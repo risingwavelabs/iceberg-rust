@@ -103,7 +103,7 @@ impl ArrowReader {
                 }
 
                 if op.is_none() {
-                    op = Some(file_io.create_operator(task.data_file_path())?);
+                    op = Some(file_io.create_operator(&task.data_file_path())?.0);
                 }
                 let parquet_file = file_io
                     .new_input_with_op(task.data_file_path(), op.as_ref().unwrap().clone())?;

@@ -160,14 +160,38 @@ impl Snapshot {
         }
     }
 
-    /// Load manifest list.
-    pub async fn load_manifest_list(
+    /// Load manifest list with operator.
+    pub async fn load_manifest_list_with_op(
         &self,
         file_io: &FileIO,
         table_metadata: &TableMetadata,
         op: Operator,
     ) -> Result<ManifestList> {
         let manifest_list_content = file_io.new_input_with_op(&self.manifest_list, op)?.read().await?;
+
+        let schema = self.schema(table_metadata)?;
+
+        let partition_type_provider = |partition_spec_id: i32| -> Result<Option<StructType>> {
+            table_metadata
+                .partition_spec_by_id(partition_spec_id)
+                .map(|partition_spec| partition_spec.partition_type(&schema))
+                .transpose()
+        };
+
+        ManifestList::parse_with_version(
+            &manifest_list_content,
+            table_metadata.format_version(),
+            partition_type_provider,
+        )
+    }
+
+    /// Load manifest list.
+    pub async fn load_manifest_list(
+        &self,
+        file_io: &FileIO,
+        table_metadata: &TableMetadata,
+    ) -> Result<ManifestList> {
+        let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
 
         let schema = self.schema(table_metadata)?;
 

@@ -169,9 +169,8 @@ impl FileIO {
     }
 
     /// Creates operator from path.
-    pub fn create_operator(&self, path: impl AsRef<str>) -> Result<Operator>{
-        let (op, _relative_path) = self.inner.create_operator(&path)?;
-        Ok(op)
+    pub fn create_operator<'a>(&self, path: &'a impl AsRef<str>) -> Result<(Operator, &'a str)> {
+        self.inner.create_operator(path)
     }
 
     /// Deletes file.

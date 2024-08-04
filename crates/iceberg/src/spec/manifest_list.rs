@@ -632,7 +632,21 @@ impl ManifestFile {
     /// Load [`Manifest`].
     ///
     /// This method will also initialize inherited values of [`ManifestEntry`], such as `sequence_number`.
-    pub async fn load_manifest(&self, file_io: &FileIO, op: Operator) -> Result<Manifest> {
+    pub async fn load_manifest(&self, file_io: &FileIO) -> Result<Manifest> {
+        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+
+        let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
+
+        // Let entries inherit values from the manifest list entry.
+        for entry in &mut entries {
+            entry.inherit_data(self);
+        }
+
+        Ok(Manifest::new(metadata, entries))
+    }
+
+    /// Load [`Manifest`] with operator.
+    pub async fn load_manifest_with_op(&self, file_io: &FileIO, op: Operator) -> Result<Manifest> {
         let avro = file_io.new_input_with_op(&self.manifest_path, op)?.read().await?;
 
         let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
