@@ -248,9 +248,10 @@ impl TableScan {
         let bound_predicates = self.bound_predicates.clone();
 
         Ok(try_stream! {
+            let op = context.file_io.create_operator(&context.snapshot.manifest_list())?;
             let manifest_list = context
                 .snapshot
-                .load_manifest_list(&context.file_io, &context.table_metadata)
+                .load_manifest_list(&context.file_io, &context.table_metadata, op.clone())
                 .await?;
 
             for entry in manifest_list.entries() {
@@ -276,7 +277,7 @@ impl TableScan {
                     }
                 }
 
-                let manifest = entry.load_manifest(&context.file_io).await?;
+                let manifest = entry.load_manifest(&context.file_io, op.clone()).await?;
                 let mut manifest_entries_stream =
                     futures::stream::iter(manifest.entries().iter().filter(|e| e.is_alive()));
 

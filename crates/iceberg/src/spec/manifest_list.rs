@@ -23,6 +23,7 @@ use crate::io::FileIO;
 use crate::{io::OutputFile, Error, ErrorKind};
 use apache_avro::{from_value, types::Value, Reader, Writer};
 use bytes::Bytes;
+use opendal::Operator;
 
 use self::{
     _const_schema::{MANIFEST_LIST_AVRO_SCHEMA_V1, MANIFEST_LIST_AVRO_SCHEMA_V2},
@@ -631,8 +632,8 @@ impl ManifestFile {
     /// Load [`Manifest`].
     ///
     /// This method will also initialize inherited values of [`ManifestEntry`], such as `sequence_number`.
-    pub async fn load_manifest(&self, file_io: &FileIO) -> Result<Manifest> {
-        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+    pub async fn load_manifest(&self, file_io: &FileIO, op: Operator) -> Result<Manifest> {
+        let avro = file_io.new_input_with_op(&self.manifest_path, op)?.read().await?;
 
         let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
 

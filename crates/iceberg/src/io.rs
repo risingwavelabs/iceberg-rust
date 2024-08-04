@@ -168,6 +168,12 @@ impl FileIO {
         Ok(FileIOBuilder::new(url.scheme()))
     }
 
+    /// Creates operator from path.
+    pub fn create_operator(&self, path: impl AsRef<str>) -> Result<Operator>{
+        let (op, _relative_path) = self.inner.create_operator(&path)?;
+        Ok(op)
+    }
+
     /// Deletes file.
     pub async fn delete(&self, path: impl AsRef<str>) -> Result<()> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
@@ -178,6 +184,18 @@ impl FileIO {
     pub async fn is_exist(&self, path: impl AsRef<str>) -> Result<bool> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.is_exist(relative_path).await?)
+    }
+
+    /// Creates input file with operator.
+    pub fn new_input_with_op(&self, path: impl AsRef<str>, op: Operator) -> Result<InputFile> {
+        let (_, relative_path) = self.inner.create_operator(&path)?;
+        let path = path.as_ref().to_string();
+        let relative_path_pos = path.len() - relative_path.len();
+        Ok(InputFile {
+            op,
+            path,
+            relative_path_pos,
+        })
     }
 
     /// Creates input file.

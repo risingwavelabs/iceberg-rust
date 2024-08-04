@@ -23,6 +23,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use opendal::Operator;
 use typed_builder::TypedBuilder;
 
 use super::table_metadata::SnapshotLog;
@@ -164,8 +165,9 @@ impl Snapshot {
         &self,
         file_io: &FileIO,
         table_metadata: &TableMetadata,
+        op: Operator,
     ) -> Result<ManifestList> {
-        let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
+        let manifest_list_content = file_io.new_input_with_op(&self.manifest_list, op)?.read().await?;
 
         let schema = self.schema(table_metadata)?;
 

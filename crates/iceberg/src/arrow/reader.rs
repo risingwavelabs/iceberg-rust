@@ -90,6 +90,7 @@ impl ArrowReader {
     /// Returns a stream of Arrow RecordBatches containing the data from the files
     pub fn read(self, mut tasks: FileScanTaskStream) -> crate::Result<ArrowRecordBatchStream> {
         let file_io = self.file_io.clone();
+        let mut op = None;
 
         Ok(try_stream! {
             while let Some(Ok(task)) = tasks.next().await {
@@ -101,8 +102,11 @@ impl ArrowReader {
                     visit(&mut collector, predicates)?;
                 }
 
+                if op.is_none() {
+                    op = Some(file_io.create_operator(task.data_file_path())?);
+                }
                 let parquet_file = file_io
-                    .new_input(task.data_file_path())?;
+                    .new_input_with_op(task.data_file_path(), op.as_ref().unwrap().clone())?;
                 let (parquet_metadata, parquet_reader) = try_join!(parquet_file.metadata(), parquet_file.reader())?;
                 let arrow_file_reader = ArrowFileReader::new(parquet_metadata, parquet_reader);
 
