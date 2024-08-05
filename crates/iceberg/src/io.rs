@@ -449,12 +449,7 @@ impl Storage {
 
                     headers.insert(reqwest::header::CONNECTION, "Keep-Alive".parse().unwrap());
 
-                    let client_builder = reqwest::ClientBuilder::new().http2_keep_alive_interval(Duration::from_secs(60))
-                        .http2_keep_alive_timeout(Duration::from_secs(60))
-                        .http2_adaptive_window(true)
-                        .http2_keep_alive_while_idle(true)
-                        .http2_keep_alive_interval(Duration::from_secs(60))
-                        .http2_prior_knowledge()
+                    let client_builder = reqwest::ClientBuilder::new()
                         .default_headers(headers)
                         .tcp_keepalive(Duration::from_secs(60))
                         .tcp_nodelay(true);
