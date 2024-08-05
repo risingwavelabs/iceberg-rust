@@ -444,10 +444,13 @@ impl Storage {
                 let prefix = format!("{}://{}/", scheme_str, bucket);
                 if path.starts_with(&prefix) {
 
-                    let mut client_builder = reqwest::ClientBuilder::new();
-
-                    client_builder = client_builder.tcp_keepalive(Duration::from_secs(60));
-                    client_builder = client_builder.tcp_nodelay(true);
+                    let client_builder = reqwest::ClientBuilder::new().http2_keep_alive_interval(Duration::from_secs(60))
+                        .http2_keep_alive_timeout(Duration::from_secs(60))
+                        .http2_adaptive_window(true)
+                        .http2_keep_alive_while_idle(true)
+                        .http2_keep_alive_interval(Duration::from_secs(60))
+                        .tcp_keepalive(Duration::from_secs(60))
+                        .tcp_nodelay(true);
 
                     let http_client = HttpClient::build(client_builder)?;
 
