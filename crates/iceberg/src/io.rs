@@ -452,6 +452,7 @@ impl Storage {
 
                     let client_builder = reqwest::ClientBuilder::new()
                         .default_headers(headers)
+                        .connection_verbose(true)
                         .tcp_keepalive(Duration::from_secs(60))
                         .tcp_nodelay(true);
 
