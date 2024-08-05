@@ -58,7 +58,7 @@ use once_cell::sync::Lazy;
 use opendal::{Builder, Operator, OperatorBuilder, Scheme};
 use opendal::raw::HttpClient;
 use opendal::services::S3;
-use reqwest::header::HeaderMap;
+use reqwest::header::{CONNECTION, HeaderMap, HeaderValue};
 use url::Url;
 
 /// Following are arguments for [s3 file io](https://py.iceberg.apache.org/configuration/#s3).
@@ -447,7 +447,8 @@ impl Storage {
 
                     let mut headers = HeaderMap::new();
 
-                    headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive" ));
+                    headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive"));
+                    headers.insert("Keep-Alive", reqwest::header::HeaderValue::from_static("timeout=5, max=1000" ));
 
                     let client_builder = reqwest::ClientBuilder::new()
                         .default_headers(headers)
