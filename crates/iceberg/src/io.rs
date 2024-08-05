@@ -452,7 +452,7 @@ impl Storage {
 
                     let client_builder = reqwest::ClientBuilder::new()
                         .default_headers(headers)
-                        .pool_max_idle_per_host(1)
+                        .pool_max_idle_per_host(0)
                         .connection_verbose(true)
                         .tcp_keepalive(Duration::from_secs(60))
                         .tcp_nodelay(true);
