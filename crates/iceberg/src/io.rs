@@ -447,7 +447,7 @@ impl Storage {
 
                     let mut headers = HeaderMap::new();
 
-                    headers.insert(reqwest::header::CONNECTION, "keep-alive".parse().unwrap());
+                    headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive" ));
 
                     let client_builder = reqwest::ClientBuilder::new()
                         .default_headers(headers)
