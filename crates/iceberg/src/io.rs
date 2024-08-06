@@ -51,10 +51,13 @@
 use bytes::Bytes;
 use std::ops::Range;
 use std::{collections::HashMap, sync::Arc};
+use std::time::Duration;
 
 use crate::{error::Result, Error, ErrorKind};
 use once_cell::sync::Lazy;
-use opendal::{Operator, Scheme};
+use opendal::{Builder, Operator, OperatorBuilder, Scheme};
+use opendal::raw::HttpClient;
+use opendal::services::S3;
 use url::Url;
 
 /// Following are arguments for [s3 file io](https://py.iceberg.apache.org/configuration/#s3).
@@ -76,6 +79,15 @@ static S3_CONFIG_MAPPING: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(
     m.insert(S3_REGION, "region");
 
     m
+});
+
+/// A global http client for s3.
+static S3_HTTP_CLIENT: Lazy<HttpClient> = Lazy::new(|| {
+    let client_builder = reqwest::ClientBuilder::new()
+        .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true);
+
+    HttpClient::build(client_builder).expect("should build successfully")
 });
 
 const DEFAULT_ROOT_PATH: &str = "/";
@@ -423,7 +435,10 @@ impl Storage {
 
                 let prefix = format!("{}://{}/", scheme_str, bucket);
                 if path.starts_with(&prefix) {
-                    Ok((Operator::via_map(Scheme::S3, props)?, &path[prefix.len()..]))
+                    let mut s3_op_builder = S3::from_map(props);
+                    let access = s3_op_builder.http_client(S3_HTTP_CLIENT.clone()).build()?;
+                    let op: Operator = OperatorBuilder::new(access).finish();
+                    Ok((op, &path[prefix.len()..]))
                 } else {
                     Err(Error::new(
                         ErrorKind::DataInvalid,
