@@ -447,8 +447,11 @@ impl Storage {
 
                     let mut headers = HeaderMap::new();
 
+                    headers.insert(reqwest::header::USER_AGENT, reqwest::header::HeaderValue::from_static("aws-sdk-cpp/1.11.234 ua/2.0 md/aws-crt#0.24.11-dev+183a3521 os/Darwin/23.5.0 md/arch#arm64 lang/c++#C++23 md/Clang#18.1.8 cfg/retry-mode#custom api/S3"));
                     headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive"));
                     headers.insert("Keep-Alive", reqwest::header::HeaderValue::from_static("timeout=5, max=1000" ));
+                    headers.insert("my-key", reqwest::header::HeaderValue::from_static("my-value" ));
+                    headers.insert("a", reqwest::header::HeaderValue::from_static("b" ));
 
                     let client_builder = reqwest::ClientBuilder::new()
                         .default_headers(headers)
