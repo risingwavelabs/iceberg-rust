@@ -361,6 +361,67 @@ impl TableScan {
         return Ok(file_scan_task_rx.boxed());
     }
 
+    /// Returns a stream of [`FileScanTask`]s.
+    pub async fn plan_eq_delete_files(&self) -> Result<FileScanTaskStream> {
+        let concurrency_limit_manifest_files = self.concurrency_limit_manifest_files;
+        let concurrency_limit_manifest_entries = self.concurrency_limit_manifest_entries;
+
+        // used to stream ManifestEntryContexts between stages of the file plan operation
+        let (manifest_entry_ctx_tx, manifest_entry_ctx_rx) =
+            channel(concurrency_limit_manifest_files);
+        // used to stream the results back to the caller
+        let (file_scan_task_tx, file_scan_task_rx) = channel(concurrency_limit_manifest_entries);
+
+        let manifest_list = self.plan_context.get_manifest_list().await?;
+
+        // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
+        // whose content type is not Data or whose partitions cannot match this
+        // scan's filter
+        let manifest_file_contexts = self
+            .plan_context
+            .build_manifest_file_contexts(manifest_list, manifest_entry_ctx_tx)?;
+
+        let mut channel_for_manifest_error = file_scan_task_tx.clone();
+
+        // Concurrently load all [`Manifest`]s and stream their [`ManifestEntry`]s
+        spawn(async move {
+            let result = futures::stream::iter(manifest_file_contexts)
+                .try_for_each_concurrent(concurrency_limit_manifest_files, |ctx| async move {
+                    ctx.fetch_manifest_and_stream_manifest_entries().await
+                })
+                .await;
+
+            if let Err(error) = result {
+                let _ = channel_for_manifest_error.send(Err(error)).await;
+            }
+        });
+
+        let mut channel_for_manifest_entry_error = file_scan_task_tx.clone();
+
+        // Process the [`ManifestEntry`] stream in parallel
+        spawn(async move {
+            let result = manifest_entry_ctx_rx
+                .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
+                .try_for_each_concurrent(
+                    concurrency_limit_manifest_entries,
+                    |(manifest_entry_context, tx)| async move {
+                        crate::runtime::spawn(async move {
+                            Self::process_manifest_entry(manifest_entry_context, tx).await
+                        })
+                            .await
+                    },
+                )
+                .await;
+
+            if let Err(error) = result {
+                let _ = channel_for_manifest_entry_error.send(Err(error)).await;
+            }
+        });
+
+        return Ok(file_scan_task_rx.boxed());
+    }
+
+
     /// Returns an [`ArrowRecordBatchStream`].
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
@@ -397,6 +458,64 @@ impl TableScan {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 "Only Data files currently supported",
+            ));
+        }
+
+        if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
+            let BoundPredicates {
+                ref snapshot_bound_predicate,
+                ref partition_bound_predicate,
+            } = bound_predicates.as_ref();
+
+            let expression_evaluator_cache =
+                manifest_entry_context.expression_evaluator_cache.as_ref();
+
+            let expression_evaluator = expression_evaluator_cache.get(
+                manifest_entry_context.partition_spec_id,
+                partition_bound_predicate,
+            )?;
+
+            // skip any data file whose partition data indicates that it can't contain
+            // any data that matches this scan's filter
+            if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
+                return Ok(());
+            }
+
+            // skip any data file whose metrics don't match this scan's filter
+            if !InclusiveMetricsEvaluator::eval(
+                snapshot_bound_predicate,
+                manifest_entry_context.manifest_entry.data_file(),
+                false,
+            )? {
+                return Ok(());
+            }
+        }
+
+        // congratulations! the manifest entry has made its way through the
+        // entire plan without getting filtered out. Create a corresponding
+        // FileScanTask and push it to the result stream
+        file_scan_task_tx
+            .send(Ok(manifest_entry_context.into_file_scan_task()))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn process_manifest_entry_with_eq_delete(
+        manifest_entry_context: ManifestEntryContext,
+        mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+    ) -> Result<()> {
+        // skip processing this manifest entry if it has been marked as deleted
+        if !manifest_entry_context.manifest_entry.is_alive() {
+            return Ok(());
+        }
+
+        // abort the plan if we encounter a manifest entry whose data file's
+        // content type is currently unsupported
+        if manifest_entry_context.manifest_entry.content_type() != DataContentType::EqualityDeletes {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Only EqualityDeletes files currently supported",
             ));
         }
 
@@ -565,7 +684,7 @@ impl PlanContext {
         let filtered_entries = manifest_list
             .consume_entries()
             .into_iter()
-            .filter(|manifest_file| manifest_file.content == ManifestContentType::Data);
+            .filter(|manifest_file| manifest_file.content == ManifestContentType::Deletes);
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
