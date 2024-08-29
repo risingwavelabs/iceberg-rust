@@ -406,7 +406,7 @@ impl TableScan {
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
                         crate::runtime::spawn(async move {
-                            Self::process_manifest_entry(manifest_entry_context, tx).await
+                            Self::process_manifest_entry_with_eq_delete(manifest_entry_context, tx).await
                         })
                             .await
                     },
