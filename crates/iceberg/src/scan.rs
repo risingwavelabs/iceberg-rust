@@ -379,7 +379,7 @@ impl TableScan {
         // scan's filter
         let manifest_file_contexts = self
             .plan_context
-            .build_manifest_file_contexts(manifest_list, manifest_entry_ctx_tx)?;
+            .build_manifest_file_contexts_with_delete(manifest_list, manifest_entry_ctx_tx)?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
 
@@ -691,6 +691,50 @@ impl PlanContext {
             .consume_entries()
             .into_iter()
             .filter(|manifest_file| manifest_file.content == ManifestContentType::Data);
+
+        // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
+        let mut filtered_mfcs = vec![];
+        if self.predicate.is_some() {
+            for manifest_file in filtered_entries {
+                let partition_bound_predicate = self.get_partition_filter(&manifest_file)?;
+
+                // evaluate the ManifestFile against the partition filter. Skip
+                // if it cannot contain any matching rows
+                if self
+                    .manifest_evaluator_cache
+                    .get(
+                        manifest_file.partition_spec_id,
+                        partition_bound_predicate.clone(),
+                    )
+                    .eval(&manifest_file)?
+                {
+                    let mfc = self.create_manifest_file_context(
+                        manifest_file,
+                        Some(partition_bound_predicate),
+                        sender.clone(),
+                    );
+                    filtered_mfcs.push(Ok(mfc));
+                }
+            }
+        } else {
+            for manifest_file in filtered_entries {
+                let mfc = self.create_manifest_file_context(manifest_file, None, sender.clone());
+                filtered_mfcs.push(Ok(mfc));
+            }
+        }
+
+        Ok(Box::new(filtered_mfcs.into_iter()))
+    }
+
+    fn build_manifest_file_contexts_with_delete(
+        &self,
+        manifest_list: ManifestList,
+        sender: Sender<ManifestEntryContext>,
+    ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>>>> {
+        let filtered_entries = manifest_list
+            .consume_entries()
+            .into_iter()
+            .filter(|manifest_file| manifest_file.content == ManifestContentType::Deletes);
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
