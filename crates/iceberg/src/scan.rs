@@ -516,10 +516,13 @@ impl TableScan {
         // abort the plan if we encounter a manifest entry whose data file's
         // content type is currently unsupported
         if manifest_entry_context.manifest_entry.content_type() != DataContentType::EqualityDeletes {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Only EqualityDeletes files currently supported",
-            ));
+            // return Err(Error::new(
+            //     ErrorKind::FeatureUnsupported,
+            //     "Only EqualityDeletes files currently supported",
+            // ));
+
+            // skip instead of error
+            return Ok(());
         }
 
         if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
@@ -687,7 +690,7 @@ impl PlanContext {
         let filtered_entries = manifest_list
             .consume_entries()
             .into_iter()
-            .filter(|manifest_file| manifest_file.content == ManifestContentType::Deletes);
+            .filter(|manifest_file| manifest_file.content == ManifestContentType::Data);
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
