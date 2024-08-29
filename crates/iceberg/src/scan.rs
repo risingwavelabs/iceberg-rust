@@ -455,10 +455,13 @@ impl TableScan {
         // abort the plan if we encounter a manifest entry whose data file's
         // content type is currently unsupported
         if manifest_entry_context.manifest_entry.content_type() != DataContentType::Data {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Only Data files currently supported",
-            ));
+            // return Err(Error::new(
+            //     ErrorKind::FeatureUnsupported,
+            //     "Only Data files currently supported",
+            // ));
+
+            // skip instead of error
+            return Ok(());
         }
 
         if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
