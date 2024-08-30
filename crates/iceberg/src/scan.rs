@@ -1041,6 +1041,11 @@ impl FileScanTask {
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    /// Returns the sequence number of this file scan task.
+    pub fn sequence_number(&self) -> i64 {
+        self.sequence_number
+    }
 }
 
 #[cfg(test)]
