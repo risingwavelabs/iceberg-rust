@@ -650,6 +650,7 @@ impl ManifestEntryContext {
                 .bound_predicates
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
             schema: self.snapshot_schema,
+            sequence_number: self.manifest_entry.sequence_number().unwrap_or(0),
         }
     }
 }
@@ -1017,6 +1018,7 @@ pub struct FileScanTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     predicate: Option<BoundPredicate>,
     schema: SchemaRef,
+    sequence_number: i64,
 }
 
 impl FileScanTask {
