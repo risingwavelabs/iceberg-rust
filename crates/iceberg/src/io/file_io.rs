@@ -66,6 +66,12 @@ impl FileIO {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.delete(relative_path).await?)
     }
+    
+    /// Remove all
+    pub async fn remove_all(&self, path: impl AsRef<str>) -> Result<()> {
+        let (op, relative_path) = self.inner.create_operator(&path)?;
+        Ok(op.remove_all(relative_path).await?)
+    }
 
     /// Check file exists.
     pub async fn is_exist(&self, path: impl AsRef<str>) -> Result<bool> {
