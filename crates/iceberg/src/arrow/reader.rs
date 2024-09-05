@@ -307,35 +307,34 @@ impl ArrowReader {
 
             let fields = arrow_schema.fields();
             let iceberg_schema = arrow_schema_to_schema(arrow_schema)?;
-            fields.filter_leaves(|idx, field| {
+            fields.into_iter().enumerate().for_each(|(idx, field)| {
                 let field_id = field.metadata().get(PARQUET_FIELD_ID_META_KEY);
                 if field_id.is_none() {
-                    return false;
+                    return;
                 }
 
                 let field_id = i32::from_str(field_id.unwrap());
                 if field_id.is_err() {
-                    return false;
+                    return;
                 }
                 let field_id = field_id.unwrap();
 
                 if !field_ids.contains(&field_id) {
-                    return false;
+                    return;
                 }
 
                 let iceberg_field = iceberg_schema_of_task.field_by_id(field_id);
                 let parquet_iceberg_field = iceberg_schema.field_by_id(field_id);
 
                 if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
-                    return false;
+                    return;
                 }
 
                 if iceberg_field.unwrap().field_type != parquet_iceberg_field.unwrap().field_type {
-                    return false;
+                    return;
                 }
 
                 column_map.insert(field_id, idx);
-                true
             });
 
             if column_map.len() != field_ids.len() {
@@ -359,7 +358,7 @@ impl ArrowReader {
                     ));
                 }
             }
-            Ok(ProjectionMask::leaves(parquet_schema, indices))
+            Ok(ProjectionMask::roots(parquet_schema, indices))
         }
     }
 
