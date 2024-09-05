@@ -26,7 +26,7 @@ use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kl
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
-    ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    ArrowError, DataType, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use arrow_string::like::starts_with;
 use bytes::Bytes;
@@ -352,29 +352,34 @@ impl ArrowReader {
             // some Arrow types that are not yet supported.
             let mut projected_fields: HashMap<FieldRef, i32> = HashMap::new();
             let projected_arrow_schema = ArrowSchema::new_with_metadata(
-                fields.filter_leaves(|_, f| {
-                    f.metadata()
-                        .get(PARQUET_FIELD_ID_META_KEY)
-                        .and_then(|field_id| i32::from_str(field_id).ok())
-                        .map_or(false, |field_id| {
-                            projected_fields.insert((*f).clone(), field_id);
-                            leaf_field_ids.contains(&field_id)
+                Fields::from_iter(
+                    fields
+                        .iter()
+                        .filter(|f| {
+                            f.metadata()
+                                .get(PARQUET_FIELD_ID_META_KEY)
+                                .and_then(|field_id| i32::from_str(field_id).ok())
+                                .map_or(false, |field_id| {
+                                    projected_fields.insert((*f).clone(), field_id);
+                                    leaf_field_ids.contains(&field_id)
+                                })
                         })
-                }),
+                        .cloned(),
+                ),
                 arrow_schema.metadata().clone(),
             );
             let iceberg_schema = arrow_schema_to_schema(&projected_arrow_schema)?;
 
-            fields.filter_leaves(|idx, field| {
+            fields.iter().enumerate().for_each(|(idx, field)| {
                 let Some(field_id) = projected_fields.get(field).cloned() else {
-                    return false;
+                    return;
                 };
 
                 let iceberg_field = iceberg_schema_of_task.field_by_id(field_id);
                 let parquet_iceberg_field = iceberg_schema.field_by_id(field_id);
 
                 if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
-                    return false;
+                    return;
                 }
 
                 if !type_promotion_is_valid(
@@ -384,11 +389,10 @@ impl ArrowReader {
                         .as_primitive_type(),
                     iceberg_field.unwrap().field_type.as_primitive_type(),
                 ) {
-                    return false;
+                    return;
                 }
 
                 column_map.insert(field_id, idx);
-                true
             });
 
             if column_map.len() != leaf_field_ids.len() {
@@ -419,7 +423,7 @@ impl ArrowReader {
                     ));
                 }
             }
-            Ok(ProjectionMask::leaves(parquet_schema, indices))
+            Ok(ProjectionMask::roots(parquet_schema, indices))
         }
     }
 
