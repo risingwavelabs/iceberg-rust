@@ -264,7 +264,7 @@ impl ArrowReader {
                     ));
                 }
             }
-            Ok(ProjectionMask::leaves(parquet_schema, indices))
+            Ok(ProjectionMask::roots(parquet_schema, indices))
         }
     }
 
