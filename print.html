@@ -1,0 +1,1176 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Iceberg Rust</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="download.html">Download</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="CONTRIBUTING.html">Contributing</a></li><li class="chapter-item expanded "><a href="release.html">Release</a></li><li class="chapter-item expanded affix "><li class="part-title">Reference</li><li class="chapter-item expanded "><a href="reference/podman.html">Using Podman instead of Docker</a></li><li class="chapter-item expanded "><a href="reference/setup_gpg.html">Setup GPG key</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Iceberg Rust</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/apache/iceberg-rust" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="iceberg-rust"><a class="header" href="#iceberg-rust">Iceberg Rust</a></h1>
+<p>Iceberg Rust is a rust implementation for accessing iceberg tables.</p>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="install"><a class="header" href="#install">Install</a></h1>
+<div class="warning">
+Cargo 1.75.0 or later is required to build.
+</div>
+<p>Add <code>iceberg</code> into <code>Cargo.toml</code> dependencies:</p>
+<pre><code class="language-toml">iceberg = &quot;0.2.0&quot;
+</code></pre>
+<p>iceberg is under active development, you may want to use the git version instead:</p>
+<pre><code class="language-toml">iceberg = { git = &quot;https://github.com/apache/iceberg-rust&quot;, rev = &quot;commit-hash&quot; }
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="apache-iceberg-rust-downloads"><a class="header" href="#apache-iceberg-rust-downloads">Apache Iceberg™ Rust Downloads</a></h1>
+<p>The official Apache Iceberg-Rust releases are provided as source artifacts.</p>
+<h2 id="releases"><a class="header" href="#releases">Releases</a></h2>
+<p>The latest source release is <a href="https://www.apache.org/dyn/closer.lua/iceberg/iceberg-rust-0.3.0/apache-iceberg-rust-0.3.0-src.tar.gz?action=download">0.3.0</a> (<a href="https://downloads.apache.org/iceberg/iceberg-rust-0.3.0/apache-iceberg-rust-0.3.0-src.tar.gz.asc">asc</a>,
+<a href="https://downloads.apache.org/iceberg/iceberg-rust-0.3.0/apache-iceberg-rust-0.3.0-src.tar.gz.sha512">sha512</a>).</p>
+<p>For older releases, please check the <a href="https://archive.apache.org/dist/iceberg/">archive</a>.</p>
+<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
+<ul>
+<li>When downloading a release, please verify the OpenPGP compatible signature (or failing that, check the SHA-512); these should be fetched from the main Apache site.</li>
+<li>The KEYS file contains the public keys used for signing release. It is recommended that (when possible) a web of trust is used to confirm the identity of these keys.</li>
+<li>Please download the <a href="https://downloads.apache.org/iceberg/KEYS">KEYS</a> as well as the .asc signature files.</li>
+</ul>
+<h3 id="to-verify-the-signature-of-the-release-artifact"><a class="header" href="#to-verify-the-signature-of-the-release-artifact">To verify the signature of the release artifact</a></h3>
+<p>You will need to download both the release artifact and the .asc signature file for that artifact. Then verify the signature by:</p>
+<ul>
+<li>
+<p>Download the KEYS file and the .asc signature files for the relevant release artifacts.</p>
+</li>
+<li>
+<p>Import the KEYS file to your GPG keyring:</p>
+<pre><code class="language-shell">gpg --import KEYS
+</code></pre>
+</li>
+<li>
+<p>Verify the signature of the release artifact using the following command:</p>
+<pre><code class="language-shell">gpg --verify &lt;artifact&gt;.asc &lt;artifact&gt;
+</code></pre>
+</li>
+</ul>
+<h3 id="to-verify-the-checksum-of-the-release-artifact"><a class="header" href="#to-verify-the-checksum-of-the-release-artifact">To verify the checksum of the release artifact</a></h3>
+<p>You will need to download both the release artifact and the .sha512 checksum file for that artifact. Then verify the checksum by:</p>
+<pre><code class="language-shell">shasum -a 512 -c &lt;artifact&gt;.sha512
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="catalog"><a class="header" href="#catalog">Catalog</a></h1>
+<p><code>Catalog</code> is the entry point for accessing iceberg tables. You can use a catalog to:</p>
+<ul>
+<li>Create and list namespaces.</li>
+<li>Create, load, and drop tables</li>
+</ul>
+<p>Currently only rest catalog has been implemented, and other catalogs are under active development. Here is an 
+example of how to create a <code>RestCatalog</code>:</p>
+<pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
+</span><span class="boring">// or more contributor license agreements.  See the NOTICE file
+</span><span class="boring">// distributed with this work for additional information
+</span><span class="boring">// regarding copyright ownership.  The ASF licenses this file
+</span><span class="boring">// to you under the Apache License, Version 2.0 (the
+</span><span class="boring">// &quot;License&quot;); you may not use this file except in compliance
+</span><span class="boring">// with the License.  You may obtain a copy of the License at
+</span><span class="boring">//
+</span><span class="boring">//   http://www.apache.org/licenses/LICENSE-2.0
+</span><span class="boring">//
+</span><span class="boring">// Unless required by applicable law or agreed to in writing,
+</span><span class="boring">// software distributed under the License is distributed on an
+</span><span class="boring">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+</span><span class="boring">// KIND, either express or implied.  See the License for the
+</span><span class="boring">// specific language governing permissions and limitations
+</span><span class="boring">// under the License.
+</span><span class="boring">
+</span><span class="boring">use std::collections::HashMap;
+</span><span class="boring">
+</span><span class="boring">use iceberg::{Catalog, NamespaceIdent};
+</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">
+</span><span class="boring">#[tokio::main]
+</span><span class="boring">async fn main() {
+</span>    // Create catalog
+    let config = RestCatalogConfig::builder()
+        .uri(&quot;http://localhost:8080&quot;.to_string())
+        .build();
+
+    let catalog = RestCatalog::new(config);
+<span class="boring">
+</span><span class="boring">    // List all namespaces
+</span><span class="boring">    let all_namespaces = catalog.list_namespaces(None).await.unwrap();
+</span><span class="boring">    println!(&quot;Namespaces in current catalog: {:?}&quot;, all_namespaces);
+</span><span class="boring">
+</span><span class="boring">    let namespace_id =
+</span><span class="boring">        NamespaceIdent::from_vec(vec![&quot;ns1&quot;.to_string(), &quot;ns11&quot;.to_string()]).unwrap();
+</span><span class="boring">    // Create namespace
+</span><span class="boring">    let ns = catalog
+</span><span class="boring">        .create_namespace(
+</span><span class="boring">            &amp;namespace_id,
+</span><span class="boring">            HashMap::from([(&quot;key1&quot;.to_string(), &quot;value1&quot;.to_string())]),
+</span><span class="boring">        )
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
+</span><span class="boring">
+</span><span class="boring">    println!(&quot;Namespace created: {:?}&quot;, ns);
+</span><span class="boring">}</span></code></pre>
+<p>You can run following code to list all root namespaces:</p>
+<pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
+</span><span class="boring">// or more contributor license agreements.  See the NOTICE file
+</span><span class="boring">// distributed with this work for additional information
+</span><span class="boring">// regarding copyright ownership.  The ASF licenses this file
+</span><span class="boring">// to you under the Apache License, Version 2.0 (the
+</span><span class="boring">// &quot;License&quot;); you may not use this file except in compliance
+</span><span class="boring">// with the License.  You may obtain a copy of the License at
+</span><span class="boring">//
+</span><span class="boring">//   http://www.apache.org/licenses/LICENSE-2.0
+</span><span class="boring">//
+</span><span class="boring">// Unless required by applicable law or agreed to in writing,
+</span><span class="boring">// software distributed under the License is distributed on an
+</span><span class="boring">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+</span><span class="boring">// KIND, either express or implied.  See the License for the
+</span><span class="boring">// specific language governing permissions and limitations
+</span><span class="boring">// under the License.
+</span><span class="boring">
+</span><span class="boring">use std::collections::HashMap;
+</span><span class="boring">
+</span><span class="boring">use iceberg::{Catalog, NamespaceIdent};
+</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">
+</span><span class="boring">#[tokio::main]
+</span><span class="boring">async fn main() {
+</span><span class="boring">    // Create catalog
+</span><span class="boring">    let config = RestCatalogConfig::builder()
+</span><span class="boring">        .uri(&quot;http://localhost:8080&quot;.to_string())
+</span><span class="boring">        .build();
+</span><span class="boring">
+</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">
+</span>    // List all namespaces
+    let all_namespaces = catalog.list_namespaces(None).await.unwrap();
+    println!(&quot;Namespaces in current catalog: {:?}&quot;, all_namespaces);
+<span class="boring">
+</span><span class="boring">    let namespace_id =
+</span><span class="boring">        NamespaceIdent::from_vec(vec![&quot;ns1&quot;.to_string(), &quot;ns11&quot;.to_string()]).unwrap();
+</span><span class="boring">    // Create namespace
+</span><span class="boring">    let ns = catalog
+</span><span class="boring">        .create_namespace(
+</span><span class="boring">            &amp;namespace_id,
+</span><span class="boring">            HashMap::from([(&quot;key1&quot;.to_string(), &quot;value1&quot;.to_string())]),
+</span><span class="boring">        )
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
+</span><span class="boring">
+</span><span class="boring">    println!(&quot;Namespace created: {:?}&quot;, ns);
+</span><span class="boring">}</span></code></pre>
+<p>Then you can run following code to create namespace:</p>
+<pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
+</span><span class="boring">// or more contributor license agreements.  See the NOTICE file
+</span><span class="boring">// distributed with this work for additional information
+</span><span class="boring">// regarding copyright ownership.  The ASF licenses this file
+</span><span class="boring">// to you under the Apache License, Version 2.0 (the
+</span><span class="boring">// &quot;License&quot;); you may not use this file except in compliance
+</span><span class="boring">// with the License.  You may obtain a copy of the License at
+</span><span class="boring">//
+</span><span class="boring">//   http://www.apache.org/licenses/LICENSE-2.0
+</span><span class="boring">//
+</span><span class="boring">// Unless required by applicable law or agreed to in writing,
+</span><span class="boring">// software distributed under the License is distributed on an
+</span><span class="boring">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+</span><span class="boring">// KIND, either express or implied.  See the License for the
+</span><span class="boring">// specific language governing permissions and limitations
+</span><span class="boring">// under the License.
+</span><span class="boring">
+</span><span class="boring">use std::collections::HashMap;
+</span><span class="boring">
+</span><span class="boring">use iceberg::{Catalog, NamespaceIdent};
+</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">
+</span><span class="boring">#[tokio::main]
+</span><span class="boring">async fn main() {
+</span><span class="boring">    // Create catalog
+</span><span class="boring">    let config = RestCatalogConfig::builder()
+</span><span class="boring">        .uri(&quot;http://localhost:8080&quot;.to_string())
+</span><span class="boring">        .build();
+</span><span class="boring">
+</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">
+</span><span class="boring">    // List all namespaces
+</span><span class="boring">    let all_namespaces = catalog.list_namespaces(None).await.unwrap();
+</span><span class="boring">    println!(&quot;Namespaces in current catalog: {:?}&quot;, all_namespaces);
+</span><span class="boring">
+</span>    let namespace_id =
+        NamespaceIdent::from_vec(vec![&quot;ns1&quot;.to_string(), &quot;ns11&quot;.to_string()]).unwrap();
+    // Create namespace
+    let ns = catalog
+        .create_namespace(
+            &amp;namespace_id,
+            HashMap::from([(&quot;key1&quot;.to_string(), &quot;value1&quot;.to_string())]),
+        )
+        .await
+        .unwrap();
+
+    println!(&quot;Namespace created: {:?}&quot;, ns);
+<span class="boring">}</span></code></pre>
+<h1 id="table"><a class="header" href="#table">Table</a></h1>
+<p>After creating <code>Catalog</code>, we can manipulate tables through <code>Catalog</code>.</p>
+<p>You can use following code to create a table:</p>
+<pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
+</span><span class="boring">// or more contributor license agreements.  See the NOTICE file
+</span><span class="boring">// distributed with this work for additional information
+</span><span class="boring">// regarding copyright ownership.  The ASF licenses this file
+</span><span class="boring">// to you under the Apache License, Version 2.0 (the
+</span><span class="boring">// &quot;License&quot;); you may not use this file except in compliance
+</span><span class="boring">// with the License.  You may obtain a copy of the License at
+</span><span class="boring">//
+</span><span class="boring">//   http://www.apache.org/licenses/LICENSE-2.0
+</span><span class="boring">//
+</span><span class="boring">// Unless required by applicable law or agreed to in writing,
+</span><span class="boring">// software distributed under the License is distributed on an
+</span><span class="boring">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+</span><span class="boring">// KIND, either express or implied.  See the License for the
+</span><span class="boring">// specific language governing permissions and limitations
+</span><span class="boring">// under the License.
+</span><span class="boring">
+</span><span class="boring">use std::collections::HashMap;
+</span><span class="boring">
+</span><span class="boring">use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+</span><span class="boring">use iceberg::{Catalog, TableCreation, TableIdent};
+</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">
+</span><span class="boring">#[tokio::main]
+</span><span class="boring">async fn main() {
+</span><span class="boring">    // Create catalog
+</span><span class="boring">    let config = RestCatalogConfig::builder()
+</span><span class="boring">        .uri(&quot;http://localhost:8080&quot;.to_string())
+</span><span class="boring">        .build();
+</span><span class="boring">
+</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">
+</span>    let table_id = TableIdent::from_strs([&quot;default&quot;, &quot;t1&quot;]).unwrap();
+
+    let table_schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::optional(1, &quot;foo&quot;, Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(2, &quot;bar&quot;, Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(3, &quot;baz&quot;, Type::Primitive(PrimitiveType::Boolean)).into(),
+        ])
+        .with_schema_id(1)
+        .with_identifier_field_ids(vec![2])
+        .build()
+        .unwrap();
+
+    // Create table
+    let table_creation = TableCreation::builder()
+        .name(table_id.name.clone())
+        .schema(table_schema.clone())
+        .properties(HashMap::from([(&quot;owner&quot;.to_string(), &quot;testx&quot;.to_string())]))
+        .build();
+
+    let table = catalog
+        .create_table(&amp;table_id.namespace, table_creation)
+        .await
+        .unwrap();
+
+    println!(&quot;Table created: {:?}&quot;, table.metadata());
+<span class="boring">
+</span><span class="boring">    let table2 = catalog
+</span><span class="boring">        .load_table(&amp;TableIdent::from_strs([&quot;default&quot;, &quot;t2&quot;]).unwrap())
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
+</span><span class="boring">    println!(&quot;{:?}&quot;, table2.metadata());
+</span><span class="boring">}</span></code></pre>
+<p>Also, you can load a table directly:</p>
+<pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
+</span><span class="boring">// or more contributor license agreements.  See the NOTICE file
+</span><span class="boring">// distributed with this work for additional information
+</span><span class="boring">// regarding copyright ownership.  The ASF licenses this file
+</span><span class="boring">// to you under the Apache License, Version 2.0 (the
+</span><span class="boring">// &quot;License&quot;); you may not use this file except in compliance
+</span><span class="boring">// with the License.  You may obtain a copy of the License at
+</span><span class="boring">//
+</span><span class="boring">//   http://www.apache.org/licenses/LICENSE-2.0
+</span><span class="boring">//
+</span><span class="boring">// Unless required by applicable law or agreed to in writing,
+</span><span class="boring">// software distributed under the License is distributed on an
+</span><span class="boring">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+</span><span class="boring">// KIND, either express or implied.  See the License for the
+</span><span class="boring">// specific language governing permissions and limitations
+</span><span class="boring">// under the License.
+</span><span class="boring">
+</span><span class="boring">use std::collections::HashMap;
+</span><span class="boring">
+</span><span class="boring">use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+</span><span class="boring">use iceberg::{Catalog, TableCreation, TableIdent};
+</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">
+</span><span class="boring">#[tokio::main]
+</span><span class="boring">async fn main() {
+</span><span class="boring">    // Create catalog
+</span><span class="boring">    let config = RestCatalogConfig::builder()
+</span><span class="boring">        .uri(&quot;http://localhost:8080&quot;.to_string())
+</span><span class="boring">        .build();
+</span><span class="boring">
+</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">
+</span><span class="boring">    let table_id = TableIdent::from_strs([&quot;default&quot;, &quot;t1&quot;]).unwrap();
+</span><span class="boring">
+</span><span class="boring">    let table_schema = Schema::builder()
+</span><span class="boring">        .with_fields(vec![
+</span><span class="boring">            NestedField::optional(1, &quot;foo&quot;, Type::Primitive(PrimitiveType::String)).into(),
+</span><span class="boring">            NestedField::required(2, &quot;bar&quot;, Type::Primitive(PrimitiveType::Int)).into(),
+</span><span class="boring">            NestedField::optional(3, &quot;baz&quot;, Type::Primitive(PrimitiveType::Boolean)).into(),
+</span><span class="boring">        ])
+</span><span class="boring">        .with_schema_id(1)
+</span><span class="boring">        .with_identifier_field_ids(vec![2])
+</span><span class="boring">        .build()
+</span><span class="boring">        .unwrap();
+</span><span class="boring">
+</span><span class="boring">    // Create table
+</span><span class="boring">    let table_creation = TableCreation::builder()
+</span><span class="boring">        .name(table_id.name.clone())
+</span><span class="boring">        .schema(table_schema.clone())
+</span><span class="boring">        .properties(HashMap::from([(&quot;owner&quot;.to_string(), &quot;testx&quot;.to_string())]))
+</span><span class="boring">        .build();
+</span><span class="boring">
+</span><span class="boring">    let table = catalog
+</span><span class="boring">        .create_table(&amp;table_id.namespace, table_creation)
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
+</span><span class="boring">
+</span><span class="boring">    println!(&quot;Table created: {:?}&quot;, table.metadata());
+</span><span class="boring">
+</span>    let table2 = catalog
+        .load_table(&amp;TableIdent::from_strs([&quot;default&quot;, &quot;t2&quot;]).unwrap())
+        .await
+        .unwrap();
+    println!(&quot;{:?}&quot;, table2.metadata());
+<span class="boring">}</span></code></pre>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="contributing"><a class="header" href="#contributing">Contributing</a></h1>
+<p>First, thank you for contributing to Iceberg Rust! The goal of this document is to provide everything you need to start contributing to iceberg-rust. The following TOC is sorted progressively, starting with the basics and expanding into more specifics.</p>
+<ul>
+<li><a href="CONTRIBUTING.html#your-first-contribution">Your First Contribution</a></li>
+<li><a href="CONTRIBUTING.html#workflow">Workflow</a>
+<ul>
+<li><a href="CONTRIBUTING.html#git-branches">Git Branches</a></li>
+<li><a href="CONTRIBUTING.html#github-pull-requests">GitHub Pull Requests</a>
+<ul>
+<li><a href="CONTRIBUTING.html#title">Title</a></li>
+<li><a href="CONTRIBUTING.html#reviews--approvals">Reviews &amp; Approvals</a></li>
+<li><a href="CONTRIBUTING.html#merge-style">Merge Style</a></li>
+<li><a href="CONTRIBUTING.html#ci">CI</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a href="CONTRIBUTING.html#setup">Setup</a>
+<ul>
+<li><a href="CONTRIBUTING.html#using-a-dev-container-environment">Using a dev container environment</a></li>
+<li><a href="CONTRIBUTING.html#bring-your-own-toolbox">Bring your own toolbox</a></li>
+</ul>
+</li>
+<li><a href="CONTRIBUTING.html#code-of-conduct">Code of Conduct</a></li>
+</ul>
+<h2 id="your-first-contribution"><a class="header" href="#your-first-contribution">Your First Contribution</a></h2>
+<ol>
+<li><a href="https://github.com/apache/iceberg-rust/fork">Fork the iceberg-rust repository</a> into your own GitHub account.</li>
+<li><a href="https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-and-deleting-branches-within-your-repository">Create a new Git branch</a>.</li>
+<li>Make your changes.</li>
+<li><a href="https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request-from-a-fork">Submit the branch as a pull request</a> to the main iceberg-rust repo. An iceberg-rust team member should comment and/or review your pull request within a few days. Although, depending on the circumstances, it may take longer.</li>
+</ol>
+<h2 id="workflow"><a class="header" href="#workflow">Workflow</a></h2>
+<h3 id="git-branches"><a class="header" href="#git-branches">Git Branches</a></h3>
+<p><em>All</em> changes must be made in a branch and submitted as <a href="CONTRIBUTING.html#github-pull-requests">pull requests</a>. iceberg-rust does not adopt any type of branch naming style, but please use something descriptive of your changes.</p>
+<h3 id="github-pull-requests"><a class="header" href="#github-pull-requests">GitHub Pull Requests</a></h3>
+<p>Once your changes are ready you must submit your branch as a <a href="https://github.com/apache/iceberg-rust/pulls">pull request</a>.</p>
+<h4 id="title"><a class="header" href="#title">Title</a></h4>
+<p>The pull request title must follow the format outlined in the <a href="https://www.conventionalcommits.org">conventional commits spec</a>. <a href="https://www.conventionalcommits.org">Conventional commits</a> is a standardized format for commit messages. iceberg-rust only requires this format for commits on the <code>main</code> branch. And because iceberg-rust squashes commits before merging branches, this means that only the pull request title must conform to this format.</p>
+<p>The following are all good examples of pull request titles:</p>
+<pre><code class="language-text">feat(schema): Add last_updated_ms in schema
+docs: add hdfs classpath related troubleshoot
+ci: Mark job as skipped if owner is not apache
+fix(schema): Ignore prefix if it's empty
+refactor: Polish the implementation of read parquet
+</code></pre>
+<h4 id="reviews--approvals"><a class="header" href="#reviews--approvals">Reviews &amp; Approvals</a></h4>
+<p>All pull requests should be reviewed by at least one iceberg-rust committer.</p>
+<h4 id="merge-style"><a class="header" href="#merge-style">Merge Style</a></h4>
+<p>All pull requests are squash merged. We generally discourage large pull requests that are over 300-500 lines of diff. If you would like to propose a change that is larger we suggest coming onto <a href="mailto:dev@iceberg.apache.org">Iceberg's DEV mailing list</a> or <a href="https://join.slack.com/t/apache-iceberg/shared_invite/zt-1zbov3k6e-KtJfoaxp97YfX6dPz1Bk7A">Slack #rust Channel</a> and discuss it with us. This way we can talk through the solution and discuss if a change that large is even needed! This will produce a quicker response to the change and likely produce code that aligns better with our process.</p>
+<p>When a pull request is under review, please avoid using force push as it makes it difficult for reviewer to track changes. If you need to keep the branch up to date with the main branch, consider using <code>git merge</code> instead. </p>
+<h3 id="ci"><a class="header" href="#ci">CI</a></h3>
+<p>Currently, iceberg-rust uses GitHub Actions to run tests. The workflows are defined in <code>.github/workflows</code>.</p>
+<h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
+<p>For small or first-time contributions, we recommend the dev container method. Prefer to do it yourself? That's fine too!</p>
+<h3 id="using-a-dev-container-environment"><a class="header" href="#using-a-dev-container-environment">Using a dev container environment</a></h3>
+<p>iceberg-rust provides a pre-configured <a href="https://containers.dev/">dev container</a> that could be used in <a href="https://github.com/features/codespaces">Github Codespaces</a>, <a href="https://code.visualstudio.com/">VSCode</a>, <a href="https://www.jetbrains.com/remote-development/gateway/">JetBrains</a>, <a href="https://jupyterlab.readthedocs.io/en/stable/">JuptyerLab</a>. Please pick up your favourite runtime environment.</p>
+<p>The fastest way is:</p>
+<p><a href="https://codespaces.new/apache/iceberg-rust?quickstart=1&amp;machine=standardLinux32gb"><img src="https://github.com/codespaces/badge.svg" alt="Open in GitHub Codespaces" /></a></p>
+<h3 id="bring-your-own-toolbox"><a class="header" href="#bring-your-own-toolbox">Bring your own toolbox</a></h3>
+<h4 id="install-rust"><a class="header" href="#install-rust">Install rust</a></h4>
+<p>iceberg-rust is primarily a Rust project. To build iceberg-rust, you will need to set up Rust development first. We highly recommend using <a href="https://rustup.rs/">rustup</a> for the setup process.</p>
+<p>For Linux or MacOS, use the following command:</p>
+<pre><code class="language-shell">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+</code></pre>
+<p>For Windows, download <code>rustup-init.exe</code> from <a href="https://win.rustup.rs/x86_64">here</a> instead.</p>
+<p>Rustup will read iceberg-rust's <code>rust-toolchain.toml</code> and set up everything else automatically. To ensure that everything works correctly, run <code>cargo version</code> under iceberg-rust's root directory:</p>
+<pre><code class="language-shell">$ cargo version
+cargo 1.69.0 (6e9a83356 2023-04-12)
+</code></pre>
+<h4 id="install-docker-or-podman"><a class="header" href="#install-docker-or-podman">Install Docker or Podman</a></h4>
+<p>Currently, iceberg-rust uses Docker to set up environment for integration tests. Podman is also supported.</p>
+<p>You can learn how to install Docker from <a href="https://docs.docker.com/get-docker/">here</a>.</p>
+<p>For macos users, you can install <a href="https://orbstack.dev/">OrbStack</a> as a docker alternative.</p>
+<p>For podman users, refer to <a href="docs/contributing/podman.html">Using Podman instead of Docker</a></p>
+<h2 id="build"><a class="header" href="#build">Build</a></h2>
+<ul>
+<li>To compile the project: <code>make build</code></li>
+<li>To check code styles: <code>make check</code></li>
+<li>To run unit tests only: <code>make unit-test</code></li>
+<li>To run all tests: <code>make test</code></li>
+</ul>
+<h2 id="code-of-conduct"><a class="header" href="#code-of-conduct">Code of Conduct</a></h2>
+<p>We expect all community members to follow our <a href="https://www.apache.org/foundation/policies/conduct.html">Code of Conduct</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<p>This document mainly introduces how the release manager releases a new version in accordance with the Apache requirements.</p>
+<h2 id="introduction"><a class="header" href="#introduction">Introduction</a></h2>
+<p><code>Source Release</code> is the key point which Apache values, and is also necessary for an ASF release.</p>
+<p>Please remember that publishing software has legal consequences.</p>
+<p>This guide complements the foundation-wide policies and guides:</p>
+<ul>
+<li><a href="https://www.apache.org/legal/release-policy.html">Release Policy</a></li>
+<li><a href="https://infra.apache.org/release-distribution">Release Distribution Policy</a></li>
+<li><a href="https://infra.apache.org/release-publishing.html">Release Creation Process</a></li>
+</ul>
+<h2 id="some-terminology-of-release"><a class="header" href="#some-terminology-of-release">Some Terminology of release</a></h2>
+<p>In the context of our release, we use several terms to describe different stages of the release process.</p>
+<p>Here's an explanation of these terms:</p>
+<ul>
+<li><code>iceberg_version</code>: the version of Iceberg to be released, like <code>0.2.0</code>.</li>
+<li><code>release_version</code>: the version of release candidate, like <code>0.2.0-rc.1</code>.</li>
+<li><code>rc_version</code>: the minor version for voting round, like <code>rc.1</code>.</li>
+</ul>
+<h2 id="preparation"><a class="header" href="#preparation">Preparation</a></h2>
+<div class="warning">
+<p>This section is the requirements for individuals who are new to the role of release manager.</p>
+</div>
+<p>Refer to <a href="reference/setup_gpg.html">Setup GPG Key</a> to make sure the GPG key has been set up.</p>
+<h2 id="start-a-tracking-issue-about-the-next-release"><a class="header" href="#start-a-tracking-issue-about-the-next-release">Start a tracking issue about the next release</a></h2>
+<p>Start a tracking issue on GitHub for the upcoming release to track all tasks that need to be completed.</p>
+<p>Title:</p>
+<pre><code>Tracking issues of Iceberg Rust ${iceberg_version} Release
+</code></pre>
+<p>Content:</p>
+<pre><code class="language-markdown">This issue is used to track tasks of the iceberg rust ${iceberg_version} release.
+
+## Tasks
+
+### Blockers
+
+&gt; Blockers are the tasks that must be completed before the release.
+
+### Build Release
+
+#### GitHub Side
+
+- [ ] Bump version in project
+- [ ] Update docs
+- [ ] Generate dependencies list
+- [ ] Push release candidate tag to GitHub
+
+#### ASF Side
+
+- [ ] Create an ASF Release
+- [ ] Upload artifacts to the SVN dist repo
+
+### Voting
+
+- [ ] Start VOTE at iceberg community
+
+### Official Release
+
+- [ ] Push the release git tag
+- [ ] Publish artifacts to SVN RELEASE branch
+- [ ] Change Iceberg Rust Website download link
+- [ ] Send the announcement
+
+For details of each step, please refer to: https://rust.iceberg.apache.org/release
+</code></pre>
+<h2 id="github-side"><a class="header" href="#github-side">GitHub Side</a></h2>
+<h3 id="bump-version-in-project"><a class="header" href="#bump-version-in-project">Bump version in project</a></h3>
+<p>Bump all components' version in the project to the new iceberg version.
+Please note that this version is the exact version of the release, not the release candidate version.</p>
+<ul>
+<li>rust core: bump version in <code>Cargo.toml</code></li>
+</ul>
+<h3 id="update-docs"><a class="header" href="#update-docs">Update docs</a></h3>
+<ul>
+<li>Update <code>CHANGELOG.md</code>, refer to <a href="reference/generate_release_note.html">Generate Release Note</a> for more information.</li>
+</ul>
+<h3 id="generate-dependencies-list"><a class="header" href="#generate-dependencies-list">Generate dependencies list</a></h3>
+<p>Download and setup <code>cargo-deny</code>. You can refer to <a href="https://embarkstudios.github.io/cargo-deny/cli/index.html">cargo-deny</a>.</p>
+<p>Running <code>python3 ./scripts/dependencies.py generate</code> to update the dependencies list of every package.</p>
+<h3 id="push-release-candidate-tag"><a class="header" href="#push-release-candidate-tag">Push release candidate tag</a></h3>
+<p>After bump version PR gets merged, we can create a GitHub release for the release candidate:</p>
+<ul>
+<li>Create a tag at <code>main</code> branch on the <code>Bump Version</code> / <code>Patch up version</code> commit: <code>git tag -s &quot;v0.2.0-rc.1&quot;</code>, please correctly check out the corresponding commit instead of directly tagging on the main branch.</li>
+<li>Push tags to GitHub: <code>git push --tags</code>.</li>
+</ul>
+<h2 id="asf-side"><a class="header" href="#asf-side">ASF Side</a></h2>
+<p>If any step in the ASF Release process fails and requires code changes,
+we will abandon that version and prepare for the next one.
+Our release page will only display ASF releases instead of GitHub Releases.</p>
+<h3 id="create-an-asf-release"><a class="header" href="#create-an-asf-release">Create an ASF Release</a></h3>
+<p>After GitHub Release has been created, we can start to create ASF Release.</p>
+<ul>
+<li>Checkout to released tag. (e.g. <code>git checkout v0.2.0-rc.1</code>, tag is created in the previous step)</li>
+<li>Use the release script to create a new release: <code>ICEBERG_VERSION=&lt;iceberg_version&gt; ICEBERG_VERSION_RC=&lt;rc_version&gt; ./scripts/release.sh</code>(e.g. <code>ICEBERG_VERSION=0.2.0 ICEBERG_VERSION_RC=rc.1 ./scripts/release.sh</code>)
+<ul>
+<li>This script will do the following things:
+<ul>
+<li>Create a new branch named by <code>release-${release_version}</code> from the tag</li>
+<li>Generate the release candidate artifacts under <code>dist</code>, including:
+<ul>
+<li><code>apache-iceberg-rust-${release_version}-src.tar.gz</code></li>
+<li><code>apache-iceberg-rust-${release_version}-src.tar.gz.asc</code></li>
+<li><code>apache-iceberg-rust-${release_version}-src.tar.gz.sha512</code></li>
+</ul>
+</li>
+<li>Check the header of the source code. This step needs docker to run.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>Push the newly created branch to GitHub</li>
+</ul>
+<p>This script will create a new release under <code>dist</code>.</p>
+<p>For example:</p>
+<pre><code class="language-shell">&gt; tree dist
+dist
+├── apache-iceberg-rust-0.2.0-src.tar.gz
+├── apache-iceberg-rust-0.2.0-src.tar.gz.asc
+└── apache-iceberg-rust-0.2.0-src.tar.gz.sha512
+</code></pre>
+<h3 id="upload-artifacts-to-the-svn-dist-repo"><a class="header" href="#upload-artifacts-to-the-svn-dist-repo">Upload artifacts to the SVN dist repo</a></h3>
+<p>SVN is required for this step.</p>
+<p>The svn repository of the dev branch is: <a href="https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust">https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust</a></p>
+<p>First, checkout Iceberg to local directory:</p>
+<pre><code class="language-shell"># As this step will copy all the versions, it will take some time. If the network is broken, please use svn cleanup to delete the lock before re-execute it.
+svn co https://dist.apache.org/repos/dist/dev/iceberg/ /tmp/iceberg-dist-dev
+</code></pre>
+<p>Then, upload the artifacts:</p>
+<blockquote>
+<p>The <code>${release_version}</code> here should be like <code>0.2.0-rc.1</code></p>
+</blockquote>
+<pre><code class="language-shell"># create a directory named by version
+mkdir /tmp/iceberg-dist-dev/${release_version}
+# copy source code and signature package to the versioned directory
+cp ${repo_dir}/dist/* /tmp/iceberg-dist-dev/iceberg-rust-${release_version}/
+# change dir to the svn folder
+cd /tmp/iceberg-dist-dev/
+# check svn status
+svn status
+# add to svn
+svn add ${release_version}
+# check svn status
+svn status
+# commit to SVN remote server
+svn commit -m &quot;Prepare for ${release_version}&quot;
+</code></pre>
+<p>Visit <a href="https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust/">https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust/</a> to make sure the artifacts are uploaded correctly.</p>
+<h3 id="rescue"><a class="header" href="#rescue">Rescue</a></h3>
+<p>If you accidentally published wrong or unexpected artifacts, like wrong signature files, wrong sha256 files,
+please cancel the release for the current <code>release_version</code>,
+<em>increase th RC counting</em> and re-initiate a release with the new <code>release_version</code>.
+And remember to delete the wrong artifacts from the SVN dist repo.</p>
+<h2 id="voting"><a class="header" href="#voting">Voting</a></h2>
+<p>Iceberg Community Vote should send email to: <a href="mailto:dev@iceberg.apache.org">dev@iceberg.apache.org</a>:</p>
+<p>Title:</p>
+<pre><code>[VOTE] Release Apache Iceberg Rust ${release_version} RC1
+</code></pre>
+<p>Content:</p>
+<pre><code>Hello, Apache Iceberg Rust Community,
+
+This is a call for a vote to release Apache Iceberg rust version ${iceberg_version}.
+
+The tag to be voted on is ${iceberg_version}.
+
+The release candidate:
+
+https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust-${release_version}/
+
+Keys to verify the release candidate:
+
+https://downloads.apache.org/iceberg/KEYS
+
+Git tag for the release:
+
+https://github.com/apache/iceberg-rust/releases/tag/${release_version}
+
+Please download, verify, and test.
+
+The VOTE will be open for at least 72 hours and until the necessary
+number of votes are reached.
+
+[ ] +1 approve
+[ ] +0 no opinion
+[ ] -1 disapprove with the reason
+
+To learn more about Apache Iceberg, please see https://rust.iceberg.apache.org/
+
+Checklist for reference:
+
+[ ] Download links are valid.
+[ ] Checksums and signatures.
+[ ] LICENSE/NOTICE files exist
+[ ] No unexpected binary files
+[ ] All source files have ASF headers
+[ ] Can compile from source
+
+More detailed checklist please refer to:
+https://github.com/apache/iceberg-rust/tree/main/scripts
+
+To compile from source, please refer to:
+https://github.com/apache/iceberg-rust/blob/main/CONTRIBUTING.md
+
+Here is a Python script in release to help you verify the release candidate:
+
+./scripts/verify.py
+
+Thanks
+
+${name}
+</code></pre>
+<p>Example: <a href="https://lists.apache.org/thread/c211gqq2yl15jbxqk4rcnq1bdqltjm5l">https://lists.apache.org/thread/c211gqq2yl15jbxqk4rcnq1bdqltjm5l</a></p>
+<p>After at least 3 <code>+1</code> binding vote (from Iceberg PMC member), claim the vote result:</p>
+<p>Title:</p>
+<pre><code>[RESULT][VOTE] Release Apache Iceberg Rust ${release_version} RC1
+</code></pre>
+<p>Content:</p>
+<pre><code>Hello, Apache Iceberg Rust Community,
+
+The vote to release Apache Iceberg Rust ${release_version} has passed.
+
+The vote PASSED with 3 +1 binding and 1 +1 non-binding votes, no +0 or -1 votes:
+
+Binding votes:
+
+- xxx
+- yyy
+- zzz
+
+Non-Binding votes:
+
+- aaa
+
+Vote thread: ${vote_thread_url}
+
+Thanks
+
+${name}
+</code></pre>
+<p>Example: <a href="https://lists.apache.org/thread/xk5myl10mztcfotn59oo59s4ckvojds6">https://lists.apache.org/thread/xk5myl10mztcfotn59oo59s4ckvojds6</a></p>
+<h2 id="official-release"><a class="header" href="#official-release">Official Release</a></h2>
+<h3 id="push-the-release-git-tag"><a class="header" href="#push-the-release-git-tag">Push the release git tag</a></h3>
+<pre><code class="language-shell"># Checkout the tags that passed VOTE
+git checkout ${release_version}
+# Tag with the iceberg version
+git tag -s ${iceberg_version}
+# Push tags to github to trigger releases
+git push origin ${iceberg_version}
+</code></pre>
+<h3 id="publish-artifacts-to-svn-release-branch"><a class="header" href="#publish-artifacts-to-svn-release-branch">Publish artifacts to SVN RELEASE branch</a></h3>
+<pre><code class="language-shell">svn mv https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust-${release_version} https://dist.apache.org/repos/dist/release/iceberg/iceberg-rust-${iceberg_version} -m &quot;Release Apache Iceberg Rust ${iceberg_version}&quot;
+</code></pre>
+<h3 id="change-iceberg-rust-website-download-link"><a class="header" href="#change-iceberg-rust-website-download-link">Change Iceberg Rust Website download link</a></h3>
+<p>Update the download link in <code>website/src/download.md</code> to the new release version.</p>
+<h3 id="create-a-github-release"><a class="header" href="#create-a-github-release">Create a GitHub Release</a></h3>
+<ul>
+<li>Click <a href="https://github.com/apache/iceberg-rust/releases/new">here</a> to create a new release.</li>
+<li>Pick the git tag of this release version from the dropdown menu.</li>
+<li>Make sure the branch target is <code>main</code>.</li>
+<li>Generate the release note by clicking the <code>Generate release notes</code> button.</li>
+<li>Add the release note from every component's <code>upgrade.md</code> if there are breaking changes before the content generated by GitHub. Check them carefully.</li>
+<li>Publish the release.</li>
+</ul>
+<h3 id="send-the-announcement"><a class="header" href="#send-the-announcement">Send the announcement</a></h3>
+<p>Send the release announcement to <code>dev@iceberg.apache.org</code> and CC <code>announce@apache.org</code>.</p>
+<p>Instead of adding breaking changes, let's include the new features as &quot;notable changes&quot; in the announcement.</p>
+<p>Title:</p>
+<pre><code>[ANNOUNCE] Release Apache Iceberg Rust ${iceberg_version}
+</code></pre>
+<p>Content:</p>
+<pre><code>Hi all,
+
+The Apache Iceberg Rust community is pleased to announce
+that Apache Iceberg Rust ${iceberg_version} has been released!
+
+Iceberg is a data access layer that allows users to easily and efficiently
+retrieve data from various storage services in a unified way.
+
+The notable changes since ${iceberg_version} include:
+1. xxxxx
+2. yyyyyy
+3. zzzzzz
+
+Please refer to the change log for the complete list of changes:
+https://github.com/apache/iceberg-rust/releases/tag/v${iceberg_version}
+
+Apache Iceberg Rust website: https://rust.iceberg.apache.org/
+
+Download Links: https://rust.iceberg.apache.org/download
+
+Iceberg Resources:
+- Issue: https://github.com/apache/iceberg-rust/issues
+- Mailing list: dev@iceberg.apache.org
+
+Thanks
+On behalf of Apache Iceberg Community
+</code></pre>
+<p>Example: <a href="https://lists.apache.org/thread/oy77n55brvk72tnlb2bjzfs9nz3cfd0s">https://lists.apache.org/thread/oy77n55brvk72tnlb2bjzfs9nz3cfd0s</a></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="using-podman-instead-of-docker"><a class="header" href="#using-podman-instead-of-docker">Using Podman instead of Docker</a></h1>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="setup-gpg-key"><a class="header" href="#setup-gpg-key">Setup GPG key</a></h1>
+<blockquote>
+<p>This section is a brief from the <a href="https://infra.apache.org/openpgp.html">Cryptography with OpenPGP</a> guideline.</p>
+</blockquote>
+<h2 id="install-gpg"><a class="header" href="#install-gpg">Install GPG</a></h2>
+<p>For more details, please refer to <a href="https://www.gnupg.org/download/index.html">GPG official website</a>. Here shows one approach to install GPG with <code>apt</code>:</p>
+<pre><code class="language-shell">sudo apt install gnupg2
+</code></pre>
+<h2 id="generate-gpg-key"><a class="header" href="#generate-gpg-key">Generate GPG Key</a></h2>
+<p>Attentions:</p>
+<ul>
+<li>Name is best to keep consistent with your full name of Apache ID;</li>
+<li>Email should be the Apache email;</li>
+<li>Name is best to only use English to avoid garbled.</li>
+</ul>
+<p>Run <code>gpg --full-gen-key</code> and complete the generation interactively:</p>
+<pre><code class="language-shell">gpg (GnuPG) 2.2.20; Copyright (C) 2020 Free Software Foundation, Inc.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+Please select what kind of key you want:
+   (1) RSA and RSA (default)
+   (2) DSA and Elgamal
+   (3) DSA (sign only)
+   (4) RSA (sign only)
+  (14) Existing key from card
+Your selection? 1 # input 1
+RSA keys may be between 1024 and 4096 bits long.
+What keysize do you want? (2048) 4096 # input 4096
+Requested keysize is 4096 bits
+Please specify how long the key should be valid.
+         0 = key does not expire
+      &lt;n&gt;  = key expires in n days
+      &lt;n&gt;w = key expires in n weeks
+      &lt;n&gt;m = key expires in n months
+      &lt;n&gt;y = key expires in n years
+Key is valid for? (0) 0 # input 0
+Key does not expire at all
+Is this correct? (y/N) y # input y
+
+GnuPG needs to construct a user ID to identify your key.
+
+Real name: Hulk Lin               # input your name
+Email address: hulk@apache.org    # input your email
+Comment:                          # input some annotations, optional
+You selected this USER-ID:
+    &quot;Hulk &lt;hulk@apache.org&gt;&quot;
+
+Change (N)ame, (C)omment, (E)mail or (O)kay/(Q)uit? O # input O
+We need to generate a lot of random bytes. It is a good idea to perform
+some other action (type on the keyboard, move the mouse, utilize the
+disks) during the prime generation; this gives the random number
+generator a better chance to gain enough entropy.
+We need to generate a lot of random bytes. It is a good idea to perform
+some other action (type on the keyboard, move the mouse, utilize the
+disks) during the prime generation; this gives the random number
+generator a better chance to gain enough entropy.
+
+# Input the security key
+┌──────────────────────────────────────────────────────┐
+│ Please enter this passphrase                         │
+│                                                      │
+│ Passphrase: _______________________________          │
+│                                                      │
+│       &lt;OK&gt;                              &lt;Cancel&gt;     │
+└──────────────────────────────────────────────────────┘
+# key generation will be done after your inputting the key with the following output
+gpg: key E49B00F626B marked as ultimately trusted
+gpg: revocation certificate stored as '/Users/hulk/.gnupg/openpgp-revocs.d/F77B887A4F25A9468C513E9AA3008E49B00F626B.rev'
+public and secret key created and signed.
+
+pub   rsa4096 2022-07-12 [SC]
+      F77B887A4F25A9468C513E9AA3008E49B00F626B
+uid           [ultimate] hulk &lt;hulk@apache.org&gt;
+sub   rsa4096 2022-07-12 [E]
+</code></pre>
+<h2 id="upload-your-key-to-public-gpg-keyserver"><a class="header" href="#upload-your-key-to-public-gpg-keyserver">Upload your key to public GPG keyserver</a></h2>
+<p>Firstly, list your key:</p>
+<pre><code class="language-shell">gpg --list-keys
+</code></pre>
+<p>The output is like:</p>
+<pre><code class="language-shell">-------------------------------
+pub   rsa4096 2022-07-12 [SC]
+      F77B887A4F25A9468C513E9AA3008E49B00F626B
+uid           [ultimate] hulk &lt;hulk@apache.org&gt;
+sub   rsa4096 2022-07-12 [E]
+</code></pre>
+<p>Then, send your key id to key server:</p>
+<pre><code class="language-shell">gpg --keyserver keys.openpgp.org --send-key &lt;key-id&gt; # e.g., F77B887A4F25A9468C513E9AA3008E49B00F626B
+</code></pre>
+<p>Among them, <code>keys.openpgp.org</code> is a randomly selected keyserver, you can use <code>keyserver.ubuntu.com</code> or any other full-featured keyserver.</p>
+<h2 id="check-whether-the-key-is-created-successfully"><a class="header" href="#check-whether-the-key-is-created-successfully">Check whether the key is created successfully</a></h2>
+<p>Uploading takes about one minute; after that, you can check by your email at the corresponding keyserver.</p>
+<p>Uploading keys to the keyserver is mainly for joining a <a href="https://infra.apache.org/release-signing.html#web-of-trust">Web of Trust</a>.</p>
+<h2 id="add-your-gpg-public-key-to-the-keys-document"><a class="header" href="#add-your-gpg-public-key-to-the-keys-document">Add your GPG public key to the KEYS document</a></h2>
+<p>:::info</p>
+<p><code>SVN</code> is required for this step.</p>
+<p>:::</p>
+<p>The svn repository of the release branch is: https://dist.apache.org/repos/dist/release/iceberg</p>
+<p>Please always add the public key to KEYS in the release branch:</p>
+<pre><code class="language-shell">svn co https://dist.apache.org/repos/dist/release/iceberg iceberg-dist
+# As this step will copy all the versions, it will take some time. If the network is broken, please use svn cleanup to delete the lock before re-execute it.
+cd iceberg-dist
+(gpg --list-sigs YOUR_NAME@apache.org &amp;&amp; gpg --export --armor YOUR_NAME@apache.org) &gt;&gt; KEYS # Append your key to the KEYS file
+svn add .   # It is not needed if the KEYS document exists before.
+svn ci -m &quot;add gpg key for YOUR_NAME&quot; # Later on, if you are asked to enter a username and password, just use your apache username and password.
+</code></pre>
+<h2 id="upload-the-gpg-public-key-to-your-github-account"><a class="header" href="#upload-the-gpg-public-key-to-your-github-account">Upload the GPG public key to your GitHub account</a></h2>
+<ul>
+<li>Enter https://github.com/settings/keys to add your GPG key.</li>
+<li>Please remember to bind the email address used in the GPG key to your GitHub account (https://github.com/settings/emails) if you find &quot;unverified&quot; after adding it.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+    </div>
+    </body>
+</html>
