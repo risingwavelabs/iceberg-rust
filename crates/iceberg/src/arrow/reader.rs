@@ -374,7 +374,10 @@ impl ArrowReader {
                 .map(|idx| mask_indices.iter().position(|&i| i == *idx).unwrap())
                 .collect::<Vec<_>>();
 
-            Ok((ProjectionMask::roots(parquet_schema, indices), Some(reorder)))
+            Ok((
+                ProjectionMask::roots(parquet_schema, indices),
+                Some(reorder),
+            ))
         }
     }
 
