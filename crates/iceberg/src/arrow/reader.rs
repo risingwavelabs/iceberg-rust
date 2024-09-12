@@ -186,6 +186,7 @@ impl ArrowReader {
 
         // Create a projection mask for the batch stream to select which columns in the
         // Parquet file that we want in the response
+        // Since Parquet projection mask will lose the order of the columns, we need to reorder.
         let (projection_mask, reorder) = Self::get_arrow_projection_mask(
             &task.project_field_ids,
             &task.schema,
@@ -328,7 +329,16 @@ impl ArrowReader {
                 }
             }
 
-            Ok((ProjectionMask::leaves(parquet_schema, indices.clone()), Some(indices)))
+            // projection mask is order by indices
+            let mut mask_indices = indices.clone();
+            mask_indices.sort_by_key(|&x| x);
+            // try to reorder the mask_indices to indices
+            let reorder = indices
+                .iter()
+                .map(|idx| mask_indices.iter().position(|&i| i == *idx).unwrap())
+                .collect::<Vec<_>>();
+
+            Ok((ProjectionMask::leaves(parquet_schema, indices), Some(reorder)))
         }
     }
 
