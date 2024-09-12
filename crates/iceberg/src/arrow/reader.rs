@@ -328,11 +328,7 @@ impl ArrowReader {
                 }
             }
 
-            let mut indexed_pairs: Vec<(usize, usize)> = indices.iter().cloned().enumerate().collect();
-            indexed_pairs.sort_by_key(|&(_, index)| index);
-            let reorder_vec: Vec<usize> = indexed_pairs.iter().map(|&(pos, _)| pos).collect();
-
-            Ok((ProjectionMask::leaves(parquet_schema, indices), Some(reorder_vec)))
+            Ok((ProjectionMask::leaves(parquet_schema, indices.clone()), Some(indices)))
         }
     }
 
