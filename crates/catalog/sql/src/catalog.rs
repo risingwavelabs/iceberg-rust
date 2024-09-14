@@ -630,7 +630,7 @@ impl Catalog for SqlCatalog {
         let new_table_name = creation.name.clone();
 
         // build table location
-        let table_creation_localtion = match creation.location {
+        let table_creation_location = match creation.location {
             Some(location) => location,
             None => {
                 let namespace_properties =
@@ -653,14 +653,14 @@ impl Catalog for SqlCatalog {
 
         // build table metadata
         let table_metadata = TableMetadataBuilder::from_table_creation(TableCreation {
-            location: Some(table_creation_localtion.clone()),
+            location: Some(table_creation_location.clone()),
             ..creation
         })?
         .build()?;
 
         // serde table to json
-        let new_table_meta_localtion = metadata_path(&table_creation_localtion, Uuid::new_v4());
-        let file = self.fileio.new_output(&new_table_meta_localtion)?;
+        let new_table_meta_location = metadata_path(&table_creation_location, Uuid::new_v4());
+        let file = self.fileio.new_output(&new_table_meta_location)?;
         file.write(serde_json::to_vec(&table_metadata)?.into())
             .await?;
 
@@ -673,7 +673,7 @@ impl Catalog for SqlCatalog {
             Some(&self.name),
             Some(&namespace_name),
             Some(&new_table_name),
-            Some(&new_table_meta_localtion),
+            Some(&new_table_meta_location),
             Some(CATALOG_FIELD_TABLE_RECORD_TYPE),
         ];
 
@@ -682,7 +682,7 @@ impl Catalog for SqlCatalog {
         Ok(Table::builder()
             .file_io(self.fileio.clone())
             .identifier(identifier)
-            .metadata_location(new_table_meta_localtion)
+            .metadata_location(new_table_meta_location)
             .metadata(table_metadata)
             .build()?)
     }
@@ -723,8 +723,8 @@ impl Catalog for SqlCatalog {
             }
         }
 
-        let new_table_meta_localtion = metadata_path(table.metadata().location(), Uuid::new_v4());
-        let file = self.fileio.new_output(&new_table_meta_localtion)?;
+        let new_table_meta_location = metadata_path(table.metadata().location(), Uuid::new_v4());
+        let file = self.fileio.new_output(&new_table_meta_location)?;
         file.write(serde_json::to_vec(&update_table_metadata)?.into())
             .await?;
 
@@ -742,7 +742,7 @@ impl Catalog for SqlCatalog {
 
         let namespace_name = identifier.namespace().join(".");
         let args: Vec<Option<&str>> = vec![
-            Some(&new_table_meta_localtion),
+            Some(&new_table_meta_location),
             Some(&self.name),
             Some(&namespace_name),
             Some(identifier.name()),
@@ -753,7 +753,7 @@ impl Catalog for SqlCatalog {
         Ok(Table::builder()
             .file_io(self.fileio.clone())
             .identifier(identifier)
-            .metadata_location(new_table_meta_localtion)
+            .metadata_location(new_table_meta_location)
             .metadata(update_table_metadata)
             .build()?)
     }
