@@ -485,9 +485,9 @@ impl Catalog for SqlCatalog {
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        if !self.namespace_exists(namespace).await? {
-            return no_such_namespace_err(namespace);
-        }
+        // if !self.namespace_exists(namespace).await? {
+        //     return no_such_namespace_err(namespace);
+        // }
 
         let query = format!(
             "SELECT {CATALOG_FIELD_TABLE_NAME} FROM {CATALOG_TABLE_NAME} 
@@ -618,9 +618,9 @@ impl Catalog for SqlCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        if !self.namespace_exists(namespace).await? {
-            return no_such_namespace_err(namespace);
-        }
+        // if !self.namespace_exists(namespace).await? {
+        //     return no_such_namespace_err(namespace);
+        // }
 
         let identifier = TableIdent::new(namespace.clone(), creation.name.clone());
         if self.table_exists(&identifier).await? {
