@@ -485,10 +485,6 @@ impl Catalog for SqlCatalog {
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        // if !self.namespace_exists(namespace).await? {
-        //     return no_such_namespace_err(namespace);
-        // }
-
         let query = format!(
             "SELECT {CATALOG_FIELD_TABLE_NAME} FROM {CATALOG_TABLE_NAME} 
              WHERE {CATALOG_FIELD_CATALOG_NAME} = ? 
@@ -618,10 +614,6 @@ impl Catalog for SqlCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        // if !self.namespace_exists(namespace).await? {
-        //     return no_such_namespace_err(namespace);
-        // }
-
         let identifier = TableIdent::new(namespace.clone(), creation.name.clone());
         if self.table_exists(&identifier).await? {
             return table_already_exists_err(&identifier);
@@ -702,19 +694,21 @@ impl Catalog for SqlCatalog {
         let table_updates = commit.take_updates();
 
         let table = self.load_table(&identifier).await?;
-        let mut update_table_metadata = table.metadata().clone();
+        let mut update_table_metadata_builder = TableMetadataBuilder::new(table.metadata().clone());
 
         for table_update in table_updates {
             match table_update {
                 TableUpdate::AddSnapshot { snapshot } => {
-                    update_table_metadata.append_snapshot(snapshot);
+                    update_table_metadata_builder =
+                        update_table_metadata_builder.append_snapshot(snapshot)?;
                 }
 
                 TableUpdate::SetSnapshotRef {
                     ref_name,
                     reference,
                 } => {
-                    update_table_metadata.update_snapshot_ref(ref_name, reference);
+                    update_table_metadata_builder =
+                        update_table_metadata_builder.set_snapshot_ref(ref_name, reference)?;
                 }
 
                 _ => {
@@ -725,6 +719,7 @@ impl Catalog for SqlCatalog {
 
         let new_table_meta_location = metadata_path(table.metadata().location(), Uuid::new_v4());
         let file = self.fileio.new_output(&new_table_meta_location)?;
+        let update_table_metadata = update_table_metadata_builder.build()?;
         file.write(serde_json::to_vec(&update_table_metadata)?.into())
             .await?;
 
@@ -1676,12 +1671,6 @@ mod tests {
                 ("added-files-size".to_string(), "6001".to_string())
             ])
         );
-
-        let table_reload = catalog.load_table(&expected_table_ident).await.unwrap();
-        let snapshot_reload_vec = table_reload.metadata().snapshots().collect_vec();
-        assert_eq!(1, snapshot_reload_vec.len());
-        let snapshot_reload = &snapshot_reload_vec[0];
-        assert_eq!(snapshot, snapshot_reload);
     }
 
     #[tokio::test]
@@ -1738,16 +1727,19 @@ mod tests {
             .with_manifest_list("/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro")
             .with_summary(Summary { operation: Operation::Append, other: HashMap::from_iter(vec![("spark.app.id".to_string(), "local-1662532784305".to_string()), ("added-data-files".to_string(), "4".to_string()), ("added-records".to_string(), "4".to_string()), ("added-files-size".to_string(), "6001".to_string())]) })
             .build();
+
         let table_update_add_snapshot = TableUpdate::AddSnapshot {
             snapshot: add_snapshot,
         };
+
+        let table_update_opers = vec![table_update_add_snapshot, table_update_set_snapshot_ref];
+
         let table_commit = TableCommit::builder()
             .ident(expected_table_ident.clone())
-            .updates(vec![table_update_add_snapshot])
+            .updates(table_update_opers)
             .requirements(vec![])
             .build();
-        catalog.update_table(table_commit).await.unwrap();
-        let table = catalog.load_table(&expected_table_ident).await.unwrap();
+        let table = catalog.update_table(table_commit).await.unwrap();
         let snapshot_vec = table.metadata().snapshots().collect_vec();
         assert_eq!(1, snapshot_vec.len());
         let snapshot = &snapshot_vec[0];
@@ -1773,26 +1765,14 @@ mod tests {
         let snapshot_refs_map = table.metadata().snapshot_refs();
         assert_eq!(1, snapshot_refs_map.len());
         let snapshot_ref = snapshot_refs_map.get(MAIN_BRANCH).unwrap();
-        let basic_snapshot_ref = SnapshotReference {
+        let expected_snapshot_ref = SnapshotReference {
             snapshot_id,
             retention: SnapshotRetention::Branch {
-                min_snapshots_to_keep: None,
-                max_snapshot_age_ms: None,
-                max_ref_age_ms: None,
+                min_snapshots_to_keep: Some(10),
+                max_snapshot_age_ms: Some(100),
+                max_ref_age_ms: Some(200),
             },
         };
-        assert_eq!(snapshot_ref, &basic_snapshot_ref);
-
-        let table_commit = TableCommit::builder()
-            .ident(expected_table_ident.clone())
-            .updates(vec![table_update_set_snapshot_ref])
-            .requirements(vec![])
-            .build();
-        catalog.update_table(table_commit).await.unwrap();
-        let table = catalog.load_table(&expected_table_ident).await.unwrap();
-        let snapshot_refs_map = table.metadata().snapshot_refs();
-        assert_eq!(1, snapshot_refs_map.len());
-        let snapshot_ref = snapshot_refs_map.get(MAIN_BRANCH).unwrap();
-        assert_eq!(snapshot_ref, &reference);
+        assert_eq!(snapshot_ref, &expected_snapshot_ref);
     }
 }

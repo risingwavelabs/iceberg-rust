@@ -331,12 +331,6 @@ impl TableMetadata {
             .insert(snapshot.snapshot_id(), Arc::new(snapshot));
     }
 
-    /// update snapshot ref of table
-    #[inline]
-    pub fn update_snapshot_ref(&mut self, ref_name: String, reference: SnapshotReference) {
-        self.refs.insert(ref_name, reference);
-    }
-
     /// Returns snapshot references.
     #[inline]
     pub fn snapshot_refs(&self) -> &HashMap<String, SnapshotReference> {
@@ -641,6 +635,49 @@ impl TableMetadataBuilder {
     /// Changes uuid of table metadata.
     pub fn assign_uuid(mut self, uuid: Uuid) -> Result<Self> {
         self.0.table_uuid = uuid;
+        Ok(self)
+    }
+
+    /// Append snapshot to table
+    pub fn append_snapshot(mut self, snapshot: Snapshot) -> Result<Self> {
+        self.0.append_snapshot(snapshot);
+
+        Ok(self)
+    }
+
+    /// Set current snapshot ref of table
+    pub fn set_snapshot_ref(
+        mut self,
+        ref_name: String,
+        reference: SnapshotReference,
+    ) -> Result<Self> {
+        if let Some(existing_snapshot_ref) = self.0.refs.get(&ref_name) {
+            if (*existing_snapshot_ref) == reference {
+                return Ok(self);
+            }
+        }
+
+        let snapshot_id = reference.snapshot_id;
+        let snapshot = self
+            .0
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Snapshot not found"))?;
+        if snapshot.snapshot_id() == reference.snapshot_id {
+            self.0.last_updated_ms = snapshot.timestamp_ms();
+        }
+
+        if ref_name == MAIN_BRANCH {
+            self.0.current_snapshot_id = Some(snapshot_id);
+            assert_ne!(0, self.0.last_updated_ms);
+
+            self.0.snapshot_log.push(SnapshotLog {
+                timestamp_ms: self.0.last_updated_ms,
+                snapshot_id,
+            });
+        }
+
+        self.0.refs.insert(ref_name, reference);
+
         Ok(self)
     }
 
