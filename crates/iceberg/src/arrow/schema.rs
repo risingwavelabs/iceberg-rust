@@ -24,8 +24,8 @@ use arrow_array::types::{
     validate_decimal_precision_and_scale, Decimal128Type, TimestampMicrosecondType,
 };
 use arrow_array::{
-    BooleanArray, Datum as ArrowDatum, Float32Array, Float64Array, Int32Array, Int64Array,
-    PrimitiveArray, Scalar, StringArray, TimestampMicrosecondArray,
+    BooleanArray, Date32Array, Datum as ArrowDatum, Float32Array, Float64Array, Int32Array,
+    Int64Array, PrimitiveArray, Scalar, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use bitvec::macros::internal::funty::Fundamental;
@@ -171,7 +171,6 @@ fn visit_type<V: ArrowSchemaVisitor>(r#type: &DataType, visitor: &mut V) -> Resu
 }
 
 /// Visit list types in post order.
-#[allow(dead_code)]
 fn visit_list<V: ArrowSchemaVisitor>(
     data_type: &DataType,
     element_field: &Field,
@@ -184,7 +183,6 @@ fn visit_list<V: ArrowSchemaVisitor>(
 }
 
 /// Visit struct type in post order.
-#[allow(dead_code)]
 fn visit_struct<V: ArrowSchemaVisitor>(fields: &Fields, visitor: &mut V) -> Result<V::T> {
     let mut results = Vec::with_capacity(fields.len());
     for field in fields {
@@ -198,7 +196,6 @@ fn visit_struct<V: ArrowSchemaVisitor>(fields: &Fields, visitor: &mut V) -> Resu
 }
 
 /// Visit schema in post order.
-#[allow(dead_code)]
 fn visit_schema<V: ArrowSchemaVisitor>(schema: &ArrowSchema, visitor: &mut V) -> Result<V::U> {
     let mut results = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
@@ -211,10 +208,15 @@ fn visit_schema<V: ArrowSchemaVisitor>(schema: &ArrowSchema, visitor: &mut V) ->
 }
 
 /// Convert Arrow schema to ceberg schema.
-#[allow(dead_code)]
 pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
     let mut visitor = ArrowSchemaConverter::new();
     visit_schema(schema, &mut visitor)
+}
+
+/// Convert Arrow type to iceberg type.
+pub fn arrow_type_to_type(ty: &DataType) -> Result<Type> {
+    let mut visitor = ArrowSchemaConverter::new();
+    visit_type(ty, &mut visitor)
 }
 
 const ARROW_FIELD_DOC_KEY: &str = "doc";
@@ -246,7 +248,6 @@ fn get_field_doc(field: &Field) -> Option<String> {
 struct ArrowSchemaConverter;
 
 impl ArrowSchemaConverter {
-    #[allow(dead_code)]
     fn new() -> Self {
         Self {}
     }
@@ -615,6 +616,15 @@ pub fn schema_to_arrow_schema(schema: &crate::spec::Schema) -> crate::Result<Arr
     }
 }
 
+/// Convert iceberg type to an arrow type.
+pub fn type_to_arrow_type(ty: &crate::spec::Type) -> crate::Result<DataType> {
+    let mut converter = ToArrowSchemaConverter;
+    match crate::spec::visit_type(ty, &mut converter)? {
+        ArrowSchemaOrFieldOrType::Type(ty) => Ok(ty),
+        _ => unreachable!(),
+    }
+}
+
 /// Convert Iceberg Datum to Arrow Datum.
 pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Box<dyn ArrowDatum + Send>> {
     match (datum.data_type(), datum.literal()) {
@@ -636,6 +646,9 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Box<dyn ArrowDatum + Send
         (PrimitiveType::String, PrimitiveLiteral::String(value)) => {
             Ok(Box::new(StringArray::new_scalar(value.as_str())))
         }
+        (PrimitiveType::Date, PrimitiveLiteral::Int(value)) => {
+            Ok(Box::new(Date32Array::new_scalar(*value)))
+        }
         (PrimitiveType::Timestamp, PrimitiveLiteral::Long(value)) => {
             Ok(Box::new(TimestampMicrosecondArray::new_scalar(*value)))
         }
@@ -655,43 +668,57 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Box<dyn ArrowDatum + Send
 }
 
 macro_rules! get_parquet_stat_as_datum {
-    ($limit_type:ident) => {
+    ($limit_type:tt) => {
         paste::paste! {
         /// Gets the $limit_type value from a parquet Statistics struct, as a Datum
         pub(crate) fn [<get_parquet_stat_ $limit_type _as_datum>](
             primitive_type: &PrimitiveType, stats: &Statistics
         ) -> Result<Option<Datum>> {
-            Ok(Some(match (primitive_type, stats) {
-                (PrimitiveType::Boolean, Statistics::Boolean(stats)) => Datum::bool(*stats.$limit_type()),
-                (PrimitiveType::Int, Statistics::Int32(stats)) => Datum::int(*stats.$limit_type()),
-                (PrimitiveType::Date, Statistics::Int32(stats)) => Datum::date(*stats.$limit_type()),
-                (PrimitiveType::Long, Statistics::Int64(stats)) => Datum::long(*stats.$limit_type()),
-                (PrimitiveType::Time, Statistics::Int64(stats)) => Datum::time_micros(*stats.$limit_type())?,
+            Ok(match (primitive_type, stats) {
+                (PrimitiveType::Boolean, Statistics::Boolean(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::bool(*val)),
+                (PrimitiveType::Int, Statistics::Int32(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::int(*val)),
+                (PrimitiveType::Date, Statistics::Int32(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::date(*val)),
+                (PrimitiveType::Long, Statistics::Int64(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::long(*val)),
+                (PrimitiveType::Time, Statistics::Int64(stats)) => {
+                    let Some(val) = stats.[<$limit_type _opt>]() else {
+                        return Ok(None);
+                    };
+
+                    Some(Datum::time_micros(*val)?)
+                }
                 (PrimitiveType::Timestamp, Statistics::Int64(stats)) => {
-                    Datum::timestamp_micros(*stats.$limit_type())
+                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamp_micros(*val))
                 }
                 (PrimitiveType::Timestamptz, Statistics::Int64(stats)) => {
-                    Datum::timestamptz_micros(*stats.$limit_type())
+                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamptz_micros(*val))
                 }
                 (PrimitiveType::TimestampNs, Statistics::Int64(stats)) => {
-                    Datum::timestamp_nanos(*stats.$limit_type())
+                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamp_nanos(*val))
                 }
                 (PrimitiveType::TimestamptzNs, Statistics::Int64(stats)) => {
-                    Datum::timestamptz_nanos(*stats.$limit_type())
+                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamptz_nanos(*val))
                 }
-                (PrimitiveType::Float, Statistics::Float(stats)) => Datum::float(*stats.$limit_type()),
-                (PrimitiveType::Double, Statistics::Double(stats)) => Datum::double(*stats.$limit_type()),
+                (PrimitiveType::Float, Statistics::Float(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::float(*val)),
+                (PrimitiveType::Double, Statistics::Double(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::double(*val)),
                 (PrimitiveType::String, Statistics::ByteArray(stats)) => {
-                    Datum::string(stats.$limit_type().as_utf8()?)
+                    let Some(val) = stats.[<$limit_type _opt>]() else {
+                        return Ok(None);
+                    };
+
+                    Some(Datum::string(val.as_utf8()?))
                 }
                 (PrimitiveType::Decimal {
                     precision: _,
                     scale: _,
                 }, Statistics::ByteArray(stats)) => {
-                    Datum::new(
+                    let Some(bytes) = stats.[<$limit_type _bytes_opt>]() else {
+                        return Ok(None);
+                    };
+
+                    Some(Datum::new(
                         primitive_type.clone(),
-                        PrimitiveLiteral::Int128(i128::from_le_bytes(stats.[<$limit_type _bytes>]().try_into()?)),
-                    )
+                        PrimitiveLiteral::Int128(i128::from_le_bytes(bytes.try_into()?)),
+                    ))
                 }
                 (
                 PrimitiveType::Decimal {
@@ -699,10 +726,12 @@ macro_rules! get_parquet_stat_as_datum {
                     scale: _,
                 },
                 Statistics::Int32(stats)) => {
-                    Datum::new(
-                        primitive_type.clone(),
-                        PrimitiveLiteral::Int128(i128::from(*stats.$limit_type())),
-                    )
+                    stats.[<$limit_type _opt>]().map(|val| {
+                        Datum::new(
+                            primitive_type.clone(),
+                            PrimitiveLiteral::Int128(i128::from(*val)),
+                        )
+                    })
                 }
 
                 (
@@ -712,40 +741,46 @@ macro_rules! get_parquet_stat_as_datum {
                     },
                     Statistics::Int64(stats),
                 ) => {
-                    Datum::new(
-                        primitive_type.clone(),
-                        PrimitiveLiteral::Int128(i128::from(*stats.$limit_type())),
-                    )
+                    stats.[<$limit_type _opt>]().map(|val| {
+                        Datum::new(
+                            primitive_type.clone(),
+                            PrimitiveLiteral::Int128(i128::from(*val)),
+                        )
+                    })
                 }
                 (PrimitiveType::Uuid, Statistics::FixedLenByteArray(stats)) => {
-                    let raw = stats.[<$limit_type _bytes>]();
-                    if raw.len() != 16 {
+                    let Some(bytes) = stats.[<$limit_type _bytes_opt>]() else {
+                        return Ok(None);
+                    };
+                    if bytes.len() != 16 {
                         return Err(Error::new(
                             ErrorKind::Unexpected,
                             "Invalid length of uuid bytes.",
                         ));
                     }
-                    Datum::uuid(Uuid::from_bytes(
-                        raw[..16].try_into().unwrap(),
-                    ))
+                    Some(Datum::uuid(Uuid::from_bytes(
+                        bytes[..16].try_into().unwrap(),
+                    )))
                 }
                 (PrimitiveType::Fixed(len), Statistics::FixedLenByteArray(stat)) => {
-                    let raw = stat.[<$limit_type _bytes>]();
-                    if raw.len() != *len as usize {
+                    let Some(bytes) = stat.[<$limit_type _bytes_opt>]() else {
+                        return Ok(None);
+                    };
+                    if bytes.len() != *len as usize {
                         return Err(Error::new(
                             ErrorKind::Unexpected,
                             "Invalid length of fixed bytes.",
                         ));
                     }
-                    Datum::fixed(raw.to_vec())
+                    Some(Datum::fixed(bytes.to_vec()))
                 }
                 (PrimitiveType::Binary, Statistics::ByteArray(stat)) => {
-                    Datum::binary(stat.[<$limit_type _bytes>]().to_vec())
+                    return Ok(stat.[<$limit_type _bytes_opt>]().map(|bytes|Datum::binary(bytes.to_vec())))
                 }
                 _ => {
                     return Ok(None);
                 }
-            }))
+            })
             }
         }
     }
@@ -779,7 +814,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 
     use super::*;
-    use crate::spec::Schema;
+    use crate::spec::{Literal, Schema};
 
     /// Create a simple field with metadata.
     fn simple_field(name: &str, ty: DataType, nullable: bool, value: &str) -> Field {
@@ -1364,5 +1399,91 @@ mod tests {
         let schema = iceberg_schema_for_schema_to_arrow_schema();
         let converted_arrow_schema = schema_to_arrow_schema(&schema).unwrap();
         assert_eq!(converted_arrow_schema, arrow_schema);
+    }
+
+    #[test]
+    fn test_type_conversion() {
+        // test primitive type
+        {
+            let arrow_type = DataType::Int32;
+            let iceberg_type = Type::Primitive(PrimitiveType::Int);
+            assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+            assert_eq!(iceberg_type, arrow_type_to_type(&arrow_type).unwrap());
+        }
+
+        // test struct type
+        {
+            // no metadata will cause error
+            let arrow_type = DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Utf8, true),
+            ]));
+            assert_eq!(
+                &arrow_type_to_type(&arrow_type).unwrap_err().to_string(),
+                "DataInvalid => Field id not found in metadata"
+            );
+
+            let arrow_type = DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int64, false).with_metadata(HashMap::from_iter([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    1.to_string(),
+                )])),
+                Field::new("b", DataType::Utf8, true).with_metadata(HashMap::from_iter([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    2.to_string(),
+                )])),
+            ]));
+            let iceberg_type = Type::Struct(StructType::new(vec![
+                NestedField {
+                    id: 1,
+                    doc: None,
+                    name: "a".to_string(),
+                    required: true,
+                    field_type: Box::new(Type::Primitive(PrimitiveType::Long)),
+                    initial_default: None,
+                    write_default: None,
+                }
+                .into(),
+                NestedField {
+                    id: 2,
+                    doc: None,
+                    name: "b".to_string(),
+                    required: false,
+                    field_type: Box::new(Type::Primitive(PrimitiveType::String)),
+                    initial_default: None,
+                    write_default: None,
+                }
+                .into(),
+            ]));
+            assert_eq!(iceberg_type, arrow_type_to_type(&arrow_type).unwrap());
+            assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+
+            // initial_default and write_default is ignored
+            let iceberg_type = Type::Struct(StructType::new(vec![
+                NestedField {
+                    id: 1,
+                    doc: None,
+                    name: "a".to_string(),
+                    required: true,
+                    field_type: Box::new(Type::Primitive(PrimitiveType::Long)),
+                    initial_default: Some(Literal::Primitive(PrimitiveLiteral::Int(114514))),
+                    write_default: None,
+                }
+                .into(),
+                NestedField {
+                    id: 2,
+                    doc: None,
+                    name: "b".to_string(),
+                    required: false,
+                    field_type: Box::new(Type::Primitive(PrimitiveType::String)),
+                    initial_default: None,
+                    write_default: Some(Literal::Primitive(PrimitiveLiteral::String(
+                        "514".to_string(),
+                    ))),
+                }
+                .into(),
+            ]));
+            assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+        }
     }
 }

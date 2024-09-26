@@ -15,5 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod expr_to_predicate;
-pub(crate) mod scan;
+use pyo3::exceptions::PyValueError;
+use pyo3::PyErr;
+
+/// Convert an iceberg error to a python error
+pub fn to_py_err(err: iceberg::Error) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}

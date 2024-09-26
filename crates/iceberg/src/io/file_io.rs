@@ -32,16 +32,25 @@ use crate::{Error, ErrorKind, Result};
 ///
 /// All path passed to `FileIO` must be absolute path starting with scheme string used to construct `FileIO`.
 /// For example, if you construct `FileIO` with `s3a` scheme, then all path passed to `FileIO` must start with `s3a://`.
+///
+/// Supported storages:
+///
+/// | Storage            | Feature Flag     | Schemes    |
+/// |--------------------|-------------------|------------|
+/// | Local file system  | `storage-fs`      | `file`     |
+/// | Memory             | `storage-memory`  | `memory`   |
+/// | S3                 | `storage-s3`      | `s3`, `s3a`|
+/// | GCS                | `storage-gcs`     | `gs`       |
 #[derive(Clone, Debug)]
 pub struct FileIO {
     inner: Arc<Storage>,
 }
 
 impl FileIO {
-    /// Try to infer file io scheme from path.
+    /// Try to infer file io scheme from path. See [`FileIO`] for supported schemes.
     ///
-    /// If it's a valid url, for example http://example.org, url scheme will be used.
-    /// If it's not a valid url, will try to detect if it's a file path.
+    /// - If it's a valid url, for example `s3://bucket/a`, url scheme will be used, and the rest of the url will be ignored.
+    /// - If it's not a valid url, will try to detect if it's a file path.
     ///
     /// Otherwise will return parsing error.
     pub fn from_path(path: impl AsRef<str>) -> crate::Result<FileIOBuilder> {
@@ -62,24 +71,40 @@ impl FileIO {
     }
 
     /// Deletes file.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn delete(&self, path: impl AsRef<str>) -> Result<()> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.delete(relative_path).await?)
     }
-    
-    /// Remove all
+
+    /// Remove the path and all nested dirs and files recursively.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn remove_all(&self, path: impl AsRef<str>) -> Result<()> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.remove_all(relative_path).await?)
     }
 
     /// Check file exists.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn is_exist(&self, path: impl AsRef<str>) -> Result<bool> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.is_exist(relative_path).await?)
     }
 
     /// Creates input file.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_input(&self, path: impl AsRef<str>) -> Result<InputFile> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         let path = path.as_ref().to_string();
@@ -92,6 +117,10 @@ impl FileIO {
     }
 
     /// Creates output file.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         let path = path.as_ref().to_string();
@@ -117,6 +146,7 @@ pub struct FileIOBuilder {
 
 impl FileIOBuilder {
     /// Creates a new builder with scheme.
+    /// See [`FileIO`] for supported schemes.
     pub fn new(scheme_str: impl ToString) -> Self {
         Self {
             scheme_str: Some(scheme_str.to_string()),
@@ -334,7 +364,7 @@ impl OutputFile {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::fs::{create_dir_all, File};
     use std::io::Write;
     use std::path::Path;
 
@@ -349,6 +379,7 @@ mod tests {
     }
 
     fn write_to_file<P: AsRef<Path>>(s: &str, path: P) {
+        create_dir_all(path.as_ref().parent().unwrap()).unwrap();
         let mut f = File::create(path).unwrap();
         write!(f, "{s}").unwrap();
     }
@@ -385,16 +416,24 @@ mod tests {
     async fn test_delete_local_file() {
         let tmp_dir = TempDir::new().unwrap();
 
-        let file_name = "a.txt";
-        let content = "Iceberg loves rust.";
-
-        let full_path = format!("{}/{}", tmp_dir.path().to_str().unwrap(), file_name);
-        write_to_file(content, &full_path);
+        let a_path = format!("{}/{}", tmp_dir.path().to_str().unwrap(), "a.txt");
+        let sub_dir_path = format!("{}/sub", tmp_dir.path().to_str().unwrap());
+        let b_path = format!("{}/{}", sub_dir_path, "b.txt");
+        let c_path = format!("{}/{}", sub_dir_path, "c.txt");
+        write_to_file("Iceberg loves rust.", &a_path);
+        write_to_file("Iceberg loves rust.", &b_path);
+        write_to_file("Iceberg loves rust.", &c_path);
 
         let file_io = create_local_file_io();
-        assert!(file_io.is_exist(&full_path).await.unwrap());
-        file_io.delete(&full_path).await.unwrap();
-        assert!(!file_io.is_exist(&full_path).await.unwrap());
+        assert!(file_io.is_exist(&a_path).await.unwrap());
+
+        file_io.remove_all(&sub_dir_path).await.unwrap();
+        assert!(!file_io.is_exist(&b_path).await.unwrap());
+        assert!(!file_io.is_exist(&c_path).await.unwrap());
+        assert!(file_io.is_exist(&a_path).await.unwrap());
+
+        file_io.delete(&a_path).await.unwrap();
+        assert!(!file_io.is_exist(&a_path).await.unwrap());
     }
 
     #[tokio::test]
@@ -407,6 +446,7 @@ mod tests {
         let file_io = create_local_file_io();
         assert!(!file_io.is_exist(&full_path).await.unwrap());
         assert!(file_io.delete(&full_path).await.is_ok());
+        assert!(file_io.remove_all(&full_path).await.is_ok());
     }
 
     #[tokio::test]
