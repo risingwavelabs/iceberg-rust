@@ -32,7 +32,7 @@ keywords = ["iceberg", "sql", "catalog"]
 async-trait = { workspace = true }
 iceberg = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { version = "0.7.3", features = ["any"], default-features = false }
+sqlx = { version = "0.7.4", features = ["any"], default-features = false }
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
@@ -40,7 +40,7 @@ uuid = { workspace = true, features = ["v4"] }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
 itertools = { workspace = true }
 regex = "1.10.5"
-sqlx = { version = "0.7.3", features = [
+sqlx = { version = "0.7.4", features = [
   "tls-rustls",
   "runtime-tokio",
   "any",
