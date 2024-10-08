@@ -23,8 +23,8 @@ use iceberg::io::FileIO;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation,
-    TableIdent,
+    Catalog, Error, Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
+    TableUpdate,
 };
 use sqlx::any::{install_default_drivers, AnyPoolOptions, AnyQueryResult, AnyRow};
 use sqlx::{Any, AnyPool, Row, Transaction};
@@ -588,8 +588,8 @@ impl Catalog for SqlCatalog {
             &format!(
                 "DELETE FROM {CATALOG_TABLE_NAME}
                  WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
-                  AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                   AND {CATALOG_FIELD_TABLE_NAME} = ?
+                  AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                   AND (
                     {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
                     OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
@@ -769,12 +769,82 @@ impl Catalog for SqlCatalog {
         Ok(())
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        let identifier = commit.identifier().clone();
+        if !self.table_exists(&identifier).await? {
+            return no_such_table_err(&identifier);
+        }
+
+        // ReplaceSortOrder is currently not supported, so ignore the requirement here.
+        let _requirements = commit.take_requirements();
+        let table_updates = commit.take_updates();
+
+        let table = self.load_table(&identifier).await?;
+        let mut update_table_metadata_builder =
+            TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None);
+
+        for table_update in table_updates {
+            match table_update {
+                TableUpdate::AddSnapshot { snapshot } => {
+                    update_table_metadata_builder =
+                        update_table_metadata_builder.add_snapshot(snapshot)?;
+                }
+
+                TableUpdate::SetSnapshotRef {
+                    ref_name,
+                    reference,
+                } => {
+                    update_table_metadata_builder =
+                        update_table_metadata_builder.set_ref(&ref_name, reference)?;
+                }
+
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+
+        let new_table_meta_location = metadata_path(table.metadata().location(), Uuid::new_v4());
+        let file = self.fileio.new_output(&new_table_meta_location)?;
+        let update_table_metadata = update_table_metadata_builder.build()?;
+        file.write(serde_json::to_vec(&update_table_metadata.metadata)?.into())
+            .await?;
+
+        let update = format!(
+            "UPDATE {CATALOG_TABLE_NAME} 
+             SET {CATALOG_FIELD_METADATA_LOCATION_PROP} = ? 
+             WHERE {CATALOG_FIELD_CATALOG_NAME} = ? 
+             AND {CATALOG_FIELD_TABLE_NAMESPACE} = ? 
+             AND {CATALOG_FIELD_TABLE_NAME} = ? 
+             AND (
+                    {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                    OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
+                  )"
+        );
+
+        let namespace_name = identifier.namespace().join(".");
+        let args: Vec<Option<&str>> = vec![
+            Some(&new_table_meta_location),
+            Some(&self.name),
+            Some(&namespace_name),
+            Some(identifier.name()),
+        ];
+
+        self.execute(&update, args, None).await?;
+
+        Ok(Table::builder()
+            .file_io(self.fileio.clone())
+            .identifier(identifier)
+            .metadata_location(new_table_meta_location)
+            .metadata(update_table_metadata.metadata)
+            .build()?)
     }
+}
+
+/// Generate the metadata path for a table
+#[inline]
+pub fn metadata_path(meta_data_location: &str, uuid: Uuid) -> String {
+    format!("{}/metadata/0-{}.metadata.json", meta_data_location, uuid)
 }
 
 #[cfg(test)]
@@ -783,9 +853,14 @@ mod tests {
     use std::hash::Hash;
 
     use iceberg::io::FileIOBuilder;
-    use iceberg::spec::{BoundPartitionSpec, NestedField, PrimitiveType, Schema, SortOrder, Type};
+    use iceberg::spec::{
+        BoundPartitionSpec, NestedField, Operation, PrimitiveType, Schema, Snapshot,
+        SnapshotReference, SnapshotRetention, SortOrder, Summary, Type, MAIN_BRANCH,
+    };
     use iceberg::table::Table;
-    use iceberg::{Catalog, Namespace, NamespaceIdent, TableCreation, TableIdent};
+    use iceberg::{
+        Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent, TableUpdate,
+    };
     use itertools::Itertools;
     use regex::Regex;
     use sqlx::migrate::MigrateDatabase;
@@ -1692,7 +1767,27 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            format!("Unexpected => No such table: {:?}", src_table_ident),
+            format!("Unexpected => No such table: {:?}", src_table_ident)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_throws_error_if_table_not_exist() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc.clone()).await;
+        let namespace_ident = NamespaceIdent::new("a".into());
+        let table_name = "tbl1";
+        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let err = catalog
+            .drop_table(&table_ident)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Unexpected => No such table: TableIdent { namespace: NamespaceIdent([\"a\"]), name: \"tbl1\" }"
         );
     }
 
@@ -1714,5 +1809,242 @@ mod tests {
                 .to_string(),
             format!("Unexpected => Table {:?} already exists.", &dst_table_ident),
         );
+    }
+
+    #[tokio::test]
+    async fn test_drop_table() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc.clone()).await;
+        let namespace_ident = NamespaceIdent::new("a".into());
+        let table_name = "tbl1";
+        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let location = warehouse_loc.clone();
+        let table_creation = TableCreation::builder()
+            .name(table_name.into())
+            .location(location.clone())
+            .schema(simple_table_schema())
+            .build();
+
+        catalog
+            .create_table(&namespace_ident, table_creation)
+            .await
+            .unwrap();
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        assert_table_eq(&table, &table_ident, &simple_table_schema());
+
+        catalog.drop_table(&table_ident).await.unwrap();
+        let err = catalog
+            .load_table(&table_ident)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Unexpected => No such table: TableIdent { namespace: NamespaceIdent([\"a\"]), name: \"tbl1\" }"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_table_throws_error_if_table_not_exist() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc.clone()).await;
+        let namespace_ident = NamespaceIdent::new("a".into());
+        let table_name = "tbl1";
+        let table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
+        create_namespace(&catalog, &namespace_ident).await;
+        let table_commit = TableCommit::builder()
+            .ident(table_ident.clone())
+            .updates(vec![])
+            .requirements(vec![])
+            .build();
+        let err = catalog
+            .update_table(table_commit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Unexpected => No such table: TableIdent { namespace: NamespaceIdent([\"a\"]), name: \"tbl1\" }"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_table_add_snapshot() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc.clone()).await;
+        let namespace_ident = NamespaceIdent::new("a".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_name = "abc";
+        let location = warehouse_loc.clone();
+        let table_creation = TableCreation::builder()
+            .name(table_name.into())
+            .location(location.clone())
+            .schema(simple_table_schema())
+            .build();
+
+        let expected_table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
+
+        assert_table_eq(
+            &catalog
+                .create_table(&namespace_ident, table_creation)
+                .await
+                .unwrap(),
+            &expected_table_ident,
+            &simple_table_schema(),
+        );
+
+        let table = catalog.load_table(&expected_table_ident).await.unwrap();
+        assert_table_eq(&table, &expected_table_ident, &simple_table_schema());
+
+        let table_snapshots_iter = table.metadata().snapshots();
+        assert_eq!(0, table_snapshots_iter.count());
+
+        let add_snapshot = Snapshot::builder()
+            .with_snapshot_id(638933773299822130)
+            .with_timestamp_ms(1662532818843)
+            .with_sequence_number(1)
+            .with_schema_id(1)
+            .with_manifest_list("/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro")
+            .with_summary(Summary { operation: Operation::Append,  additional_properties: HashMap::from_iter(vec![("spark.app.id".to_string(), "local-1662532784305".to_string()), ("added-data-files".to_string(), "4".to_string()), ("added-records".to_string(), "4".to_string()), ("added-files-size".to_string(), "6001".to_string())]) })
+            .build();
+
+        let table_update = TableUpdate::AddSnapshot {
+            snapshot: add_snapshot,
+        };
+        let requirements = vec![];
+        let table_commit = TableCommit::builder()
+            .ident(expected_table_ident.clone())
+            .updates(vec![table_update])
+            .requirements(requirements)
+            .build();
+        let table = catalog.update_table(table_commit).await.unwrap();
+        let snapshot_vec = table.metadata().snapshots().collect_vec();
+        assert_eq!(1, snapshot_vec.len());
+        let snapshot = &snapshot_vec[0];
+        assert_eq!(snapshot.snapshot_id(), 638933773299822130);
+        assert_eq!(snapshot.timestamp_ms(), 1662532818843);
+        assert_eq!(snapshot.sequence_number(), 1);
+        assert_eq!(snapshot.schema_id().unwrap(), 1);
+        assert_eq!(snapshot.manifest_list(), "/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro");
+        assert_eq!(snapshot.summary().operation, Operation::Append);
+        assert_eq!(
+            snapshot.summary().additional_properties,
+            HashMap::from_iter(vec![
+                (
+                    "spark.app.id".to_string(),
+                    "local-1662532784305".to_string()
+                ),
+                ("added-data-files".to_string(), "4".to_string()),
+                ("added-records".to_string(), "4".to_string()),
+                ("added-files-size".to_string(), "6001".to_string())
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_table_set_snapshot_ref() {
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc.clone()).await;
+        let namespace_ident = NamespaceIdent::new("a".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let table_name = "abc";
+        let location = warehouse_loc.clone();
+        let table_creation = TableCreation::builder()
+            .name(table_name.into())
+            .location(location.clone())
+            .schema(simple_table_schema())
+            .build();
+
+        let expected_table_ident = TableIdent::new(namespace_ident.clone(), table_name.into());
+
+        assert_table_eq(
+            &catalog
+                .create_table(&namespace_ident, table_creation)
+                .await
+                .unwrap(),
+            &expected_table_ident,
+            &simple_table_schema(),
+        );
+
+        let table = catalog.load_table(&expected_table_ident).await.unwrap();
+        assert_table_eq(&table, &expected_table_ident, &simple_table_schema());
+
+        let table_snapshots_iter = table.metadata().snapshots();
+        assert_eq!(0, table_snapshots_iter.count());
+
+        let snapshot_id = 638933773299822130;
+        let reference = SnapshotReference {
+            snapshot_id,
+            retention: SnapshotRetention::Branch {
+                min_snapshots_to_keep: Some(10),
+                max_snapshot_age_ms: Some(100),
+                max_ref_age_ms: Some(200),
+            },
+        };
+        let table_update_set_snapshot_ref = TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: reference.clone(),
+        };
+
+        let add_snapshot = Snapshot::builder()
+            .with_snapshot_id(638933773299822130)
+            .with_timestamp_ms(1662532818843)
+            .with_sequence_number(1)
+            .with_schema_id(1)
+            .with_manifest_list("/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro")
+            .with_summary(Summary { operation: Operation::Append, additional_properties: HashMap::from_iter(vec![("spark.app.id".to_string(), "local-1662532784305".to_string()), ("added-data-files".to_string(), "4".to_string()), ("added-records".to_string(), "4".to_string()), ("added-files-size".to_string(), "6001".to_string())]) })
+            .build();
+
+        let table_update_add_snapshot = TableUpdate::AddSnapshot {
+            snapshot: add_snapshot,
+        };
+
+        let table_update_opers = vec![table_update_add_snapshot, table_update_set_snapshot_ref];
+
+        let table_commit = TableCommit::builder()
+            .ident(expected_table_ident.clone())
+            .updates(table_update_opers)
+            .requirements(vec![])
+            .build();
+        let table = catalog.update_table(table_commit).await.unwrap();
+        let snapshot_vec = table.metadata().snapshots().collect_vec();
+        assert_eq!(1, snapshot_vec.len());
+        let snapshot = &snapshot_vec[0];
+        assert_eq!(snapshot.snapshot_id(), 638933773299822130);
+        assert_eq!(snapshot.timestamp_ms(), 1662532818843);
+        assert_eq!(snapshot.sequence_number(), 1);
+        assert_eq!(snapshot.schema_id().unwrap(), 1);
+        assert_eq!(snapshot.manifest_list(), "/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro");
+        assert_eq!(snapshot.summary().operation, Operation::Append);
+        assert_eq!(
+            snapshot.summary().additional_properties,
+            HashMap::from_iter(vec![
+                (
+                    "spark.app.id".to_string(),
+                    "local-1662532784305".to_string()
+                ),
+                ("added-data-files".to_string(), "4".to_string()),
+                ("added-records".to_string(), "4".to_string()),
+                ("added-files-size".to_string(), "6001".to_string())
+            ])
+        );
+
+        let snapshot_refs_map = table.metadata().snapshot_refs();
+        assert_eq!(1, snapshot_refs_map.len());
+        let snapshot_ref = snapshot_refs_map.get(MAIN_BRANCH).unwrap();
+        let expected_snapshot_ref = SnapshotReference {
+            snapshot_id,
+            retention: SnapshotRetention::Branch {
+                min_snapshots_to_keep: Some(10),
+                max_snapshot_age_ms: Some(100),
+                max_ref_age_ms: Some(200),
+            },
+        };
+        assert_eq!(snapshot_ref, &expected_snapshot_ref);
     }
 }

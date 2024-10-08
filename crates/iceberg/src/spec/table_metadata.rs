@@ -384,6 +384,12 @@ impl TableMetadata {
             .insert(snapshot.snapshot_id(), Arc::new(snapshot));
     }
 
+    /// Returns snapshot references.
+    #[inline]
+    pub fn snapshot_refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Normalize this partition spec.
     ///
     /// This is an internal method
