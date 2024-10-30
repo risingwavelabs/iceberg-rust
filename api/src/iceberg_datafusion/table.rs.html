@@ -85,6 +85,78 @@
 <a href="#85" id="85">85</a>
 <a href="#86" id="86">86</a>
 <a href="#87" id="87">87</a>
+<a href="#88" id="88">88</a>
+<a href="#89" id="89">89</a>
+<a href="#90" id="90">90</a>
+<a href="#91" id="91">91</a>
+<a href="#92" id="92">92</a>
+<a href="#93" id="93">93</a>
+<a href="#94" id="94">94</a>
+<a href="#95" id="95">95</a>
+<a href="#96" id="96">96</a>
+<a href="#97" id="97">97</a>
+<a href="#98" id="98">98</a>
+<a href="#99" id="99">99</a>
+<a href="#100" id="100">100</a>
+<a href="#101" id="101">101</a>
+<a href="#102" id="102">102</a>
+<a href="#103" id="103">103</a>
+<a href="#104" id="104">104</a>
+<a href="#105" id="105">105</a>
+<a href="#106" id="106">106</a>
+<a href="#107" id="107">107</a>
+<a href="#108" id="108">108</a>
+<a href="#109" id="109">109</a>
+<a href="#110" id="110">110</a>
+<a href="#111" id="111">111</a>
+<a href="#112" id="112">112</a>
+<a href="#113" id="113">113</a>
+<a href="#114" id="114">114</a>
+<a href="#115" id="115">115</a>
+<a href="#116" id="116">116</a>
+<a href="#117" id="117">117</a>
+<a href="#118" id="118">118</a>
+<a href="#119" id="119">119</a>
+<a href="#120" id="120">120</a>
+<a href="#121" id="121">121</a>
+<a href="#122" id="122">122</a>
+<a href="#123" id="123">123</a>
+<a href="#124" id="124">124</a>
+<a href="#125" id="125">125</a>
+<a href="#126" id="126">126</a>
+<a href="#127" id="127">127</a>
+<a href="#128" id="128">128</a>
+<a href="#129" id="129">129</a>
+<a href="#130" id="130">130</a>
+<a href="#131" id="131">131</a>
+<a href="#132" id="132">132</a>
+<a href="#133" id="133">133</a>
+<a href="#134" id="134">134</a>
+<a href="#135" id="135">135</a>
+<a href="#136" id="136">136</a>
+<a href="#137" id="137">137</a>
+<a href="#138" id="138">138</a>
+<a href="#139" id="139">139</a>
+<a href="#140" id="140">140</a>
+<a href="#141" id="141">141</a>
+<a href="#142" id="142">142</a>
+<a href="#143" id="143">143</a>
+<a href="#144" id="144">144</a>
+<a href="#145" id="145">145</a>
+<a href="#146" id="146">146</a>
+<a href="#147" id="147">147</a>
+<a href="#148" id="148">148</a>
+<a href="#149" id="149">149</a>
+<a href="#150" id="150">150</a>
+<a href="#151" id="151">151</a>
+<a href="#152" id="152">152</a>
+<a href="#153" id="153">153</a>
+<a href="#154" id="154">154</a>
+<a href="#155" id="155">155</a>
+<a href="#156" id="156">156</a>
+<a href="#157" id="157">157</a>
+<a href="#158" id="158">158</a>
+<a href="#159" id="159">159</a>
 </pre></div><pre class="rust"><code><span class="comment">// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -110,7 +182,7 @@
 <span class="kw">use </span>datafusion::catalog::Session;
 <span class="kw">use </span>datafusion::datasource::{TableProvider, TableType};
 <span class="kw">use </span>datafusion::error::Result <span class="kw">as </span>DFResult;
-<span class="kw">use </span>datafusion::logical_expr::Expr;
+<span class="kw">use </span>datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 <span class="kw">use </span>datafusion::physical_plan::ExecutionPlan;
 <span class="kw">use </span>iceberg::arrow::schema_to_arrow_schema;
 <span class="kw">use </span>iceberg::table::Table;
@@ -120,7 +192,7 @@
 
 <span class="doccomment">/// Represents a [`TableProvider`] for the Iceberg [`Catalog`],
 /// managing access to a [`Table`].
-</span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>IcebergTableProvider {
+</span><span class="kw">pub struct </span>IcebergTableProvider {
     <span class="doccomment">/// A table in the catalog.
     </span>table: Table,
     <span class="doccomment">/// A reference-counted arrow `Schema`.
@@ -143,6 +215,13 @@
 
         <span class="prelude-val">Ok</span>(IcebergTableProvider { table, schema })
     }
+
+    <span class="doccomment">/// Asynchronously tries to construct a new [`IcebergTableProvider`]
+    /// using the given table. Can be used to create a table provider from an existing table regardless of the catalog implementation.
+    </span><span class="kw">pub async fn </span>try_new_from_table(table: Table) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>&gt; {
+        <span class="kw">let </span>schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())<span class="question-mark">?</span>);
+        <span class="prelude-val">Ok</span>(IcebergTableProvider { table, schema })
+    }
 }
 
 <span class="attr">#[async_trait]
@@ -162,14 +241,79 @@
     <span class="kw">async fn </span>scan(
         <span class="kw-2">&amp;</span><span class="self">self</span>,
         _state: <span class="kw-2">&amp;</span><span class="kw">dyn </span>Session,
-        _projection: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>Vec&lt;usize&gt;&gt;,
-        _filters: <span class="kw-2">&amp;</span>[Expr],
+        projection: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>Vec&lt;usize&gt;&gt;,
+        filters: <span class="kw-2">&amp;</span>[Expr],
         _limit: <span class="prelude-ty">Option</span>&lt;usize&gt;,
     ) -&gt; DFResult&lt;Arc&lt;<span class="kw">dyn </span>ExecutionPlan&gt;&gt; {
         <span class="prelude-val">Ok</span>(Arc::new(IcebergTableScan::new(
             <span class="self">self</span>.table.clone(),
             <span class="self">self</span>.schema.clone(),
+            projection,
+            filters,
         )))
+    }
+
+    <span class="kw">fn </span>supports_filters_pushdown(
+        <span class="kw-2">&amp;</span><span class="self">self</span>,
+        filters: <span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>Expr],
+    ) -&gt; std::result::Result&lt;Vec&lt;TableProviderFilterPushDown&gt;, datafusion::error::DataFusionError&gt;
+    {
+        <span class="comment">// Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
+        </span><span class="prelude-val">Ok</span>(<span class="macro">vec!</span>[TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+}
+
+<span class="attr">#[cfg(test)]
+</span><span class="kw">mod </span>tests {
+    <span class="kw">use </span>datafusion::common::Column;
+    <span class="kw">use </span>datafusion::prelude::SessionContext;
+    <span class="kw">use </span>iceberg::io::FileIO;
+    <span class="kw">use </span>iceberg::table::{StaticTable, Table};
+    <span class="kw">use </span>iceberg::TableIdent;
+
+    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+
+    <span class="kw">async fn </span>get_test_table_from_metadata_file() -&gt; Table {
+        <span class="kw">let </span>metadata_file_name = <span class="string">"TableMetadataV2Valid.json"</span>;
+        <span class="kw">let </span>metadata_file_path = <span class="macro">format!</span>(
+            <span class="string">"{}/tests/test_data/{}"</span>,
+            <span class="macro">env!</span>(<span class="string">"CARGO_MANIFEST_DIR"</span>),
+            metadata_file_name
+        );
+        <span class="kw">let </span>file_io = FileIO::from_path(<span class="kw-2">&amp;</span>metadata_file_path)
+            .unwrap()
+            .build()
+            .unwrap();
+        <span class="kw">let </span>static_identifier = TableIdent::from_strs([<span class="string">"static_ns"</span>, <span class="string">"static_table"</span>]).unwrap();
+        <span class="kw">let </span>static_table =
+            StaticTable::from_metadata_file(<span class="kw-2">&amp;</span>metadata_file_path, static_identifier, file_io)
+                .<span class="kw">await
+                </span>.unwrap();
+        static_table.into_table()
+    }
+
+    <span class="attr">#[tokio::test]
+    </span><span class="kw">async fn </span>test_try_new_from_table() {
+        <span class="kw">let </span>table = get_test_table_from_metadata_file().<span class="kw">await</span>;
+        <span class="kw">let </span>table_provider = IcebergTableProvider::try_new_from_table(table.clone())
+            .<span class="kw">await
+            </span>.unwrap();
+        <span class="kw">let </span>ctx = SessionContext::new();
+        ctx.register_table(<span class="string">"mytable"</span>, Arc::new(table_provider))
+            .unwrap();
+        <span class="kw">let </span>df = ctx.sql(<span class="string">"SELECT * FROM mytable"</span>).<span class="kw">await</span>.unwrap();
+        <span class="kw">let </span>df_schema = df.schema();
+        <span class="kw">let </span>df_columns = df_schema.fields();
+        <span class="macro">assert_eq!</span>(df_columns.len(), <span class="number">3</span>);
+        <span class="kw">let </span>x_column = df_columns.first().unwrap();
+        <span class="kw">let </span>column_data = <span class="macro">format!</span>(
+            <span class="string">"{:?}:{:?}"</span>,
+            x_column.name(),
+            x_column.data_type().to_string()
+        );
+        <span class="macro">assert_eq!</span>(column_data, <span class="string">"\"x\":\"Int64\""</span>);
+        <span class="kw">let </span>has_column = df_schema.has_column(<span class="kw-2">&amp;</span>Column::from_name(<span class="string">"z"</span>));
+        <span class="macro">assert!</span>(has_column);
     }
 }
 </code></pre></div></section></main></body></html>
