@@ -263,6 +263,7 @@ impl ArrowReader {
         // to the requester.
         let mut record_batch_stream = record_batch_stream_builder.build()?;
 
+        // The schema of the xxx file doesn't change, so we don't need to convert the schema.
         if matches!(task.data_file_content, DataContentType::PositionDeletes) {
             while let Some(batch) = record_batch_stream.try_next().await? {
                 tx.send(Ok(batch)).await?
