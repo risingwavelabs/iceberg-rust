@@ -268,6 +268,9 @@ impl ArrowReader {
                 tx.send(Ok(batch)).await?
             }
         } else {
+            // RecordBatchTransformer performs any required transformations on the RecordBatches
+            // that come back from the file, such as type promotion, default column insertion
+            // and column re-ordering.
             let mut record_batch_transformer =
                 RecordBatchTransformer::build(task.schema_ref(), task.project_field_ids());
 
