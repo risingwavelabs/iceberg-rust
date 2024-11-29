@@ -546,19 +546,19 @@ impl ToIcebergLiteralArray for StructArray {
 
         let mut columns = Vec::with_capacity(self.columns().len());
 
-        for ((array, arrow_type), iceberg_field) in self
+        for ((array, arrow_field), iceberg_field) in self
             .columns()
             .iter()
-            .zip_eq(arrow_struct_fields.iter().map(|field| field.data_type()))
+            .zip_eq(arrow_struct_fields.iter())
             .zip_eq(iceberg_type.fields().iter())
         {
-            if array.is_nullable() == iceberg_field.required {
+            if arrow_field.is_nullable() == iceberg_field.required {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "The nullable field of arrow struct array is not compatitable with iceberg type",
                 ));
             }
-            match (arrow_type, iceberg_field.field_type.as_ref()) {
+            match (arrow_field.data_type(), iceberg_field.field_type.as_ref()) {
                 (DataType::Null, _) => {
                     if iceberg_field.required {
                         return Err(Error::new(
@@ -682,9 +682,9 @@ impl ToIcebergLiteralArray for StructArray {
 /// Convert arrow struct array to iceberg struct value array.
 pub fn arrow_struct_to_iceberg_struct(
     struct_array: &StructArray,
-    ty: StructType,
+    ty: &StructType,
 ) -> Result<Vec<Option<Literal>>> {
-    struct_array.to_struct_literal_array(struct_array.data_type(), &ty)
+    struct_array.to_struct_literal_array(struct_array.data_type(), ty)
 }
 
 #[cfg(test)]
@@ -870,7 +870,7 @@ mod test {
             )),
         ]);
 
-        let result = arrow_struct_to_iceberg_struct(&struct_array, iceberg_struct_type).unwrap();
+        let result = arrow_struct_to_iceberg_struct(&struct_array, &iceberg_struct_type).unwrap();
 
         assert_eq!(result, vec![
             Some(Literal::Struct(Struct::from_iter(vec![
@@ -920,7 +920,7 @@ mod test {
             "bool_field",
             Type::Primitive(PrimitiveType::Boolean),
         ))]);
-        let result = arrow_struct_to_iceberg_struct(&struct_array, iceberg_struct_type).unwrap();
+        let result = arrow_struct_to_iceberg_struct(&struct_array, &iceberg_struct_type).unwrap();
         assert_eq!(result, vec![None; 3]);
     }
 
@@ -928,7 +928,7 @@ mod test {
     fn test_empty_struct() {
         let struct_array = StructArray::new_null(Fields::empty(), 3);
         let iceberg_struct_type = StructType::new(vec![]);
-        let result = arrow_struct_to_iceberg_struct(&struct_array, iceberg_struct_type).unwrap();
+        let result = arrow_struct_to_iceberg_struct(&struct_array, &iceberg_struct_type).unwrap();
         assert_eq!(result, vec![None; 0]);
     }
 }

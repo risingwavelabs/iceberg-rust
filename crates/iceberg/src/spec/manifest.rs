@@ -1157,6 +1157,10 @@ impl DataFile {
     pub fn sort_order_id(&self) -> Option<i32> {
         self.sort_order_id
     }
+
+    pub(crate) fn rewrite_partition(&mut self, partition: Struct) {
+        self.partition = partition;
+    }
 }
 /// Type of content stored by the data file: data, equality deletes, or
 /// position deletes (all v1 files are data files)
