@@ -49,8 +49,6 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Clone)]
 pub struct ParquetWriterBuilder<T: LocationGenerator, F: FileNameGenerator> {
     props: WriterProperties,
-    schema: SchemaRef,
-
     file_io: FileIO,
     location_generator: T,
     file_name_generator: F,
@@ -61,14 +59,12 @@ impl<T: LocationGenerator, F: FileNameGenerator> ParquetWriterBuilder<T, F> {
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
     pub fn new(
         props: WriterProperties,
-        schema: SchemaRef,
         file_io: FileIO,
         location_generator: T,
         file_name_generator: F,
     ) -> Self {
         Self {
             props,
-            schema,
             file_io,
             location_generator,
             file_name_generator,
@@ -79,8 +75,7 @@ impl<T: LocationGenerator, F: FileNameGenerator> ParquetWriterBuilder<T, F> {
 impl<T: LocationGenerator, F: FileNameGenerator> FileWriterBuilder for ParquetWriterBuilder<T, F> {
     type R = ParquetWriter;
 
-    async fn build(self) -> crate::Result<Self::R> {
-        let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+    async fn build(self, schema: SchemaRef) -> crate::Result<Self::R> {
         let written_size = Arc::new(AtomicI64::new(0));
         let out_file = self.file_io.new_output(
             self.location_generator
@@ -88,15 +83,15 @@ impl<T: LocationGenerator, F: FileNameGenerator> FileWriterBuilder for ParquetWr
         )?;
         let inner_writer = TrackWriter::new(out_file.writer().await?, written_size.clone());
         let async_writer = AsyncFileWriter::new(inner_writer);
-        let writer =
-            AsyncArrowWriter::try_new(async_writer, arrow_schema.clone(), Some(self.props))
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to build parquet writer.")
-                        .with_source(err)
-                })?;
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema.as_ref().try_into()?);
+        let writer = AsyncArrowWriter::try_new(async_writer, arrow_schema, Some(self.props))
+            .map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to build parquet writer.")
+                    .with_source(err)
+            })?;
 
         Ok(ParquetWriter {
-            schema: self.schema.clone(),
+            schema: schema.clone(),
             writer,
             written_size,
             current_row_num: 0,
@@ -434,6 +429,10 @@ impl CurrentFileStatus for ParquetWriter {
     fn current_written_size(&self) -> usize {
         self.written_size.load(std::sync::atomic::Ordering::Relaxed) as usize
     }
+
+    fn current_schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
 
 /// AsyncFileWriter is a wrapper of FileWrite to make it compatible with tokio::io::AsyncWrite.
@@ -656,12 +655,11 @@ mod tests {
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
             file_io.clone(),
             location_gen,
             file_name_gen,
         )
-        .build()
+        .build(Arc::new(to_write.schema().as_ref().try_into().unwrap()))
         .await?;
         pw.write(&to_write).await?;
         pw.write(&to_write_null).await?;
@@ -852,12 +850,11 @@ mod tests {
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(schema),
             file_io.clone(),
             location_gen,
             file_name_gen,
         )
-        .build()
+        .build(Arc::new(schema))
         .await?;
         pw.write(&to_write).await?;
         let res = pw.close().await?;
@@ -1037,12 +1034,11 @@ mod tests {
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(schema),
             file_io.clone(),
             loccation_gen,
             file_name_gen,
         )
-        .build()
+        .build(Arc::new(schema))
         .await?;
         pw.write(&to_write).await?;
         let res = pw.close().await?;

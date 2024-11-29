@@ -20,7 +20,7 @@
 use arrow_array::RecordBatch;
 use itertools::Itertools;
 
-use crate::spec::{DataContentType, DataFile, Struct};
+use crate::spec::{DataContentType, DataFile, SchemaRef, Struct};
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use crate::Result;
@@ -29,25 +29,17 @@ use crate::Result;
 #[derive(Clone)]
 pub struct DataFileWriterBuilder<B: FileWriterBuilder> {
     inner: B,
+    partition_value: Option<Struct>,
+    schema: SchemaRef,
 }
 
 impl<B: FileWriterBuilder> DataFileWriterBuilder<B> {
     /// Create a new `DataFileWriterBuilder` using a `FileWriterBuilder`.
-    pub fn new(inner: B) -> Self {
-        Self { inner }
-    }
-}
-
-/// Config for `DataFileWriter`.
-pub struct DataFileWriterConfig {
-    partition_value: Struct,
-}
-
-impl DataFileWriterConfig {
-    /// Create a new `DataFileWriterConfig` with partition value.
-    pub fn new(partition_value: Option<Struct>) -> Self {
+    pub fn new(schema: SchemaRef, inner: B, partition_value: Option<Struct>) -> Self {
         Self {
-            partition_value: partition_value.unwrap_or(Struct::empty()),
+            inner,
+            partition_value,
+            schema,
         }
     }
 }
@@ -55,12 +47,11 @@ impl DataFileWriterConfig {
 #[async_trait::async_trait]
 impl<B: FileWriterBuilder> IcebergWriterBuilder for DataFileWriterBuilder<B> {
     type R = DataFileWriter<B>;
-    type C = DataFileWriterConfig;
 
-    async fn build(self, config: Self::C) -> Result<Self::R> {
+    async fn build(self) -> Result<Self::R> {
         Ok(DataFileWriter {
-            inner_writer: Some(self.inner.clone().build().await?),
-            partition_value: config.partition_value,
+            inner_writer: Some(self.inner.clone().build(self.schema).await?),
+            partition_value: self.partition_value.unwrap_or(Struct::empty()),
         })
     }
 }
@@ -104,6 +95,10 @@ impl<B: FileWriterBuilder> CurrentFileStatus for DataFileWriter<B> {
     fn current_written_size(&self) -> usize {
         self.inner_writer.as_ref().unwrap().current_written_size()
     }
+
+    fn current_schema(&self) -> SchemaRef {
+        self.inner_writer.as_ref().unwrap().current_schema()
+    }
 }
 
 #[cfg(test)]
@@ -115,9 +110,7 @@ mod test {
 
     use crate::io::FileIOBuilder;
     use crate::spec::{DataContentType, DataFileFormat, Schema, Struct};
-    use crate::writer::base_writer::data_file_writer::{
-        DataFileWriterBuilder, DataFileWriterConfig,
-    };
+    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
     use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
     use crate::writer::file_writer::ParquetWriterBuilder;
@@ -135,14 +128,14 @@ mod test {
 
         let pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(Schema::builder().build().unwrap()),
             file_io.clone(),
             location_gen,
             file_name_gen,
         );
-        let mut data_file_writer = DataFileWriterBuilder::new(pw)
-            .build(DataFileWriterConfig::new(None))
-            .await?;
+        let mut data_file_writer =
+            DataFileWriterBuilder::new(Arc::new(Schema::builder().build().unwrap()), pw, None)
+                .build()
+                .await?;
 
         let data_file = data_file_writer.close().await.unwrap();
         assert_eq!(data_file.len(), 1);

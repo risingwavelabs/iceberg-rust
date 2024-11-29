@@ -47,10 +47,11 @@
 
 pub mod base_writer;
 pub mod file_writer;
+pub mod function_writer;
 
 use arrow_array::RecordBatch;
 
-use crate::spec::DataFile;
+use crate::spec::{DataFile, SchemaRef};
 use crate::Result;
 
 type DefaultInput = RecordBatch;
@@ -63,10 +64,8 @@ pub trait IcebergWriterBuilder<I = DefaultInput, O = DefaultOutput>:
 {
     /// The associated writer type.
     type R: IcebergWriter<I, O>;
-    /// The associated writer config type used to build the writer.
-    type C;
     /// Build the iceberg writer.
-    async fn build(self, config: Self::C) -> Result<Self::R>;
+    async fn build(self) -> Result<Self::R>;
 }
 
 /// The iceberg writer used to write data to iceberg table.
@@ -90,6 +89,8 @@ pub trait CurrentFileStatus {
     fn current_row_num(&self) -> usize;
     /// Get the current file written size.
     fn current_written_size(&self) -> usize;
+    /// Get the schema of the current file.
+    fn current_schema(&self) -> SchemaRef;
 }
 
 #[cfg(test)]
