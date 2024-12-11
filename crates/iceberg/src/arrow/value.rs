@@ -16,38 +16,82 @@
 // under the License.
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float16Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-    StringArray, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-    TimestampNanosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
+    StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use itertools::Itertools;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::spec::{Literal, PrimitiveType, Struct, StructType, Type};
 use crate::{Error, ErrorKind, Result};
 
-trait ToIcebergLiteralArray {
-    fn to_primitive_literal_array(
+/// A post order arrow array visitor.
+/// # TODO
+/// - Add support for ListArray, MapArray
+trait ArrowArrayVistor {
+    type T;
+    fn null(&self, array: &NullArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn boolean(&self, array: &BooleanArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn int16(&self, array: &Int16Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn int32(&self, array: &Int32Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn int64(&self, array: &Int64Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn float(&self, array: &Float32Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn double(&self, array: &Float64Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn decimal(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>>;
-    fn to_struct_literal_array(
+        array: &Decimal128Array,
+        iceberg_type: &PrimitiveType,
+    ) -> Result<Vec<Self::T>>;
+    fn date(&self, array: &Date32Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn time(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>>;
+        array: &Time64MicrosecondArray,
+        iceberg_type: &PrimitiveType,
+    ) -> Result<Vec<Self::T>>;
+    fn timestamp(
+        &self,
+        array: &TimestampMicrosecondArray,
+        iceberg_type: &PrimitiveType,
+    ) -> Result<Vec<Self::T>>;
+    fn timestamp_nano(
+        &self,
+        array: &TimestampNanosecondArray,
+        iceberg_type: &PrimitiveType,
+    ) -> Result<Vec<Self::T>>;
+    fn string(&self, array: &StringArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn large_string(
+        &self,
+        array: &LargeStringArray,
+        iceberg_type: &PrimitiveType,
+    ) -> Result<Vec<Self::T>>;
+    fn binary(&self, array: &BinaryArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>>;
+    fn large_binary(
+        &self,
+        array: &LargeBinaryArray,
+        iceberg_type: &PrimitiveType,
+    ) -> Result<Vec<Self::T>>;
+    fn r#struct(
+        &self,
+        array: &StructArray,
+        iceberg_type: &StructType,
+        columns: Vec<Vec<Self::T>>,
+    ) -> Result<Vec<Self::T>>;
 }
 
-impl ToIcebergLiteralArray for BooleanArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+struct ArrowArrayConvert;
+
+impl ArrowArrayVistor for ArrowArrayConvert {
+    type T = Option<Literal>;
+
+    fn null(&self, array: &NullArray, _iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
+        Ok(vec![None; array.len()])
+    }
+
+    fn boolean(&self, array: &BooleanArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Boolean => Ok(self.iter().map(|v| v.map(Literal::bool)).collect()),
+            PrimitiveType::Boolean => Ok(array.iter().map(|v| v.map(Literal::bool)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -58,24 +102,10 @@ impl ToIcebergLiteralArray for BooleanArray {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Int16Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn int16(&self, array: &Int16Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Int => Ok(self.iter().map(|v| v.map(Literal::int)).collect()),
-            PrimitiveType::Long => Ok(self.iter().map(|v| v.map(Literal::long)).collect()),
+            PrimitiveType::Int => Ok(array.iter().map(|v| v.map(Literal::int)).collect()),
+            PrimitiveType::Long => Ok(array.iter().map(|v| v.map(Literal::long)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -86,24 +116,10 @@ impl ToIcebergLiteralArray for Int16Array {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Int32Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn int32(&self, array: &Int32Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Int => Ok(self.iter().map(|v| v.map(Literal::int)).collect()),
-            PrimitiveType::Long => Ok(self.iter().map(|v| v.map(Literal::long)).collect()),
+            PrimitiveType::Int => Ok(array.iter().map(|v| v.map(Literal::int)).collect()),
+            PrimitiveType::Long => Ok(array.iter().map(|v| v.map(Literal::long)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -114,23 +130,9 @@ impl ToIcebergLiteralArray for Int32Array {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Int64Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn int64(&self, array: &Int64Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Long => Ok(self.iter().map(|v| v.map(Literal::long)).collect()),
+            PrimitiveType::Long => Ok(array.iter().map(|v| v.map(Literal::long)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -141,26 +143,9 @@ impl ToIcebergLiteralArray for Int64Array {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Float16Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn float(&self, array: &Float32Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Float => Ok(self
-                .iter()
-                .map(|v| v.map(|v| Literal::float(v.to_f32())))
-                .collect()),
+            PrimitiveType::Float => Ok(array.iter().map(|v| v.map(Literal::float)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -171,50 +156,9 @@ impl ToIcebergLiteralArray for Float16Array {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Float32Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn double(&self, array: &Float64Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Float => Ok(self.iter().map(|v| v.map(Literal::float)).collect()),
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "The type of arrow float32 array is not compatitable with iceberg type {}",
-                    iceberg_type
-                ),
-            )),
-        }
-    }
-
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Float64Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
-        match iceberg_type {
-            PrimitiveType::Double => Ok(self.iter().map(|v| v.map(Literal::double)).collect()),
+            PrimitiveType::Double => Ok(array.iter().map(|v| v.map(Literal::double)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -225,22 +169,12 @@ impl ToIcebergLiteralArray for Float64Array {
         }
     }
 
-    fn to_struct_literal_array(
+    fn decimal(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Decimal128Array {
-    fn to_primitive_literal_array(
-        &self,
-        arrow_type: &DataType,
+        array: &Decimal128Array,
         iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
-        let DataType::Decimal128(arrow_precision, arrow_scale) = arrow_type else {
+    ) -> Result<Vec<Self::T>> {
+        let DataType::Decimal128(arrow_precision, arrow_scale) = array.data_type() else {
             unreachable!()
         };
         match iceberg_type {
@@ -254,7 +188,7 @@ impl ToIcebergLiteralArray for Decimal128Array {
                         ),
                     ));
                 }
-                Ok(self.iter().map(|v| v.map(Literal::decimal)).collect())
+                Ok(array.iter().map(|v| v.map(Literal::decimal)).collect())
             }
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -266,23 +200,9 @@ impl ToIcebergLiteralArray for Decimal128Array {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Date32Array {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn date(&self, array: &Date32Array, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Date => Ok(self.iter().map(|v| v.map(Literal::date)).collect()),
+            PrimitiveType::Date => Ok(array.iter().map(|v| v.map(Literal::date)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -293,23 +213,13 @@ impl ToIcebergLiteralArray for Date32Array {
         }
     }
 
-    fn to_struct_literal_array(
+    fn time(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for Time64MicrosecondArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
+        array: &Time64MicrosecondArray,
         iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    ) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Time => Ok(self
+            PrimitiveType::Time => Ok(array
                 .iter()
                 .map(|v| v.map(Literal::time))
                 .collect()),
@@ -323,27 +233,17 @@ impl ToIcebergLiteralArray for Time64MicrosecondArray {
         }
     }
 
-    fn to_struct_literal_array(
+    fn timestamp(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for TimestampMicrosecondArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
+        array: &TimestampMicrosecondArray,
         iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    ) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Timestamp => Ok(self
+            PrimitiveType::Timestamp => Ok(array
                 .iter()
                 .map(|v| v.map(Literal::timestamp))
                 .collect()),
-            PrimitiveType::Timestamptz => Ok(self
+            PrimitiveType::Timestamptz => Ok(array
                 .iter()
                 .map(|v| v.map(Literal::timestamptz))
                 .collect()),
@@ -357,27 +257,17 @@ impl ToIcebergLiteralArray for TimestampMicrosecondArray {
         }
     }
 
-    fn to_struct_literal_array(
+    fn timestamp_nano(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for TimestampNanosecondArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
+        array: &TimestampNanosecondArray,
         iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    ) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::TimestampNs => Ok(self
+            PrimitiveType::TimestampNs => Ok(array
                 .iter()
                 .map(|v| v.map(Literal::timestamp_nano))
                 .collect()),
-            PrimitiveType::TimestamptzNs => Ok(self
+            PrimitiveType::TimestamptzNs => Ok(array
                 .iter()
                 .map(|v| v.map(Literal::timestamptz_nano))
                 .collect()),
@@ -391,23 +281,9 @@ impl ToIcebergLiteralArray for TimestampNanosecondArray {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for StringArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn string(&self, array: &StringArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::String => Ok(self.iter().map(|v| v.map(Literal::string)).collect()),
+            PrimitiveType::String => Ok(array.iter().map(|v| v.map(Literal::string)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -418,23 +294,13 @@ impl ToIcebergLiteralArray for StringArray {
         }
     }
 
-    fn to_struct_literal_array(
+    fn large_string(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for LargeStringArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
+        array: &LargeStringArray,
         iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    ) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::String => Ok(self.iter().map(|v| v.map(Literal::string)).collect()),
+            PrimitiveType::String => Ok(array.iter().map(|v| v.map(Literal::string)).collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -445,23 +311,9 @@ impl ToIcebergLiteralArray for LargeStringArray {
         }
     }
 
-    fn to_struct_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for BinaryArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    fn binary(&self, array: &BinaryArray, iceberg_type: &PrimitiveType) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Binary => Ok(self
+            PrimitiveType::Binary => Ok(array
                 .iter()
                 .map(|v| v.map(|v| Literal::binary(v.to_vec())))
                 .collect()),
@@ -475,187 +327,32 @@ impl ToIcebergLiteralArray for BinaryArray {
         }
     }
 
-    fn to_struct_literal_array(
+    fn large_binary(
         &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for LargeBinaryArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
+        array: &LargeBinaryArray,
         iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
+    ) -> Result<Vec<Self::T>> {
         match iceberg_type {
-            PrimitiveType::Binary => Ok(self
+            PrimitiveType::Binary => Ok(array
                 .iter()
                 .map(|v| v.map(|v| Literal::binary(v.to_vec())))
                 .collect()),
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "The type of arrow large binary array is not compatitable with iceberg type {}",
+                    "The type of arrow binary array is not compatitable with iceberg type {}",
                     iceberg_type
                 ),
             )),
         }
     }
 
-    fn to_struct_literal_array(
+    fn r#struct(
         &self,
-        _arrow_type: &DataType,
+        array: &StructArray,
         _iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-}
-
-impl ToIcebergLiteralArray for StructArray {
-    fn to_primitive_literal_array(
-        &self,
-        _arrow_type: &DataType,
-        _iceberg_type: &PrimitiveType,
-    ) -> Result<Vec<Option<Literal>>> {
-        unreachable!()
-    }
-
-    fn to_struct_literal_array(
-        &self,
-        arrow_type: &DataType,
-        iceberg_type: &StructType,
-    ) -> Result<Vec<Option<Literal>>> {
-        let DataType::Struct(arrow_struct_fields) = arrow_type else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "The type of arrow struct array is not a struct type",
-            ));
-        };
-
-        if self.columns().len() != iceberg_type.fields().len()
-            || arrow_struct_fields.len() != iceberg_type.fields().len()
-        {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "The type of arrow struct array is not compatitable with iceberg struct type",
-            ));
-        }
-
-        let mut columns = Vec::with_capacity(self.columns().len());
-
-        for ((array, arrow_field), iceberg_field) in self
-            .columns()
-            .iter()
-            .zip_eq(arrow_struct_fields.iter())
-            .zip_eq(iceberg_type.fields().iter())
-        {
-            if arrow_field.is_nullable() == iceberg_field.required {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "The nullable field of arrow struct array is not compatitable with iceberg type",
-                ));
-            }
-            match (arrow_field.data_type(), iceberg_field.field_type.as_ref()) {
-                (DataType::Null, _) => {
-                    if iceberg_field.required {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "column in arrow array should not be optional",
-                        ));
-                    }
-                    columns.push(vec![None; array.len()]);
-                }
-                (DataType::Boolean, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Int16, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Int16Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Int32, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Int64, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Float32, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Float32Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Float64, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Decimal128(_, _), Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Date32, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<Date32Array>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Time64(TimeUnit::Microsecond), Type::Primitive(primitive_type)) => {
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<Time64MicrosecondArray>()
-                        .unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (
-                    DataType::Timestamp(TimeUnit::Microsecond, _),
-                    Type::Primitive(primitive_type),
-                ) => {
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Timestamp(TimeUnit::Nanosecond, _), Type::Primitive(primitive_type)) => {
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Utf8, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<StringArray>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::LargeUtf8, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Binary, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::LargeBinary, Type::Primitive(primitive_type)) => {
-                    let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-                    columns.push(array.to_primitive_literal_array(arrow_type, primitive_type)?);
-                }
-                (DataType::Struct(_), Type::Struct(struct_type)) => {
-                    let array = array.as_any().downcast_ref::<StructArray>().unwrap();
-                    columns.push(array.to_struct_literal_array(arrow_type, struct_type)?);
-                }
-                (arrow_type, iceberg_field_type) => {
-                    return Err(Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        format!(
-                            "Unsupported convert arrow type {} to iceberg type: {}",
-                            arrow_type, iceberg_field_type
-                        ),
-                    ))
-                }
-            }
-        }
-
+        columns: Vec<Vec<Self::T>>,
+    ) -> Result<Vec<Self::T>> {
         let struct_literal_len = columns.first().map(|column| column.len()).unwrap_or(0);
         let mut struct_literals = Vec::with_capacity(struct_literal_len);
         let mut columns_iters = columns
@@ -664,7 +361,7 @@ impl ToIcebergLiteralArray for StructArray {
             .collect::<Vec<_>>();
 
         for row_idx in 0..struct_literal_len {
-            if self.is_null(row_idx) {
+            if array.is_null(row_idx) {
                 struct_literals.push(None);
                 continue;
             }
@@ -679,16 +376,309 @@ impl ToIcebergLiteralArray for StructArray {
     }
 }
 
+fn visit_arrow_struct_array<V: ArrowArrayVistor>(
+    array: &StructArray,
+    iceberg_type: &StructType,
+    visitor: &V,
+) -> Result<Vec<V::T>> {
+    let DataType::Struct(arrow_struct_fields) = array.data_type() else {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "The type of arrow struct array is not a struct type",
+        ));
+    };
+
+    if array.columns().len() != iceberg_type.fields().len()
+        || arrow_struct_fields.len() != iceberg_type.fields().len()
+    {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "The type of arrow struct array is not compatitable with iceberg struct type",
+        ));
+    }
+
+    let mut columns = Vec::with_capacity(array.columns().len());
+
+    for ((array, arrow_field), iceberg_field) in array
+        .columns()
+        .iter()
+        .zip_eq(arrow_struct_fields.iter())
+        .zip_eq(iceberg_type.fields().iter())
+    {
+        let arrow_type = arrow_field.data_type();
+        if arrow_field.is_nullable() == iceberg_field.required {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "The nullable field of arrow struct array is not compatitable with iceberg type",
+            ));
+        }
+        match (arrow_type, iceberg_field.field_type.as_ref()) {
+            (DataType::Null, Type::Primitive(primitive_type)) => {
+                if iceberg_field.required {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "column in arrow array should not be optional",
+                    ));
+                }
+                let array = array.as_any().downcast_ref::<NullArray>().unwrap();
+                columns.push(visitor.null(array, primitive_type)?);
+            }
+            (DataType::Boolean, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                columns.push(visitor.boolean(array, primitive_type)?);
+            }
+            (DataType::Int16, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                columns.push(visitor.int16(array, primitive_type)?);
+            }
+            (DataType::Int32, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                columns.push(visitor.int32(array, primitive_type)?);
+            }
+            (DataType::Int64, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                columns.push(visitor.int64(array, primitive_type)?);
+            }
+            (DataType::Float32, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Float32Array>().unwrap();
+                columns.push(visitor.float(array, primitive_type)?);
+            }
+            (DataType::Float64, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                columns.push(visitor.double(array, primitive_type)?);
+            }
+            (DataType::Decimal128(_, _), Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                columns.push(visitor.decimal(array, primitive_type)?);
+            }
+            (DataType::Date32, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Date32Array>().unwrap();
+                columns.push(visitor.date(array, primitive_type)?);
+            }
+            (DataType::Time64(TimeUnit::Microsecond), Type::Primitive(primitive_type)) => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<Time64MicrosecondArray>()
+                    .unwrap();
+                columns.push(visitor.time(array, primitive_type)?);
+            }
+            (DataType::Timestamp(TimeUnit::Microsecond, _), Type::Primitive(primitive_type)) => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                columns.push(visitor.timestamp(array, primitive_type)?);
+            }
+            (DataType::Timestamp(TimeUnit::Nanosecond, _), Type::Primitive(primitive_type)) => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                columns.push(visitor.timestamp_nano(array, primitive_type)?);
+            }
+            (DataType::Utf8, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+                columns.push(visitor.string(array, primitive_type)?);
+            }
+            (DataType::LargeUtf8, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                columns.push(visitor.large_string(array, primitive_type)?);
+            }
+            (DataType::Binary, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+                columns.push(visitor.binary(array, primitive_type)?);
+            }
+            (DataType::LargeBinary, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                columns.push(visitor.large_binary(array, primitive_type)?);
+            }
+            (DataType::Struct(_), Type::Struct(struct_type)) => {
+                let array = array.as_any().downcast_ref::<StructArray>().unwrap();
+                columns.push(visit_arrow_struct_array(array, struct_type, visitor)?);
+            }
+            (arrow_type, iceberg_field_type) => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Unsupported convert arrow type {} to iceberg type: {}",
+                        arrow_type, iceberg_field_type
+                    ),
+                ))
+            }
+        }
+    }
+
+    visitor.r#struct(array, iceberg_type, columns)
+}
+
+// # TODO
+// Add support for fulfill the missing field in arrow struct array
+fn visit_arrow_struct_array_from_field_id<V: ArrowArrayVistor>(
+    array: &StructArray,
+    iceberg_type: &StructType,
+    visitor: &V,
+) -> Result<Vec<V::T>> {
+    let DataType::Struct(arrow_struct_fields) = array.data_type() else {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "The type of arrow struct array is not a struct type",
+        ));
+    };
+
+    if array.columns().len() < iceberg_type.fields().len()
+        || arrow_struct_fields.len() < iceberg_type.fields().len()
+    {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "The type of arrow struct array is not compatitable with iceberg struct type",
+        ));
+    }
+
+    let mut columns = Vec::with_capacity(array.columns().len());
+
+    for iceberg_field in iceberg_type.fields() {
+        let Some((idx, field)) = arrow_struct_fields.iter().enumerate().find(|(_idx, f)| {
+            f.metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|id| id.parse::<i32>().ok().map(|id: i32| id == iceberg_field.id))
+                .unwrap_or(false)
+        }) else {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "The field {} in iceberg struct type is not found in arrow struct type",
+                    iceberg_field.name
+                ),
+            ));
+        };
+        let array = array.column(idx);
+        let arrow_type = field.data_type();
+        if array.is_nullable() == iceberg_field.required {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "The nullable field of arrow struct array is not compatitable with iceberg type",
+            ));
+        }
+        match (arrow_type, iceberg_field.field_type.as_ref()) {
+            (DataType::Null, Type::Primitive(primitive_type)) => {
+                if iceberg_field.required {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "column in arrow array should not be optional",
+                    ));
+                }
+                let array = array.as_any().downcast_ref::<NullArray>().unwrap();
+                columns.push(visitor.null(array, primitive_type)?);
+            }
+            (DataType::Boolean, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                columns.push(visitor.boolean(array, primitive_type)?);
+            }
+            (DataType::Int16, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                columns.push(visitor.int16(array, primitive_type)?);
+            }
+            (DataType::Int32, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                columns.push(visitor.int32(array, primitive_type)?);
+            }
+            (DataType::Int64, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                columns.push(visitor.int64(array, primitive_type)?);
+            }
+            (DataType::Float32, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Float32Array>().unwrap();
+                columns.push(visitor.float(array, primitive_type)?);
+            }
+            (DataType::Float64, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                columns.push(visitor.double(array, primitive_type)?);
+            }
+            (DataType::Decimal128(_, _), Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                columns.push(visitor.decimal(array, primitive_type)?);
+            }
+            (DataType::Date32, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<Date32Array>().unwrap();
+                columns.push(visitor.date(array, primitive_type)?);
+            }
+            (DataType::Time64(TimeUnit::Microsecond), Type::Primitive(primitive_type)) => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<Time64MicrosecondArray>()
+                    .unwrap();
+                columns.push(visitor.time(array, primitive_type)?);
+            }
+            (DataType::Timestamp(TimeUnit::Microsecond, _), Type::Primitive(primitive_type)) => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                columns.push(visitor.timestamp(array, primitive_type)?);
+            }
+            (DataType::Timestamp(TimeUnit::Nanosecond, _), Type::Primitive(primitive_type)) => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                columns.push(visitor.timestamp_nano(array, primitive_type)?);
+            }
+            (DataType::Utf8, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+                columns.push(visitor.string(array, primitive_type)?);
+            }
+            (DataType::LargeUtf8, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                columns.push(visitor.large_string(array, primitive_type)?);
+            }
+            (DataType::Binary, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+                columns.push(visitor.binary(array, primitive_type)?);
+            }
+            (DataType::LargeBinary, Type::Primitive(primitive_type)) => {
+                let array = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                columns.push(visitor.large_binary(array, primitive_type)?);
+            }
+            (DataType::Struct(_), Type::Struct(struct_type)) => {
+                let array = array.as_any().downcast_ref::<StructArray>().unwrap();
+                columns.push(visit_arrow_struct_array(array, struct_type, visitor)?);
+            }
+            (arrow_type, iceberg_field_type) => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Unsupported convert arrow type {} to iceberg type: {}",
+                        arrow_type, iceberg_field_type
+                    ),
+                ))
+            }
+        }
+    }
+
+    visitor.r#struct(array, iceberg_type, columns)
+}
+
 /// Convert arrow struct array to iceberg struct value array.
-pub fn arrow_struct_to_iceberg_struct(
+/// This function will assume the schema of arrow struct array is the same as iceberg struct type.
+pub fn arrow_struct_to_literal(
     struct_array: &StructArray,
     ty: &StructType,
 ) -> Result<Vec<Option<Literal>>> {
-    struct_array.to_struct_literal_array(struct_array.data_type(), ty)
+    visit_arrow_struct_array(struct_array, ty, &ArrowArrayConvert)
+}
+
+/// Convert arrow struct array to iceberg struct value array.
+/// This function will use field id to find the corresponding field in arrow struct array.
+pub fn arrow_struct_to_literal_from_field_id(
+    struct_array: &StructArray,
+    ty: &StructType,
+) -> Result<Vec<Option<Literal>>> {
+    visit_arrow_struct_array_from_field_id(struct_array, ty, &ArrowArrayConvert)
 }
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow_array::{
@@ -870,7 +860,7 @@ mod test {
             )),
         ]);
 
-        let result = arrow_struct_to_iceberg_struct(&struct_array, &iceberg_struct_type).unwrap();
+        let result = arrow_struct_to_literal(&struct_array, &iceberg_struct_type).unwrap();
 
         assert_eq!(result, vec![
             Some(Literal::Struct(Struct::from_iter(vec![
@@ -920,7 +910,7 @@ mod test {
             "bool_field",
             Type::Primitive(PrimitiveType::Boolean),
         ))]);
-        let result = arrow_struct_to_iceberg_struct(&struct_array, &iceberg_struct_type).unwrap();
+        let result = arrow_struct_to_literal(&struct_array, &iceberg_struct_type).unwrap();
         assert_eq!(result, vec![None; 3]);
     }
 
@@ -928,7 +918,98 @@ mod test {
     fn test_empty_struct() {
         let struct_array = StructArray::new_null(Fields::empty(), 3);
         let iceberg_struct_type = StructType::new(vec![]);
-        let result = arrow_struct_to_iceberg_struct(&struct_array, &iceberg_struct_type).unwrap();
+        let result = arrow_struct_to_literal(&struct_array, &iceberg_struct_type).unwrap();
         assert_eq!(result, vec![None; 0]);
+    }
+
+    #[test]
+    fn test_arrow_struct_to_iceberg_struct_from_field_id() {
+        let bool_array = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let int16_array = Int16Array::from(vec![Some(1), Some(2), None]);
+        let int32_array = Int32Array::from(vec![Some(3), Some(4), None]);
+        let int64_array = Int64Array::from(vec![Some(5), Some(6), None]);
+        let float32_array = Float32Array::from(vec![Some(1.1), Some(2.2), None]);
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(
+                    Field::new("bool_field", DataType::Boolean, true).with_metadata(HashMap::from(
+                        [(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())],
+                    )),
+                ),
+                Arc::new(bool_array) as ArrayRef,
+            ),
+            (
+                Arc::new(
+                    Field::new("int16_field", DataType::Int16, true).with_metadata(HashMap::from(
+                        [(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())],
+                    )),
+                ),
+                Arc::new(int16_array) as ArrayRef,
+            ),
+            (
+                Arc::new(
+                    Field::new("int32_field", DataType::Int32, true).with_metadata(HashMap::from(
+                        [(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())],
+                    )),
+                ),
+                Arc::new(int32_array) as ArrayRef,
+            ),
+            (
+                Arc::new(
+                    Field::new("int64_field", DataType::Int64, true).with_metadata(HashMap::from(
+                        [(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())],
+                    )),
+                ),
+                Arc::new(int64_array) as ArrayRef,
+            ),
+            (
+                Arc::new(
+                    Field::new("float32_field", DataType::Float32, true).with_metadata(
+                        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "5".to_string())]),
+                    ),
+                ),
+                Arc::new(float32_array) as ArrayRef,
+            ),
+        ]);
+        let struct_type = StructType::new(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "int16_field",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "bool_field",
+                Type::Primitive(PrimitiveType::Boolean),
+            )),
+            Arc::new(NestedField::optional(
+                3,
+                "int64_field",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                4,
+                "int32_field",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ]);
+        let result = arrow_struct_to_literal_from_field_id(&struct_array, &struct_type).unwrap();
+        assert_eq!(result, vec![
+            Some(Literal::Struct(Struct::from_iter(vec![
+                Some(Literal::int(1)),
+                Some(Literal::bool(true)),
+                Some(Literal::long(5)),
+                Some(Literal::int(3)),
+            ]))),
+            Some(Literal::Struct(Struct::from_iter(vec![
+                Some(Literal::int(2)),
+                Some(Literal::bool(false)),
+                Some(Literal::long(6)),
+                Some(Literal::int(4)),
+            ]))),
+            Some(Literal::Struct(Struct::from_iter(vec![
+                None, None, None, None,
+            ]))),
+        ]);
     }
 }

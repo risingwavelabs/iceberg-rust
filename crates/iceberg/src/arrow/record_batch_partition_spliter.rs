@@ -25,7 +25,7 @@ use itertools::Itertools;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::record_batch_projector::RecordBatchProjector;
-use crate::arrow::{arrow_struct_to_iceberg_struct, type_to_arrow_type};
+use crate::arrow::{arrow_struct_to_literal, type_to_arrow_type};
 use crate::spec::{BoundPartitionSpecRef, Literal, Struct, StructType, Type};
 use crate::transform::{create_transform_function, BoxedTransformFunction};
 use crate::{Error, ErrorKind, Result};
@@ -91,7 +91,7 @@ pub(crate) fn convert_row_to_struct(
         StructArray::try_new(partition_arrow_fields, partition_columns, None)?
     };
     let struct_array = {
-        let struct_array = arrow_struct_to_iceberg_struct(&arrow_struct_array, struct_type)?;
+        let struct_array = arrow_struct_to_literal(&arrow_struct_array, struct_type)?;
         struct_array
             .into_iter()
             .map(|s| {
@@ -238,8 +238,8 @@ mod tests {
         .expect("Failed to create spliter");
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("data", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, false),
+            Field::new("data", DataType::Utf8, false),
         ]));
         let id_array = Int32Array::from(vec![1, 2, 1, 3, 2, 3, 1]);
         let data_array = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"]);
