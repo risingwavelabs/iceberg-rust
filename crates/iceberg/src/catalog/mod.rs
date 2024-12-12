@@ -18,7 +18,7 @@
 //! Catalog API for Apache Iceberg
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::mem::take;
 use std::ops::Deref;
 
@@ -149,6 +149,12 @@ impl NamespaceIdent {
     }
 }
 
+impl Display for NamespaceIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.join("."))
+    }
+}
+
 impl AsRef<Vec<String>> for NamespaceIdent {
     fn as_ref(&self) -> &Vec<String> {
         &self.0
@@ -229,6 +235,12 @@ impl TableIdent {
             namespace: namespace_ident,
             name: table_name,
         })
+    }
+}
+
+impl Display for TableIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.namespace, self.name)
     }
 }
 
