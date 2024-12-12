@@ -111,7 +111,7 @@ where
             &schema_to_arrow_schema(&data_writer.current_schema())?,
             &unique_column_ids,
             |field| {
-                if !field.data_type().is_primitive() {
+                if field.data_type().is_nested() {
                     return Ok(None);
                 }
                 field
@@ -250,5 +250,187 @@ where
             .chain(position_delete_files)
             .chain(equality_delete_files)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use crate::writer::base_writer::equality_delete_writer::EqualityDeleteFileWriterBuilder;
+    use crate::writer::base_writer::sort_position_delete_writer::{
+        SortPositionDeleteWriterBuilder, POSITION_DELETE_ARROW_SCHEMA,
+    };
+    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
+    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
+    use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::function_writer::equality_delta_writer::{
+        EqualityDeltaWriterBuilder, DELETE_OP, INSERT_OP,
+    };
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+    use crate::Result;
+
+    #[tokio::test]
+    async fn test_equality_delta_writer() -> Result<()> {
+        // prepare writer
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "id".to_string(),
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        "name".to_string(),
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let location_gen =
+            MockLocationGenerator::new(temp_dir.path().to_str().unwrap().to_string());
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            file_io.clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(schema.clone(), pw.clone(), None);
+        let position_delete_writer_builder =
+            SortPositionDeleteWriterBuilder::new(pw.clone(), 100, None);
+        let equality_delete_writer_builder =
+            EqualityDeleteFileWriterBuilder::new(pw, vec![1, 2], schema, None).unwrap();
+        let mut equality_delta_writer = EqualityDeltaWriterBuilder::new(
+            data_file_writer_builder,
+            position_delete_writer_builder,
+            equality_delete_writer_builder,
+            vec![1, 2],
+        )
+        .build()
+        .await
+        .unwrap();
+
+        // write data
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("data", DataType::Utf8, true),
+            Field::new("op", DataType::Int32, false),
+        ]));
+        {
+            let id_array = Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1]);
+            let data_array = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"]);
+            let batch = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(id_array),
+                Arc::new(data_array),
+                Arc::new(Int32Array::from(vec![INSERT_OP; 7])),
+            ])
+            .expect("Failed to create RecordBatch");
+            equality_delta_writer.write(batch).await?;
+        }
+        {
+            let id_array = Int64Array::from(vec![1, 2, 3, 4]);
+            let data_array = StringArray::from(vec!["a", "b", "k", "l"]);
+            let batch = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(id_array),
+                Arc::new(data_array),
+                Arc::new(Int32Array::from(vec![
+                    DELETE_OP, DELETE_OP, DELETE_OP, INSERT_OP,
+                ])),
+            ])
+            .expect("Failed to create RecordBatch");
+            equality_delta_writer.write(batch).await?;
+        }
+
+        let data_files = equality_delta_writer.close().await?;
+        assert_eq!(data_files.len(), 3);
+        // data file
+        let data_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("data", DataType::Utf8, true),
+        ]));
+        let data_file = data_files
+            .iter()
+            .find(|file| file.content == DataContentType::Data)
+            .unwrap();
+        let data_file_path = data_file.file_path().to_string();
+        let input_file = file_io.new_input(&data_file_path).unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
+        let reader = reader_builder.build().unwrap();
+        let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+        let res = concat_batches(&data_schema, &batches).unwrap();
+        let expected_batches = RecordBatch::try_new(data_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1, 4])),
+            Arc::new(StringArray::from(vec![
+                "a", "b", "c", "d", "e", "f", "g", "l",
+            ])),
+        ])
+        .unwrap();
+        assert_eq!(expected_batches, res);
+
+        // position delete file
+        let position_delete_file = data_files
+            .iter()
+            .find(|file| file.content == DataContentType::PositionDeletes)
+            .unwrap();
+        let input_file = file_io
+            .new_input(position_delete_file.file_path.clone())
+            .unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
+        let reader = reader_builder.build().unwrap();
+        let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+        let res = concat_batches(&POSITION_DELETE_ARROW_SCHEMA, &batches).unwrap();
+        let expected_batches = RecordBatch::try_new(POSITION_DELETE_ARROW_SCHEMA.clone(), vec![
+            Arc::new(StringArray::from(vec![
+                data_file_path.clone(),
+                data_file_path.clone(),
+            ])),
+            Arc::new(Int64Array::from(vec![0, 1])),
+        ])
+        .unwrap();
+        assert_eq!(expected_batches, res);
+
+        // equality delete file
+        let equality_delete_file = data_files
+            .iter()
+            .find(|file| file.content == DataContentType::EqualityDeletes)
+            .unwrap();
+        let input_file = file_io
+            .new_input(equality_delete_file.file_path.clone())
+            .unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader_builder =
+            ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
+        let reader = reader_builder.build().unwrap();
+        let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+        let res = concat_batches(&data_schema, &batches).unwrap();
+        let expected_batches = RecordBatch::try_new(data_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(StringArray::from(vec!["k"])),
+        ])
+        .unwrap();
+        assert_eq!(expected_batches, res);
+
+        Ok(())
     }
 }

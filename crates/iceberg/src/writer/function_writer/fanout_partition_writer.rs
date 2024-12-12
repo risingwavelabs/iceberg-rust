@@ -88,6 +88,13 @@ pub struct FanoutPartitionWriter<B: IcebergWriterBuilder> {
     partition_writers: HashMap<OwnedRow, B::R>,
 }
 
+impl<B: IcebergWriterBuilder> FanoutPartitionWriter<B> {
+    /// Get the current number of partition writers.
+    pub fn partition_num(&self) -> usize {
+        self.partition_writers.len()
+    }
+}
+
 #[async_trait::async_trait]
 impl<B: IcebergWriterBuilder> IcebergWriter for FanoutPartitionWriter<B> {
     async fn write(&mut self, input: RecordBatch) -> Result<()> {
@@ -122,5 +129,144 @@ impl<B: IcebergWriterBuilder> IcebergWriter for FanoutPartitionWriter<B> {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
+    use itertools::Itertools;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use crate::io::FileIOBuilder;
+    use crate::spec::{
+        BoundPartitionSpec, DataFileFormat, Literal, NestedField, PrimitiveLiteral, PrimitiveType,
+        Schema, Struct, Transform, Type, UnboundPartitionField,
+    };
+    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
+    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
+    use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder;
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+    use crate::Result;
+
+    #[tokio::test]
+    async fn test_fanout_partition_writer() -> Result<()> {
+        // prepare writer
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "id".to_string(),
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        "name".to_string(),
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = BoundPartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .add_unbound_field(UnboundPartitionField {
+                source_id: 1,
+                field_id: None,
+                name: "id_bucket".to_string(),
+                transform: Transform::Identity,
+            })
+            .unwrap()
+            .build()
+            .unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let location_gen =
+            MockLocationGenerator::new(temp_dir.path().to_str().unwrap().to_string());
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            file_io.clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(schema, pw, None);
+        let mut fanout_partition_writer =
+            FanoutPartitionWriterBuilder::new(data_file_writer_builder, Arc::new(partition_spec))
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+
+        // prepare data
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("data", DataType::Utf8, true),
+        ]));
+        let id_array = Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1]);
+        let data_array = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(id_array),
+            Arc::new(data_array),
+        ])
+        .expect("Failed to create RecordBatch");
+
+        fanout_partition_writer.write(batch).await?;
+        let data_files = fanout_partition_writer.close().await?;
+        assert_eq!(data_files.len(), 3);
+        let expected_partitions = vec![
+            Struct::from_iter(vec![Some(Literal::Primitive(PrimitiveLiteral::Long(1)))]),
+            Struct::from_iter(vec![Some(Literal::Primitive(PrimitiveLiteral::Long(2)))]),
+            Struct::from_iter(vec![Some(Literal::Primitive(PrimitiveLiteral::Long(3)))]),
+        ];
+        let expected_batches = vec![
+            RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(StringArray::from(vec!["a", "c", "g"])),
+            ])
+            .unwrap(),
+            RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(Int64Array::from(vec![2, 2])),
+                Arc::new(StringArray::from(vec!["b", "e"])),
+            ])
+            .unwrap(),
+            RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(Int64Array::from(vec![3, 3])),
+                Arc::new(StringArray::from(vec!["d", "f"])),
+            ])
+            .unwrap(),
+        ];
+        for (partition, batch) in expected_partitions
+            .into_iter()
+            .zip_eq(expected_batches.into_iter())
+        {
+            assert!(data_files.iter().any(|file| file.partition == partition));
+            let data_file = data_files
+                .iter()
+                .find(|file| file.partition == partition)
+                .unwrap();
+            let input_file = file_io.new_input(data_file.file_path.clone()).unwrap();
+            let input_content = input_file.read().await.unwrap();
+            let reader_builder =
+                ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
+
+            // check data
+            let reader = reader_builder.build().unwrap();
+            let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+            let res = concat_batches(&batch.schema(), &batches).unwrap();
+            assert_eq!(batch, res);
+        }
+
+        Ok(())
     }
 }

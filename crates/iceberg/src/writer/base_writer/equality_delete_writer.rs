@@ -61,7 +61,7 @@ impl<B: FileWriterBuilder> EqualityDeleteFileWriterBuilder<B> {
             |field| {
                 // Only primitive type is allowed to be used for identifier field ids
                 if field.is_nullable()
-                    || !field.data_type().is_primitive()
+                    || field.data_type().is_nested()
                     || matches!(
                         field.data_type(),
                         DataType::Float16 | DataType::Float32 | DataType::Float64

@@ -137,7 +137,7 @@ impl RecordBatchPartitionSpliter {
             // The source columns, selected by ids, must be a primitive type and cannot be contained in a map or list, but may be nested in a struct.
             // ref: https://iceberg.apache.org/spec/#partitioning
             |field| {
-                if !field.data_type().is_primitive() {
+                if field.data_type().is_nested() {
                     return Ok(None);
                 }
                 field

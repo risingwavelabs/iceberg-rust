@@ -48,7 +48,8 @@ impl<B: FileWriterBuilder> SortPositionDeleteWriterBuilder<B> {
     }
 }
 
-static POSITION_DELETE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+/// Schema for position delete file.
+pub static POSITION_DELETE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     Arc::new(
         Schema::builder()
             .with_fields(vec![
@@ -68,7 +69,8 @@ static POSITION_DELETE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     )
 });
 
-static POSITION_DELETE_ARROW_SCHEMA: Lazy<ArrowSchemaRef> =
+/// Arrow schema for position delete file.
+pub static POSITION_DELETE_ARROW_SCHEMA: Lazy<ArrowSchemaRef> =
     Lazy::new(|| Arc::new(schema_to_arrow_schema(&POSITION_DELETE_SCHEMA).unwrap()));
 
 #[async_trait::async_trait]
@@ -104,6 +106,13 @@ pub struct SortPositionDeleteWriter<B: FileWriterBuilder> {
     cache: BTreeMap<String, Vec<i64>>,
     data_files: Vec<DataFile>,
     partition_value: Struct,
+}
+
+impl<B: FileWriterBuilder> SortPositionDeleteWriter<B> {
+    /// Get the current number of cache rows.
+    pub fn current_cache_number(&self) -> usize {
+        self.cache.len()
+    }
 }
 
 impl<B: FileWriterBuilder> SortPositionDeleteWriter<B> {
