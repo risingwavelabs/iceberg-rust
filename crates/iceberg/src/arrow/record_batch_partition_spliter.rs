@@ -127,6 +127,12 @@ impl RecordBatchPartitionSpliter {
         original_schema: &Schema,
         partition_spec: BoundPartitionSpecRef,
     ) -> Result<Self> {
+        if partition_spec.fields().is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Fail to create partition spliter using empty partition spec",
+            ));
+        }
         let projector = RecordBatchProjector::new(
             original_schema,
             &partition_spec
@@ -157,12 +163,12 @@ impl RecordBatchPartitionSpliter {
             .map(|field| create_transform_function(&field.transform))
             .collect::<Result<Vec<_>>>()?;
         let row_converter = RowConverter::new(
-            projector
-                .projected_schema_ref()
+            partition_spec
+                .partition_type()
                 .fields()
                 .iter()
-                .map(|field| SortField::new(field.data_type().clone()))
-                .collect(),
+                .map(|f| Ok(SortField::new(type_to_arrow_type(&f.field_type)?)))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         Ok(Self {
             partition_spec,
@@ -428,5 +434,31 @@ mod tests {
             Struct::from_iter(vec![Some(Literal::int(2))]),
             Struct::from_iter(vec![Some(Literal::int(3))]),
         ]);
+    }
+
+    #[test]
+    fn test_empty_partition() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(crate::spec::PrimitiveType::Int))
+                    .into(),
+                NestedField::required(
+                    2,
+                    "name",
+                    Type::Primitive(crate::spec::PrimitiveType::String),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let partition_spec = BoundPartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .build()
+            .unwrap();
+        assert!(RecordBatchPartitionSpliter::new(
+            &schema_to_arrow_schema(&schema).unwrap(),
+            Arc::new(partition_spec),
+        )
+        .is_err())
     }
 }
