@@ -272,7 +272,7 @@ impl Day {
 
 impl TransformFunction for Day {
     fn transform(&self, input: ArrayRef) -> Result<ArrayRef> {
-        let res: Int32Array = match input.data_type() {
+        let res: Date32Array = match input.data_type() {
             DataType::Timestamp(TimeUnit::Microsecond, _) => input
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -324,7 +324,7 @@ impl TransformFunction for Day {
                 ))
             }
         };
-        Ok(Some(Datum::int(val)))
+        Ok(Some(Datum::date(val)))
     }
 }
 
