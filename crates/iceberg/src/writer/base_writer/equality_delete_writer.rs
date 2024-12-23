@@ -55,13 +55,12 @@ impl<B: FileWriterBuilder> EqualityDeleteFileWriterBuilder<B> {
             &original_arrow_schema,
             &equality_ids,
             // The following rule comes from https://iceberg.apache.org/spec/#identifier-field-ids
+            // and https://iceberg.apache.org/spec/#equality-delete-files
             // - The identifier field ids must be used for primitive types.
             // - The identifier field ids must not be used for floating point types or nullable fields.
-            // - The identifier field ids can be nested field of struct but not nested field of nullable struct.
             |field| {
                 // Only primitive type is allowed to be used for identifier field ids
-                if field.is_nullable()
-                    || field.data_type().is_nested()
+                if field.data_type().is_nested()
                     || matches!(
                         field.data_type(),
                         DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -80,7 +79,7 @@ impl<B: FileWriterBuilder> EqualityDeleteFileWriterBuilder<B> {
                         .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?,
                 ))
             },
-            |field: &Field| !field.is_nullable(),
+            |_field: &Field| true,
         )?;
         Ok(Self {
             inner,
@@ -157,7 +156,7 @@ mod test {
     use std::sync::Arc;
 
     use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StructArray};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray};
     use arrow_schema::DataType;
     use arrow_select::concat::concat_batches;
     use itertools::Itertools;
@@ -481,11 +480,6 @@ mod test {
             EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![1], schema.clone(), None)
                 .is_err()
         );
-        // Int is nullable, not allowed to be used for equality delete
-        assert!(
-            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![2], schema.clone(), None)
-                .is_err()
-        );
         // Struct is not allowed to be used for equality delete
         assert!(
             EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![3], schema.clone(), None)
@@ -494,11 +488,6 @@ mod test {
         // Nested field of struct is allowed to be used for equality delete
         assert!(
             EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![4], schema.clone(), None).is_ok()
-        );
-        // Nested field of optional struct is not allowed to be used for equality delete
-        assert!(
-            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![6], schema.clone(), None)
-                .is_err()
         );
         // Nested field of map is not allowed to be used for equality delete
         assert!(
