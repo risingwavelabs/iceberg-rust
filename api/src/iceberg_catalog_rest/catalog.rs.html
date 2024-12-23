@@ -1795,39 +1795,6 @@
 <a href="#1795" id="1795">1795</a>
 <a href="#1796" id="1796">1796</a>
 <a href="#1797" id="1797">1797</a>
-<a href="#1798" id="1798">1798</a>
-<a href="#1799" id="1799">1799</a>
-<a href="#1800" id="1800">1800</a>
-<a href="#1801" id="1801">1801</a>
-<a href="#1802" id="1802">1802</a>
-<a href="#1803" id="1803">1803</a>
-<a href="#1804" id="1804">1804</a>
-<a href="#1805" id="1805">1805</a>
-<a href="#1806" id="1806">1806</a>
-<a href="#1807" id="1807">1807</a>
-<a href="#1808" id="1808">1808</a>
-<a href="#1809" id="1809">1809</a>
-<a href="#1810" id="1810">1810</a>
-<a href="#1811" id="1811">1811</a>
-<a href="#1812" id="1812">1812</a>
-<a href="#1813" id="1813">1813</a>
-<a href="#1814" id="1814">1814</a>
-<a href="#1815" id="1815">1815</a>
-<a href="#1816" id="1816">1816</a>
-<a href="#1817" id="1817">1817</a>
-<a href="#1818" id="1818">1818</a>
-<a href="#1819" id="1819">1819</a>
-<a href="#1820" id="1820">1820</a>
-<a href="#1821" id="1821">1821</a>
-<a href="#1822" id="1822">1822</a>
-<a href="#1823" id="1823">1823</a>
-<a href="#1824" id="1824">1824</a>
-<a href="#1825" id="1825">1825</a>
-<a href="#1826" id="1826">1826</a>
-<a href="#1827" id="1827">1827</a>
-<a href="#1828" id="1828">1828</a>
-<a href="#1829" id="1829">1829</a>
-<a href="#1830" id="1830">1830</a>
 </pre></div><pre class="rust"><code><span class="comment">// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -1880,7 +1847,7 @@
 </span><span class="attr">#[derive(Clone, Debug, TypedBuilder)]
 </span><span class="kw">pub struct </span>RestCatalogConfig {
     uri: String,
-    <span class="attr">#[builder(default, setter(strip_option))]
+    <span class="attr">#[builder(default, setter(strip_option(fallback = warehouse_opt)))]
     </span>warehouse: <span class="prelude-ty">Option</span>&lt;String&gt;,
 
     <span class="attr">#[builder(default)]
@@ -1903,12 +1870,6 @@
     <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>get_token_endpoint(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; String {
         <span class="kw">if let </span><span class="prelude-val">Some</span>(oauth2_uri) = <span class="self">self</span>.props.get(<span class="string">"oauth2-server-uri"</span>) {
             oauth2_uri.to_string()
-        } <span class="kw">else if let </span><span class="prelude-val">Some</span>(auth_url) = <span class="self">self</span>.props.get(<span class="string">"rest.authorization-url"</span>) {
-            <span class="macro">log::warn!</span>(
-                <span class="string">"'rest.authorization-url' is deprecated and will be removed in version 0.4.0. \
-                 Please use 'oauth2-server-uri' instead."
-            </span>);
-            auth_url.to_string()
         } <span class="kw">else </span>{
             [<span class="kw-2">&amp;</span><span class="self">self</span>.uri, PATH_V1, <span class="string">"oauth"</span>, <span class="string">"tokens"</span>].join(<span class="string">"/"</span>)
         }
@@ -2086,9 +2047,10 @@
     </span><span class="kw">async fn </span>context(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="kw-2">&amp;</span>RestContext&gt; {
         <span class="self">self</span>.ctx
             .get_or_try_init(|| <span class="kw">async </span>{
-                <span class="kw">let </span>catalog_config = RestCatalog::load_config(<span class="kw-2">&amp;</span><span class="self">self</span>.user_config).<span class="kw">await</span><span class="question-mark">?</span>;
+                <span class="kw">let </span>client = HttpClient::new(<span class="kw-2">&amp;</span><span class="self">self</span>.user_config)<span class="question-mark">?</span>;
+                <span class="kw">let </span>catalog_config = RestCatalog::load_config(<span class="kw-2">&amp;</span>client, <span class="kw-2">&amp;</span><span class="self">self</span>.user_config).<span class="kw">await</span><span class="question-mark">?</span>;
                 <span class="kw">let </span>config = <span class="self">self</span>.user_config.clone().merge_with_config(catalog_config);
-                <span class="kw">let </span>client = HttpClient::new(<span class="kw-2">&amp;</span>config)<span class="question-mark">?</span>;
+                <span class="kw">let </span>client = client.update_with(<span class="kw-2">&amp;</span>config)<span class="question-mark">?</span>;
 
                 <span class="prelude-val">Ok</span>(RestContext { config, client })
             })
@@ -2098,9 +2060,10 @@
     <span class="doccomment">/// Load the runtime config from the server by user_config.
     ///
     /// It's required for a rest catalog to update it's config after creation.
-    </span><span class="kw">async fn </span>load_config(user_config: <span class="kw-2">&amp;</span>RestCatalogConfig) -&gt; <span class="prelude-ty">Result</span>&lt;CatalogConfig&gt; {
-        <span class="kw">let </span>client = HttpClient::new(user_config)<span class="question-mark">?</span>;
-
+    </span><span class="kw">async fn </span>load_config(
+        client: <span class="kw-2">&amp;</span>HttpClient,
+        user_config: <span class="kw-2">&amp;</span>RestCatalogConfig,
+    ) -&gt; <span class="prelude-ty">Result</span>&lt;CatalogConfig&gt; {
         <span class="kw">let </span><span class="kw-2">mut </span>request = client.request(Method::GET, user_config.config_endpoint());
 
         <span class="kw">if let </span><span class="prelude-val">Some</span>(warehouse_location) = <span class="kw-2">&amp;</span>user_config.warehouse {
@@ -2110,6 +2073,7 @@
         <span class="kw">let </span>config = client
             .query::&lt;CatalogConfig, ErrorResponse, OK&gt;(request.build()<span class="question-mark">?</span>)
             .<span class="kw">await</span><span class="question-mark">?</span>;
+
         <span class="prelude-val">Ok</span>(config)
     }
 
@@ -2607,7 +2571,7 @@
                 "expires_in": 86400
                 }"#</span>,
             )
-            .expect(<span class="number">2</span>)
+            .expect(<span class="number">1</span>)
             .create_async()
             .<span class="kw">await
     </span>}
@@ -2661,7 +2625,7 @@
                 "expires_in": 86400
                 }"#</span>,
             )
-            .expect(<span class="number">2</span>)
+            .expect(<span class="number">1</span>)
             .create_async()
             .<span class="kw">await</span>;
 
@@ -2749,36 +2713,6 @@
             ),
         ]);
         <span class="macro">assert_eq!</span>(headers, expected_headers);
-    }
-
-    <span class="attr">#[tokio::test]
-    </span><span class="kw">async fn </span>test_oauth_with_deprecated_auth_url() {
-        <span class="kw">let </span><span class="kw-2">mut </span>server = Server::new_async().<span class="kw">await</span>;
-        <span class="kw">let </span>config_mock = create_config_mock(<span class="kw-2">&amp;mut </span>server).<span class="kw">await</span>;
-
-        <span class="kw">let </span><span class="kw-2">mut </span>auth_server = Server::new_async().<span class="kw">await</span>;
-        <span class="kw">let </span>auth_server_path = <span class="string">"/some/path"</span>;
-        <span class="kw">let </span>oauth_mock = create_oauth_mock_with_path(<span class="kw-2">&amp;mut </span>auth_server, auth_server_path).<span class="kw">await</span>;
-
-        <span class="kw">let </span><span class="kw-2">mut </span>props = HashMap::new();
-        props.insert(<span class="string">"credential"</span>.to_string(), <span class="string">"client1:secret1"</span>.to_string());
-        props.insert(
-            <span class="string">"rest.authorization-url"</span>.to_string(),
-            <span class="macro">format!</span>(<span class="string">"{}{}"</span>, auth_server.url(), auth_server_path).to_string(),
-        );
-
-        <span class="kw">let </span>catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri(server.url())
-                .props(props)
-                .build(),
-        );
-
-        <span class="kw">let </span>token = catalog.context().<span class="kw">await</span>.unwrap().client.token().<span class="kw">await</span>;
-
-        oauth_mock.assert_async().<span class="kw">await</span>;
-        config_mock.assert_async().<span class="kw">await</span>;
-        <span class="macro">assert_eq!</span>(token, <span class="prelude-val">Some</span>(<span class="string">"ey000000000000"</span>.to_string()));
     }
 
     <span class="attr">#[tokio::test]
@@ -3206,7 +3140,7 @@
             .with_schema_id(<span class="number">0</span>)
             .with_summary(Summary {
                 operation: Operation::Append,
-                other: HashMap::from_iter([
+                additional_properties: HashMap::from_iter([
                     (<span class="string">"spark.app.id"</span>, <span class="string">"local-1646787004168"</span>),
                     (<span class="string">"added-data-files"</span>, <span class="string">"1"</span>),
                     (<span class="string">"added-records"</span>, <span class="string">"1"</span>),

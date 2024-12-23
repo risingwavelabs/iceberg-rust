@@ -1676,6 +1676,8 @@
 <a href="#1676" id="1676">1676</a>
 <a href="#1677" id="1677">1677</a>
 <a href="#1678" id="1678">1678</a>
+<a href="#1679" id="1679">1679</a>
+<a href="#1680" id="1680">1680</a>
 </pre></div><pre class="rust"><code><span class="comment">// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -1872,7 +1874,9 @@
             }
         };
 
-        <span class="kw">let </span>metadata = TableMetadataBuilder::from_table_creation(table_creation)<span class="question-mark">?</span>.build()<span class="question-mark">?</span>;
+        <span class="kw">let </span>metadata = TableMetadataBuilder::from_table_creation(table_creation)<span class="question-mark">?
+            </span>.build()<span class="question-mark">?
+            </span>.metadata;
         <span class="kw">let </span>metadata_location = <span class="macro">format!</span>(
             <span class="string">"{}/metadata/{}-{}.metadata.json"</span>,
             <span class="kw-2">&amp;</span>location,
@@ -1961,7 +1965,7 @@
     <span class="kw">use </span>std::iter::FromIterator;
 
     <span class="kw">use </span>iceberg::io::FileIOBuilder;
-    <span class="kw">use </span>iceberg::spec::{BoundPartitionSpec, NestedField, PrimitiveType, Schema, SortOrder, Type};
+    <span class="kw">use </span>iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     <span class="kw">use </span>regex::Regex;
     <span class="kw">use </span>tempfile::TempDir;
 
@@ -2033,7 +2037,7 @@
 
         <span class="macro">assert_eq!</span>(metadata.current_schema().as_ref(), expected_schema);
 
-        <span class="kw">let </span>expected_partition_spec = BoundPartitionSpec::builder((<span class="kw-2">*</span>expected_schema).clone())
+        <span class="kw">let </span>expected_partition_spec = PartitionSpec::builder((<span class="kw-2">*</span>expected_schema).clone())
             .with_spec_id(<span class="number">0</span>)
             .build()
             .unwrap();
@@ -2043,7 +2047,7 @@
                 .partition_specs_iter()
                 .map(|p| p.as_ref())
                 .collect_vec(),
-            <span class="macro">vec!</span>[<span class="kw-2">&amp;</span>expected_partition_spec.into_schemaless()]
+            <span class="macro">vec!</span>[<span class="kw-2">&amp;</span>expected_partition_spec]
         );
 
         <span class="kw">let </span>expected_sorted_order = SortOrder::builder()
