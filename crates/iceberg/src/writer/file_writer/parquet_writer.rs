@@ -406,6 +406,11 @@ impl FileWriter for ParquetWriter {
             Error::new(ErrorKind::Unexpected, "Failed to close parquet writer.").with_source(err)
         })?;
 
+        if self.current_row_num == 0 {
+            self.out_file.delete().await?;
+            return Ok(vec![]);
+        }
+
         let written_size = self.written_size.load(std::sync::atomic::Ordering::Relaxed);
 
         Ok(vec![Self::to_data_file_builder(
