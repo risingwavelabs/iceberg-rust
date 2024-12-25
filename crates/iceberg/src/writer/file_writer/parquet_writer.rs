@@ -49,8 +49,6 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Clone)]
 pub struct ParquetWriterBuilder<T: LocationGenerator, F: FileNameGenerator> {
     props: WriterProperties,
-    schema: SchemaRef,
-
     file_io: FileIO,
     location_generator: T,
     file_name_generator: F,
@@ -61,14 +59,12 @@ impl<T: LocationGenerator, F: FileNameGenerator> ParquetWriterBuilder<T, F> {
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
     pub fn new(
         props: WriterProperties,
-        schema: SchemaRef,
         file_io: FileIO,
         location_generator: T,
         file_name_generator: F,
     ) -> Self {
         Self {
             props,
-            schema,
             file_io,
             location_generator,
             file_name_generator,
@@ -79,8 +75,7 @@ impl<T: LocationGenerator, F: FileNameGenerator> ParquetWriterBuilder<T, F> {
 impl<T: LocationGenerator, F: FileNameGenerator> FileWriterBuilder for ParquetWriterBuilder<T, F> {
     type R = ParquetWriter;
 
-    async fn build(self) -> crate::Result<Self::R> {
-        let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+    async fn build(self, schema: SchemaRef) -> crate::Result<Self::R> {
         let written_size = Arc::new(AtomicI64::new(0));
         let out_file = self.file_io.new_output(
             self.location_generator
@@ -88,15 +83,15 @@ impl<T: LocationGenerator, F: FileNameGenerator> FileWriterBuilder for ParquetWr
         )?;
         let inner_writer = TrackWriter::new(out_file.writer().await?, written_size.clone());
         let async_writer = AsyncFileWriter::new(inner_writer);
-        let writer =
-            AsyncArrowWriter::try_new(async_writer, arrow_schema.clone(), Some(self.props))
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to build parquet writer.")
-                        .with_source(err)
-                })?;
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema.as_ref().try_into()?);
+        let writer = AsyncArrowWriter::try_new(async_writer, arrow_schema, Some(self.props))
+            .map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to build parquet writer.")
+                    .with_source(err)
+            })?;
 
         Ok(ParquetWriter {
-            schema: self.schema.clone(),
+            schema: schema.clone(),
             writer,
             written_size,
             current_row_num: 0,
@@ -411,6 +406,11 @@ impl FileWriter for ParquetWriter {
             Error::new(ErrorKind::Unexpected, "Failed to close parquet writer.").with_source(err)
         })?;
 
+        if self.current_row_num == 0 {
+            self.out_file.delete().await?;
+            return Ok(vec![]);
+        }
+
         let written_size = self.written_size.load(std::sync::atomic::Ordering::Relaxed);
 
         Ok(vec![Self::to_data_file_builder(
@@ -433,6 +433,10 @@ impl CurrentFileStatus for ParquetWriter {
 
     fn current_written_size(&self) -> usize {
         self.written_size.load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+
+    fn current_schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -538,6 +542,17 @@ mod tests {
                 NestedField::optional(14, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
                 NestedField::optional(15, "fixed", Type::Primitive(PrimitiveType::Fixed(10)))
                     .into(),
+                // Parquet Statistics will use different representation for Decimal with precision 38 and scale 5,
+                // so we need to add a new field for it.
+                NestedField::optional(
+                    16,
+                    "decimal_38",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 38,
+                        scale: 5,
+                    }),
+                )
+                .into(),
             ])
             .build()
             .unwrap()
@@ -656,12 +671,11 @@ mod tests {
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
             file_io.clone(),
             location_gen,
             file_name_gen,
         )
-        .build()
+        .build(Arc::new(to_write.schema().as_ref().try_into().unwrap()))
         .await?;
         pw.write(&to_write).await?;
         pw.write(&to_write_null).await?;
@@ -852,12 +866,11 @@ mod tests {
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(schema),
             file_io.clone(),
             location_gen,
             file_name_gen,
         )
-        .build()
+        .build(Arc::new(schema))
         .await?;
         pw.write(&to_write).await?;
         let res = pw.close().await?;
@@ -1028,21 +1041,25 @@ mod tests {
             )
             .unwrap(),
         ) as ArrayRef;
+        let col16 = Arc::new(
+            arrow_array::Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
+                .with_precision_and_scale(38, 5)
+                .unwrap(),
+        ) as ArrayRef;
         let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
             col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13,
-            col14, col15,
+            col14, col15, col16,
         ])
         .unwrap();
 
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(schema),
             file_io.clone(),
             loccation_gen,
             file_name_gen,
         )
-        .build()
+        .build(Arc::new(schema))
         .await?;
         pw.write(&to_write).await?;
         let res = pw.close().await?;
@@ -1092,6 +1109,16 @@ mod tests {
                 ),
                 (14, Datum::uuid(Uuid::from_u128(0))),
                 (15, Datum::fixed(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
+                (
+                    16,
+                    Datum::new(
+                        PrimitiveType::Decimal {
+                            precision: 38,
+                            scale: 5
+                        },
+                        PrimitiveLiteral::Int128(1)
+                    )
+                ),
             ])
         );
         assert_eq!(
@@ -1124,6 +1151,16 @@ mod tests {
                 (
                     15,
                     Datum::fixed(vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+                ),
+                (
+                    16,
+                    Datum::new(
+                        PrimitiveType::Decimal {
+                            precision: 38,
+                            scale: 5
+                        },
+                        PrimitiveLiteral::Int128(100)
+                    )
                 ),
             ])
         );

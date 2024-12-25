@@ -1431,6 +1431,16 @@ impl Literal {
         Self::Primitive(PrimitiveLiteral::Long(value))
     }
 
+    /// Creates a timestamp from unix epoch in nanoseconds.
+    pub fn timestamp_nano(value: i64) -> Self {
+        Self::Primitive(PrimitiveLiteral::Long(value))
+    }
+
+    /// Creates a timestamp with timezone from unix epoch in nanoseconds.
+    pub fn timestamptz_nano(value: i64) -> Self {
+        Self::Primitive(PrimitiveLiteral::Long(value))
+    }
+
     /// Creates a timestamp from [`DateTime`].
     pub fn timestamp_from_datetime<T: TimeZone>(dt: DateTime<T>) -> Self {
         Self::timestamp(dt.with_timezone(&Utc).timestamp_micros())
@@ -2087,6 +2097,8 @@ mod timestamptz {
 }
 
 mod _serde {
+    use std::collections::HashMap;
+
     use serde::de::Visitor;
     use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
     use serde::{Deserialize, Serialize};
@@ -2676,22 +2688,24 @@ mod _serde {
                     optional: _,
                 }) => match ty {
                     Type::Struct(struct_ty) => {
-                        let iters: Vec<Option<Literal>> = required
-                            .into_iter()
-                            .map(|(field_name, value)| {
-                                let field = struct_ty
-                                    .field_by_name(field_name.as_str())
-                                    .ok_or_else(|| {
-                                        invalid_err_with_reason(
-                                            "record",
-                                            &format!("field {} is not exist", &field_name),
-                                        )
-                                    })?;
-                                let value = value.try_into(&field.field_type)?;
-                                Ok(value)
+                        let mut value_map: HashMap<String, RawLiteralEnum> =
+                            required.into_iter().collect();
+                        let values = struct_ty
+                            .fields()
+                            .iter()
+                            .map(|f| {
+                                if let Some(raw_value) = value_map.remove(&f.name) {
+                                    let value = raw_value.try_into(&f.field_type)?;
+                                    Ok(value)
+                                } else {
+                                    Err(invalid_err_with_reason(
+                                        "record",
+                                        &format!("field {} is not exist", &f.name),
+                                    ))
+                                }
                             })
-                            .collect::<Result<_, Error>>()?;
-                        Ok(Some(Literal::Struct(super::Struct::from_iter(iters))))
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        Ok(Some(Literal::Struct(super::Struct::from_iter(values))))
                     }
                     Type::Map(map_ty) => {
                         if *map_ty.key_field.field_type != Type::Primitive(PrimitiveType::String) {

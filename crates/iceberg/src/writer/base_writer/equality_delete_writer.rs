@@ -20,12 +20,12 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{DataType, Field};
 use itertools::Itertools;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
-use crate::arrow::schema_to_arrow_schema;
+use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
 use crate::spec::{DataFile, SchemaRef, Struct};
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -35,17 +35,6 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Clone)]
 pub struct EqualityDeleteFileWriterBuilder<B: FileWriterBuilder> {
     inner: B,
-}
-
-impl<B: FileWriterBuilder> EqualityDeleteFileWriterBuilder<B> {
-    /// Create a new `EqualityDeleteFileWriterBuilder` using a `FileWriterBuilder`.
-    pub fn new(inner: B) -> Self {
-        Self { inner }
-    }
-}
-
-/// Config for `EqualityDeleteWriter`.
-pub struct EqualityDeleteWriterConfig {
     // Field ids used to determine row equality in equality delete files.
     equality_ids: Vec<i32>,
     // Projector used to project the data chunk into specific fields.
@@ -53,25 +42,25 @@ pub struct EqualityDeleteWriterConfig {
     partition_value: Struct,
 }
 
-impl EqualityDeleteWriterConfig {
-    /// Create a new `DataFileWriterConfig` with equality ids.
+impl<B: FileWriterBuilder> EqualityDeleteFileWriterBuilder<B> {
+    /// Create a new `EqualityDeleteFileWriterBuilder` using a `FileWriterBuilder`.
     pub fn new(
+        inner: B,
         equality_ids: Vec<i32>,
         original_schema: SchemaRef,
         partition_value: Option<Struct>,
     ) -> Result<Self> {
         let original_arrow_schema = Arc::new(schema_to_arrow_schema(&original_schema)?);
         let projector = RecordBatchProjector::new(
-            original_arrow_schema,
+            &original_arrow_schema,
             &equality_ids,
             // The following rule comes from https://iceberg.apache.org/spec/#identifier-field-ids
+            // and https://iceberg.apache.org/spec/#equality-delete-files
             // - The identifier field ids must be used for primitive types.
             // - The identifier field ids must not be used for floating point types or nullable fields.
-            // - The identifier field ids can be nested field of struct but not nested field of nullable struct.
             |field| {
                 // Only primitive type is allowed to be used for identifier field ids
-                if field.is_nullable()
-                    || !field.data_type().is_primitive()
+                if field.data_type().is_nested()
                     || matches!(
                         field.data_type(),
                         DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -90,32 +79,30 @@ impl EqualityDeleteWriterConfig {
                         .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?,
                 ))
             },
-            |field: &Field| !field.is_nullable(),
+            |_field: &Field| true,
         )?;
         Ok(Self {
+            inner,
             equality_ids,
             projector,
             partition_value: partition_value.unwrap_or(Struct::empty()),
         })
-    }
-
-    /// Return projected Schema
-    pub fn projected_arrow_schema_ref(&self) -> &ArrowSchemaRef {
-        self.projector.projected_schema_ref()
     }
 }
 
 #[async_trait::async_trait]
 impl<B: FileWriterBuilder> IcebergWriterBuilder for EqualityDeleteFileWriterBuilder<B> {
     type R = EqualityDeleteFileWriter<B>;
-    type C = EqualityDeleteWriterConfig;
 
-    async fn build(self, config: Self::C) -> Result<Self::R> {
+    async fn build(self) -> Result<Self::R> {
+        let schema = Arc::new(arrow_schema_to_schema(
+            self.projector.projected_schema_ref(),
+        )?);
         Ok(EqualityDeleteFileWriter {
-            inner_writer: Some(self.inner.clone().build().await?),
-            projector: config.projector,
-            equality_ids: config.equality_ids,
-            partition_value: config.partition_value,
+            inner_writer: Some(self.inner.clone().build(schema).await?),
+            projector: self.projector,
+            equality_ids: self.equality_ids,
+            partition_value: self.partition_value,
         })
     }
 }
@@ -169,7 +156,7 @@ mod test {
     use std::sync::Arc;
 
     use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StructArray};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray};
     use arrow_schema::DataType;
     use arrow_select::concat::concat_batches;
     use itertools::Itertools;
@@ -177,15 +164,13 @@ mod test {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
-    use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+    use crate::arrow::schema_to_arrow_schema;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
         DataFile, DataFileFormat, ListType, MapType, NestedField, PrimitiveType, Schema,
         StructType, Type,
     };
-    use crate::writer::base_writer::equality_delete_writer::{
-        EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
-    };
+    use crate::writer::base_writer::equality_delete_writer::EqualityDeleteFileWriterBuilder;
     use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
     use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
     use crate::writer::file_writer::ParquetWriterBuilder;
@@ -380,25 +365,19 @@ mod test {
         let columns = vec![col0, col1, col2, col3, col4];
         let to_write = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
 
-        let equality_ids = vec![0_i32, 8];
-        let equality_config =
-            EqualityDeleteWriterConfig::new(equality_ids, Arc::new(schema), None).unwrap();
-        let delete_schema =
-            arrow_schema_to_schema(equality_config.projected_arrow_schema_ref()).unwrap();
-        let projector = equality_config.projector.clone();
-
         // prepare writer
         let pb = ParquetWriterBuilder::new(
             WriterProperties::builder().build(),
-            Arc::new(delete_schema),
             file_io.clone(),
             location_gen,
             file_name_gen,
         );
-
-        let mut equality_delete_writer = EqualityDeleteFileWriterBuilder::new(pb)
-            .build(equality_config)
-            .await?;
+        let mut equality_delete_writer =
+            EqualityDeleteFileWriterBuilder::new(pb, vec![0_i32, 8], Arc::new(schema), None)
+                .unwrap()
+                .build()
+                .await?;
+        let projector = equality_delete_writer.projector.clone();
 
         // write
         equality_delete_writer.write(to_write.clone()).await?;
@@ -419,6 +398,19 @@ mod test {
 
     #[tokio::test]
     async fn test_equality_delete_unreachable_column() -> Result<(), anyhow::Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let location_gen =
+            MockLocationGenerator::new(temp_dir.path().to_str().unwrap().to_string());
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let pb = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            file_io.clone(),
+            location_gen,
+            file_name_gen,
+        );
+
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
@@ -480,23 +472,42 @@ mod test {
                 .unwrap(),
         );
         // Float and Double are not allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![0], schema.clone(), None).is_err());
-        assert!(EqualityDeleteWriterConfig::new(vec![1], schema.clone(), None).is_err());
-        // Int is nullable, not allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![2], schema.clone(), None).is_err());
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![0], schema.clone(), None)
+                .is_err()
+        );
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![1], schema.clone(), None)
+                .is_err()
+        );
         // Struct is not allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![3], schema.clone(), None).is_err());
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![3], schema.clone(), None)
+                .is_err()
+        );
         // Nested field of struct is allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![4], schema.clone(), None).is_ok());
-        // Nested field of optional struct is not allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![6], schema.clone(), None).is_err());
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![4], schema.clone(), None).is_ok()
+        );
         // Nested field of map is not allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![7], schema.clone(), None).is_err());
-        assert!(EqualityDeleteWriterConfig::new(vec![8], schema.clone(), None).is_err());
-        assert!(EqualityDeleteWriterConfig::new(vec![9], schema.clone(), None).is_err());
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![7], schema.clone(), None)
+                .is_err()
+        );
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![8], schema.clone(), None)
+                .is_err()
+        );
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![9], schema.clone(), None)
+                .is_err()
+        );
         // Nested field of list is not allowed to be used for equality delete
-        assert!(EqualityDeleteWriterConfig::new(vec![10], schema.clone(), None).is_err());
-        assert!(EqualityDeleteWriterConfig::new(vec![11], schema.clone(), None).is_err());
+        assert!(
+            EqualityDeleteFileWriterBuilder::new(pb.clone(), vec![10], schema.clone(), None)
+                .is_err()
+        );
+        assert!(EqualityDeleteFileWriterBuilder::new(pb, vec![11], schema.clone(), None).is_err());
 
         Ok(())
     }
