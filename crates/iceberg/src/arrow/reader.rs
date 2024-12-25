@@ -39,6 +39,7 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask, PARQUET_FI
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
+use super::record_batch_transformer::RecordBatchTransformer;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{visit, BoundPredicateVisitor};
@@ -50,8 +51,6 @@ use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataContentType, Datum, PrimitiveType, Schema};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
-
-use super::record_batch_transformer::RecordBatchTransformer;
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
@@ -345,14 +344,19 @@ impl ArrowReader {
                 if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
                     return;
                 }
-
-                if !type_promotion_is_valid(
-                    parquet_iceberg_field
-                        .unwrap()
-                        .field_type
-                        .as_primitive_type(),
-                    iceberg_field.unwrap().field_type.as_primitive_type(),
-                ) {
+                if iceberg_field
+                    .unwrap()
+                    .field_type
+                    .as_primitive_type()
+                    .is_some()
+                    && !type_promotion_is_valid(
+                        parquet_iceberg_field
+                            .unwrap()
+                            .field_type
+                            .as_primitive_type(),
+                        iceberg_field.unwrap().field_type.as_primitive_type(),
+                    )
+                {
                     return;
                 }
 

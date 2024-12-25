@@ -28,6 +28,7 @@ rust-version = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 futures = { workspace = true }
+futures-util = "0.3.31"
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg_test_utils = { path = "../test_utils", features = ["tests"] }

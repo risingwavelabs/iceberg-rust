@@ -43,11 +43,13 @@ apache-avro = "0.17"
 array-init = "2"
 arrow-arith = { version = "53" }
 arrow-array = { version = "53" }
+arrow-buffer = { version = "53" }
 arrow-cast = { version = "53" }
 arrow-ord = { version = "53" }
 arrow-schema = { version = "53" }
 arrow-select = { version = "53" }
 arrow-string = { version = "53" }
+arrow-row = { version = "53" }
 async-stream = "0.3.5"
 async-trait = "0.1"
 async-std = "1.12"

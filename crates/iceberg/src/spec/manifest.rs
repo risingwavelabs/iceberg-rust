@@ -1188,6 +1188,10 @@ impl DataFile {
     pub fn sort_order_id(&self) -> Option<i32> {
         self.sort_order_id
     }
+
+    pub(crate) fn rewrite_partition(&mut self, partition: Struct) {
+        self.partition = partition;
+    }
 }
 /// Type of content stored by the data file: data, equality deletes, or
 /// position deletes (all v1 files are data files)
@@ -1253,6 +1257,8 @@ impl std::fmt::Display for DataFileFormat {
         }
     }
 }
+
+pub use _serde::DataFile as SerializedDataFile;
 
 mod _serde {
     use std::collections::HashMap;
@@ -1330,9 +1336,10 @@ mod _serde {
         }
     }
 
+    /// DataFile can used to be serialize.
     #[serde_as]
     #[derive(Serialize, Deserialize)]
-    pub(super) struct DataFile {
+    pub struct DataFile {
         #[serde(default)]
         content: i32,
         file_path: String,
@@ -1356,6 +1363,7 @@ mod _serde {
     }
 
     impl DataFile {
+        /// Create a SerializedDataFile from a DataFile
         pub fn try_from(
             value: super::DataFile,
             partition_type: &StructType,
@@ -1386,6 +1394,7 @@ mod _serde {
             })
         }
 
+        /// Convert a SerializedDataFile to a DataFile
         pub fn try_into(
             self,
             partition_type: &StructType,

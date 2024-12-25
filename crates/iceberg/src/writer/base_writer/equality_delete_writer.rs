@@ -64,16 +64,14 @@ impl EqualityDeleteWriterConfig {
     ) -> Result<Self> {
         let original_arrow_schema = Arc::new(schema_to_arrow_schema(&original_schema)?);
         let projector = RecordBatchProjector::new(
-            original_arrow_schema,
+            &original_arrow_schema,
             &equality_ids,
             // The following rule comes from https://iceberg.apache.org/spec/#identifier-field-ids
             // - The identifier field ids must be used for primitive types.
             // - The identifier field ids must not be used for floating point types or nullable fields.
-            // - The identifier field ids can be nested field of struct but not nested field of nullable struct.
             |field| {
                 // Only primitive type is allowed to be used for identifier field ids
-                if field.is_nullable()
-                    || field.data_type().is_nested()
+                if field.data_type().is_nested()
                     || matches!(
                         field.data_type(),
                         DataType::Float16 | DataType::Float32 | DataType::Float64
