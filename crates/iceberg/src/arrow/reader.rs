@@ -31,13 +31,14 @@ use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::channel::mpsc::{channel, Sender};
 use futures::future::BoxFuture;
-use futures::{try_join, SinkExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{try_join, FutureExt, SinkExt, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection};
-use parquet::arrow::async_reader::{AsyncFileReader, MetadataLoader};
+use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask, PARQUET_FIELD_ID_META_KEY};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
+use crate::arrow::record_batch_transformer::RecordBatchTransformer;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{visit, BoundPredicateVisitor};
@@ -47,7 +48,7 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::runtime::spawn;
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, Schema};
+use crate::spec::{DataContentType, Datum, Schema};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
@@ -201,8 +202,7 @@ impl ArrowReader {
 
         // Create a projection mask for the batch stream to select which columns in the
         // Parquet file that we want in the response
-        // Since Parquet projection mask will lose the order of the columns, we need to reorder.
-        let (projection_mask, reorder) = Self::get_arrow_projection_mask(
+        let projection_mask = Self::get_arrow_projection_mask(
             &task.project_field_ids,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
@@ -262,13 +262,23 @@ impl ArrowReader {
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester.
         let mut record_batch_stream = record_batch_stream_builder.build()?;
-        while let Some(batch) = record_batch_stream.try_next().await? {
-            let batch = if let Some(reorder) = reorder.as_ref() {
-                batch.project(&reorder).expect("must be able to reorder")
-            } else {
-                batch
-            };
-            tx.send(Ok(batch)).await?
+
+        // The schema of the xxx file doesn't change, so we don't need to convert the schema.
+        if matches!(task.data_file_content, DataContentType::PositionDeletes) {
+            while let Some(batch) = record_batch_stream.try_next().await? {
+                tx.send(Ok(batch)).await?
+            }
+        } else {
+            // RecordBatchTransformer performs any required transformations on the RecordBatches
+            // that come back from the file, such as type promotion, default column insertion
+            // and column re-ordering.
+            let mut record_batch_transformer =
+                RecordBatchTransformer::build(task.schema_ref(), task.project_field_ids());
+
+            while let Some(batch) = record_batch_stream.try_next().await? {
+                tx.send(record_batch_transformer.process_record_batch(batch))
+                    .await?
+            }
         }
 
         Ok(())
@@ -295,9 +305,9 @@ impl ArrowReader {
         iceberg_schema_of_task: &Schema,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
-    ) -> Result<(ProjectionMask, Option<Vec<usize>>)> {
+    ) -> Result<ProjectionMask> {
         if field_ids.is_empty() {
-            Ok((ProjectionMask::all(), None))
+            Ok(ProjectionMask::all())
         } else {
             // Build the map between field id and column index in Parquet schema.
             let mut column_map = HashMap::new();
@@ -355,20 +365,7 @@ impl ArrowReader {
                     ));
                 }
             }
-
-            // projection mask is order by indices
-            let mut mask_indices = indices.clone();
-            mask_indices.sort_by_key(|&x| x);
-            // try to reorder the mask_indices to indices
-            let reorder = indices
-                .iter()
-                .map(|idx| mask_indices.iter().position(|&i| i == *idx).unwrap())
-                .collect::<Vec<_>>();
-
-            Ok((
-                ProjectionMask::roots(parquet_schema, indices),
-                Some(reorder),
-            ))
+            Ok(ProjectionMask::roots(parquet_schema, indices))
         }
     }
 
@@ -1096,12 +1093,14 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
     }
 
     fn get_metadata(&mut self) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        Box::pin(async move {
-            let file_size = self.meta.size;
-            let mut loader = MetadataLoader::load(self, file_size as usize, None).await?;
-            loader.load_page_index(false, false).await?;
-            Ok(Arc::new(loader.finish()))
-        })
+        async move {
+            let reader = ParquetMetaDataReader::new();
+            let size = self.meta.size as usize;
+            let meta = reader.load_and_finish(self, size).await?;
+
+            Ok(Arc::new(meta))
+        }
+        .boxed()
     }
 }
 

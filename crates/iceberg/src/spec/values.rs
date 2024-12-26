@@ -29,7 +29,9 @@ use std::str::FromStr;
 pub use _serde::RawLiteral;
 use bitvec::vec::BitVec;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use num_bigint::BigInt;
 use ordered_float::OrderedFloat;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::de::{
     MapAccess, {self},
@@ -422,10 +424,15 @@ impl Datum {
             }
             PrimitiveType::Fixed(_) => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Binary => PrimitiveLiteral::Binary(Vec::from(bytes)),
-            PrimitiveType::Decimal {
-                precision: _,
-                scale: _,
-            } => todo!(),
+            PrimitiveType::Decimal { .. } => {
+                let unscaled_value = BigInt::from_signed_bytes_be(bytes);
+                PrimitiveLiteral::Int128(unscaled_value.to_i128().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Can't convert bytes to i128: {:?}", bytes),
+                    )
+                })?)
+            }
         };
         Ok(Datum::new(data_type, literal))
     }
@@ -449,7 +456,30 @@ impl Datum {
             PrimitiveLiteral::String(val) => ByteBuf::from(val.as_bytes()),
             PrimitiveLiteral::UInt128(val) => ByteBuf::from(val.to_be_bytes()),
             PrimitiveLiteral::Binary(val) => ByteBuf::from(val.as_slice()),
-            PrimitiveLiteral::Int128(_) => todo!(),
+            PrimitiveLiteral::Int128(val) => {
+                let PrimitiveType::Decimal { precision, .. } = self.r#type else {
+                    unreachable!(
+                        "PrimitiveLiteral Int128 must be PrimitiveType Decimal but got {}",
+                        &self.r#type
+                    )
+                };
+
+                // It's required by iceberg spec that we must keep the minimum
+                // number of bytes for the value
+                let required_bytes = Type::decimal_required_bytes(precision)
+                    .expect("PrimitiveType must has valid precision")
+                    as usize;
+
+                // The primitive literal is unscaled value.
+                let unscaled_value = BigInt::from(*val);
+                // Convert into two's-complement byte representation of the BigInt
+                // in big-endian byte order.
+                let mut bytes = unscaled_value.to_signed_bytes_be();
+                // Truncate with required bytes to make sure.
+                bytes.truncate(required_bytes);
+
+                ByteBuf::from(bytes)
+            }
         }
     }
 
@@ -1537,6 +1567,14 @@ impl Literal {
         })?;
         Ok(Self::decimal(decimal.mantissa()))
     }
+
+    /// Attempts to convert the Literal to a PrimitiveLiteral
+    pub fn as_primitive_literal(&self) -> Option<PrimitiveLiteral> {
+        match self {
+            Literal::Primitive(primitive) => Some(primitive.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// The partition struct stores the tuple of partition values for each file.
@@ -1560,7 +1598,7 @@ impl Struct {
     }
 
     /// Create a iterator to read the field in order of field_value.
-    pub fn iter(&self) -> impl Iterator<Item = Option<&Literal>> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<&Literal>> {
         self.null_bitmap.iter().zip(self.fields.iter()).map(
             |(null, value)| {
                 if *null {
@@ -1575,6 +1613,11 @@ impl Struct {
     /// returns true if the field at position `index` is null
     pub fn is_null_at_index(&self, index: usize) -> bool {
         self.null_bitmap[index]
+    }
+
+    /// Return fields in the struct.
+    pub fn fields(&self) -> &[Literal] {
+        &self.fields
     }
 }
 
@@ -3032,6 +3075,31 @@ mod tests {
     }
 
     #[test]
+    fn avro_bytes_decimal() {
+        let bytes = vec![4u8, 210u8];
+
+        check_avro_bytes_serde(
+            bytes,
+            Datum::decimal(Decimal::new(1234, 2)).unwrap(),
+            &PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            },
+        );
+
+        let bytes = vec![251u8, 46u8];
+
+        check_avro_bytes_serde(
+            bytes,
+            Datum::decimal(Decimal::new(-1234, 2)).unwrap(),
+            &PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            },
+        );
+    }
+
+    #[test]
     fn avro_convert_test_int() {
         check_convert_with_avro(
             Literal::Primitive(PrimitiveLiteral::Int(32)),
@@ -3192,10 +3260,10 @@ mod tests {
                 (Literal::Primitive(PrimitiveLiteral::Int(3)), None),
             ])),
             &Type::Map(MapType {
-                key_field: NestedField::map_key_element(0, Type::Primitive(PrimitiveType::Int))
+                key_field: NestedField::map_key_element(2, Type::Primitive(PrimitiveType::Int))
                     .into(),
                 value_field: NestedField::map_value_element(
-                    1,
+                    3,
                     Type::Primitive(PrimitiveType::Long),
                     false,
                 )
@@ -3219,10 +3287,10 @@ mod tests {
                 ),
             ])),
             &Type::Map(MapType {
-                key_field: NestedField::map_key_element(0, Type::Primitive(PrimitiveType::Int))
+                key_field: NestedField::map_key_element(2, Type::Primitive(PrimitiveType::Int))
                     .into(),
                 value_field: NestedField::map_value_element(
-                    1,
+                    3,
                     Type::Primitive(PrimitiveType::Long),
                     true,
                 )
@@ -3249,10 +3317,10 @@ mod tests {
                 ),
             ])),
             &Type::Map(MapType {
-                key_field: NestedField::map_key_element(0, Type::Primitive(PrimitiveType::String))
+                key_field: NestedField::map_key_element(2, Type::Primitive(PrimitiveType::String))
                     .into(),
                 value_field: NestedField::map_value_element(
-                    1,
+                    3,
                     Type::Primitive(PrimitiveType::Int),
                     false,
                 )
@@ -3276,10 +3344,10 @@ mod tests {
                 ),
             ])),
             &Type::Map(MapType {
-                key_field: NestedField::map_key_element(0, Type::Primitive(PrimitiveType::String))
+                key_field: NestedField::map_key_element(2, Type::Primitive(PrimitiveType::String))
                     .into(),
                 value_field: NestedField::map_value_element(
-                    1,
+                    3,
                     Type::Primitive(PrimitiveType::Int),
                     true,
                 )
@@ -3299,9 +3367,9 @@ mod tests {
                 None,
             ])),
             &Type::Struct(StructType::new(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(3, "address", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(3, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(4, "address", Type::Primitive(PrimitiveType::String)).into(),
             ])),
         );
     }

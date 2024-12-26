@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod table_provider_factory;
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -23,7 +25,7 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
@@ -33,7 +35,8 @@ use crate::physical_plan::scan::IcebergTableScan;
 
 /// Represents a [`TableProvider`] for the Iceberg [`Catalog`],
 /// managing access to a [`Table`].
-pub(crate) struct IcebergTableProvider {
+#[derive(Debug)]
+pub struct IcebergTableProvider {
     /// A table in the catalog.
     table: Table,
     /// A reference-counted arrow `Schema`.
@@ -41,6 +44,9 @@ pub(crate) struct IcebergTableProvider {
 }
 
 impl IcebergTableProvider {
+    pub(crate) fn new(table: Table, schema: ArrowSchemaRef) -> Self {
+        IcebergTableProvider { table, schema }
+    }
     /// Asynchronously tries to construct a new [`IcebergTableProvider`]
     /// using the given client and table name to fetch an actual [`Table`]
     /// in the provided namespace.
@@ -54,6 +60,13 @@ impl IcebergTableProvider {
 
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
 
+        Ok(IcebergTableProvider { table, schema })
+    }
+
+    /// Asynchronously tries to construct a new [`IcebergTableProvider`]
+    /// using the given table. Can be used to create a table provider from an existing table regardless of the catalog implementation.
+    pub async fn try_new_from_table(table: Table) -> Result<Self> {
+        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
         Ok(IcebergTableProvider { table, schema })
     }
 }
@@ -92,14 +105,61 @@ impl TableProvider for IcebergTableProvider {
         filters: &[&Expr],
     ) -> std::result::Result<Vec<TableProviderFilterPushDown>, datafusion::error::DataFusionError>
     {
-        let filter_support = filters
-            .iter()
-            .map(|e| match e {
-                Expr::BinaryExpr(BinaryExpr { .. }) => TableProviderFilterPushDown::Inexact,
-                _ => TableProviderFilterPushDown::Unsupported,
-            })
-            .collect::<Vec<TableProviderFilterPushDown>>();
+        // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+}
 
-        Ok(filter_support)
+#[cfg(test)]
+mod tests {
+    use datafusion::common::Column;
+    use datafusion::prelude::SessionContext;
+    use iceberg::io::FileIO;
+    use iceberg::table::{StaticTable, Table};
+    use iceberg::TableIdent;
+
+    use super::*;
+
+    async fn get_test_table_from_metadata_file() -> Table {
+        let metadata_file_name = "TableMetadataV2Valid.json";
+        let metadata_file_path = format!(
+            "{}/tests/test_data/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            metadata_file_name
+        );
+        let file_io = FileIO::from_path(&metadata_file_path)
+            .unwrap()
+            .build()
+            .unwrap();
+        let static_identifier = TableIdent::from_strs(["static_ns", "static_table"]).unwrap();
+        let static_table =
+            StaticTable::from_metadata_file(&metadata_file_path, static_identifier, file_io)
+                .await
+                .unwrap();
+        static_table.into_table()
+    }
+
+    #[tokio::test]
+    async fn test_try_new_from_table() {
+        let table = get_test_table_from_metadata_file().await;
+        let table_provider = IcebergTableProvider::try_new_from_table(table.clone())
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("mytable", Arc::new(table_provider))
+            .unwrap();
+        let df = ctx.sql("SELECT * FROM mytable").await.unwrap();
+        let df_schema = df.schema();
+        let df_columns = df_schema.fields();
+        assert_eq!(df_columns.len(), 3);
+        let x_column = df_columns.first().unwrap();
+        let column_data = format!(
+            "{:?}:{:?}",
+            x_column.name(),
+            x_column.data_type().to_string()
+        );
+        assert_eq!(column_data, "\"x\":\"Int64\"");
+        let has_column = df_schema.has_column(&Column::from_name("z"));
+        assert!(has_column);
     }
 }
