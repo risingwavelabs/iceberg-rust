@@ -1126,42 +1126,6 @@ impl TableMetadataBuilder {
     fn highest_sort_order_id(&self) -> Option<i64> {
         self.metadata.sort_orders.keys().max().copied()
     }
-
-    // /// Set current snapshot ref of table
-    // pub fn set_snapshot_ref(
-    //     mut self,
-    //     ref_name: String,
-    //     reference: SnapshotReference,
-    // ) -> Result<Self> {
-    //     if let Some(existing_snapshot_ref) = self.0.refs.get(&ref_name) {
-    //         if (*existing_snapshot_ref) == reference {
-    //             return Ok(self);
-    //         }
-    //     }
-
-    //     let snapshot_id = reference.snapshot_id;
-    //     let snapshot = self
-    //         .0
-    //         .snapshot_by_id(snapshot_id)
-    //         .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Snapshot not found"))?;
-    //     if snapshot.snapshot_id() == reference.snapshot_id {
-    //         self.0.last_updated_ms = snapshot.timestamp_ms();
-    //     }
-
-    //     if ref_name == MAIN_BRANCH {
-    //         self.0.current_snapshot_id = Some(snapshot_id);
-    //         assert_ne!(0, self.0.last_updated_ms);
-
-    //         self.0.snapshot_log.push(SnapshotLog {
-    //             timestamp_ms: self.0.last_updated_ms,
-    //             snapshot_id,
-    //         });
-    //     }
-
-    //     self.0.refs.insert(ref_name, reference);
-
-    //     Ok(self)
-    // }
 }
 
 impl From<TableMetadataBuildResult> for TableMetadata {

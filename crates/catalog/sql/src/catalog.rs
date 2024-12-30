@@ -24,7 +24,6 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, Error, Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
-    TableUpdate,
 };
 use sqlx::any::{install_default_drivers, AnyPoolOptions, AnyQueryResult, AnyRow};
 use sqlx::{Any, AnyPool, Row, Transaction};
@@ -784,24 +783,11 @@ impl Catalog for SqlCatalog {
             TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None);
 
         for table_update in table_updates {
-            match table_update {
-                TableUpdate::AddSnapshot { snapshot } => {
-                    update_table_metadata_builder =
-                        update_table_metadata_builder.add_snapshot(snapshot)?;
-                }
+            update_table_metadata_builder = table_update.apply(update_table_metadata_builder)?;
+        }
 
-                TableUpdate::SetSnapshotRef {
-                    ref_name,
-                    reference,
-                } => {
-                    update_table_metadata_builder =
-                        update_table_metadata_builder.set_ref(&ref_name, reference)?;
-                }
-
-                _ => {
-                    unreachable!()
-                }
-            }
+        for table_requirement in _requirements {
+            table_requirement.check(Some(table.metadata()))?;
         }
 
         let new_table_meta_location = metadata_path(table.metadata().location(), Uuid::new_v4());
@@ -855,11 +841,12 @@ mod tests {
     use iceberg::io::FileIOBuilder;
     use iceberg::spec::{
         BoundPartitionSpec, NestedField, Operation, PrimitiveType, Schema, Snapshot,
-        SnapshotReference, SnapshotRetention, SortOrder, Summary, Type, MAIN_BRANCH,
+        SnapshotReference, SnapshotRetention, SortOrder, Type, MAIN_BRANCH,
     };
     use iceberg::table::Table;
     use iceberg::{
-        Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent, TableUpdate,
+        Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent,
+        TableRequirement, TableUpdate,
     };
     use itertools::Itertools;
     use regex::Regex;
@@ -1903,17 +1890,23 @@ mod tests {
         let table_snapshots_iter = table.metadata().snapshots();
         assert_eq!(0, table_snapshots_iter.count());
 
-        let add_snapshot = Snapshot::builder()
-            .with_snapshot_id(638933773299822130)
-            .with_timestamp_ms(1662532818843)
-            .with_sequence_number(1)
-            .with_schema_id(1)
-            .with_manifest_list("/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro")
-            .with_summary(Summary { operation: Operation::Append,  additional_properties: HashMap::from_iter(vec![("spark.app.id".to_string(), "local-1662532784305".to_string()), ("added-data-files".to_string(), "4".to_string()), ("added-records".to_string(), "4".to_string()), ("added-files-size".to_string(), "6001".to_string())]) })
-            .build();
+        // Add snapshot
+        let record = r#"
+                {
+                    "snapshot-id": 3051729675574597004,
+                    "sequence-number": 10,
+                    "timestamp-ms": 9992191116217,
+                    "summary": {
+                        "operation": "append"
+                    },
+                    "manifest-list": "s3://b/wh/.../s1.avro",
+                    "schema-id": 0
+                }
+                "#;
 
+        let snapshot = serde_json::from_str::<Snapshot>(record).unwrap();
         let table_update = TableUpdate::AddSnapshot {
-            snapshot: add_snapshot,
+            snapshot: snapshot.clone(),
         };
         let requirements = vec![];
         let table_commit = TableCommit::builder()
@@ -1925,24 +1918,43 @@ mod tests {
         let snapshot_vec = table.metadata().snapshots().collect_vec();
         assert_eq!(1, snapshot_vec.len());
         let snapshot = &snapshot_vec[0];
-        assert_eq!(snapshot.snapshot_id(), 638933773299822130);
-        assert_eq!(snapshot.timestamp_ms(), 1662532818843);
-        assert_eq!(snapshot.sequence_number(), 1);
-        assert_eq!(snapshot.schema_id().unwrap(), 1);
-        assert_eq!(snapshot.manifest_list(), "/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro");
+        assert_eq!(snapshot.snapshot_id(), 3051729675574597004);
+        assert_eq!(snapshot.timestamp_ms(), 9992191116217);
+        assert_eq!(snapshot.sequence_number(), 10);
+        assert_eq!(snapshot.schema_id().unwrap(), 0);
+        assert_eq!(snapshot.manifest_list(), "s3://b/wh/.../s1.avro");
         assert_eq!(snapshot.summary().operation, Operation::Append);
-        assert_eq!(
-            snapshot.summary().additional_properties,
-            HashMap::from_iter(vec![
-                (
-                    "spark.app.id".to_string(),
-                    "local-1662532784305".to_string()
-                ),
-                ("added-data-files".to_string(), "4".to_string()),
-                ("added-records".to_string(), "4".to_string()),
-                ("added-files-size".to_string(), "6001".to_string())
-            ])
-        );
+        assert_eq!(snapshot.summary().additional_properties, HashMap::new());
+
+        // Add another snapshot
+        // Add snapshot
+        let record = r#"
+              {
+                  "snapshot-id": 3051729675574597005,
+                  "sequence-number": 11,
+                  "timestamp-ms": 9992191117217,
+                  "summary": {
+                      "operation": "append"
+                  },
+                  "manifest-list": "s3://b/wh/.../s2.avro",
+                  "schema-id": 0
+              }
+              "#;
+        let snapshot = serde_json::from_str::<Snapshot>(record).unwrap();
+        let table_update = TableUpdate::AddSnapshot {
+            snapshot: snapshot.clone(),
+        };
+        let requirement = TableRequirement::RefSnapshotIdMatch {
+            r#ref: "main".to_string(),
+            snapshot_id: Some(3051729675574597004),
+        };
+        let requirements = vec![requirement];
+        let table_commit = TableCommit::builder()
+            .ident(expected_table_ident.clone())
+            .updates(vec![table_update])
+            .requirements(requirements)
+            .build();
+        assert!(catalog.update_table(table_commit).await.is_err());
     }
 
     #[tokio::test]
@@ -1976,73 +1988,75 @@ mod tests {
 
         let table_snapshots_iter = table.metadata().snapshots();
         assert_eq!(0, table_snapshots_iter.count());
+        let table = catalog.load_table(&expected_table_ident).await.unwrap();
+        assert_table_eq(&table, &expected_table_ident, &simple_table_schema());
 
-        let snapshot_id = 638933773299822130;
-        let reference = SnapshotReference {
-            snapshot_id,
-            retention: SnapshotRetention::Branch {
-                min_snapshots_to_keep: Some(10),
-                max_snapshot_age_ms: Some(100),
-                max_ref_age_ms: Some(200),
-            },
+        let table_snapshots_iter = table.metadata().snapshots();
+        assert_eq!(0, table_snapshots_iter.count());
+
+        // Add snapshot
+        let record = r#"
+                {
+                    "snapshot-id": 3051729675574597004,
+                    "sequence-number": 10,
+                    "timestamp-ms": 9992191116217,
+                    "summary": {
+                        "operation": "append"
+                    },
+                    "manifest-list": "s3://b/wh/.../s1.avro",
+                    "schema-id": 0
+                }
+                "#;
+
+        let snapshot = serde_json::from_str::<Snapshot>(record).unwrap();
+        let table_update = TableUpdate::AddSnapshot {
+            snapshot: snapshot.clone(),
         };
-        let table_update_set_snapshot_ref = TableUpdate::SetSnapshotRef {
-            ref_name: MAIN_BRANCH.to_string(),
-            reference: reference.clone(),
-        };
-
-        let add_snapshot = Snapshot::builder()
-            .with_snapshot_id(638933773299822130)
-            .with_timestamp_ms(1662532818843)
-            .with_sequence_number(1)
-            .with_schema_id(1)
-            .with_manifest_list("/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro")
-            .with_summary(Summary { operation: Operation::Append, additional_properties: HashMap::from_iter(vec![("spark.app.id".to_string(), "local-1662532784305".to_string()), ("added-data-files".to_string(), "4".to_string()), ("added-records".to_string(), "4".to_string()), ("added-files-size".to_string(), "6001".to_string())]) })
-            .build();
-
-        let table_update_add_snapshot = TableUpdate::AddSnapshot {
-            snapshot: add_snapshot,
-        };
-
-        let table_update_opers = vec![table_update_add_snapshot, table_update_set_snapshot_ref];
-
+        let requirements = vec![];
         let table_commit = TableCommit::builder()
             .ident(expected_table_ident.clone())
-            .updates(table_update_opers)
-            .requirements(vec![])
+            .updates(vec![table_update])
+            .requirements(requirements)
             .build();
         let table = catalog.update_table(table_commit).await.unwrap();
         let snapshot_vec = table.metadata().snapshots().collect_vec();
         assert_eq!(1, snapshot_vec.len());
         let snapshot = &snapshot_vec[0];
-        assert_eq!(snapshot.snapshot_id(), 638933773299822130);
-        assert_eq!(snapshot.timestamp_ms(), 1662532818843);
-        assert_eq!(snapshot.sequence_number(), 1);
-        assert_eq!(snapshot.schema_id().unwrap(), 1);
-        assert_eq!(snapshot.manifest_list(), "/home/iceberg/warehouse/ns/tbl1/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro");
+        assert_eq!(snapshot.snapshot_id(), 3051729675574597004);
+        assert_eq!(snapshot.timestamp_ms(), 9992191116217);
+        assert_eq!(snapshot.sequence_number(), 10);
+        assert_eq!(snapshot.schema_id().unwrap(), 0);
+        assert_eq!(snapshot.manifest_list(), "s3://b/wh/.../s1.avro");
         assert_eq!(snapshot.summary().operation, Operation::Append);
-        assert_eq!(
-            snapshot.summary().additional_properties,
-            HashMap::from_iter(vec![
-                (
-                    "spark.app.id".to_string(),
-                    "local-1662532784305".to_string()
-                ),
-                ("added-data-files".to_string(), "4".to_string()),
-                ("added-records".to_string(), "4".to_string()),
-                ("added-files-size".to_string(), "6001".to_string())
-            ])
-        );
+        assert_eq!(snapshot.summary().additional_properties, HashMap::new());
 
+        let table_update_set_snapshot_ref = TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: SnapshotReference {
+                snapshot_id: snapshot.snapshot_id(),
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(10),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        };
+
+        let table_commit = TableCommit::builder()
+            .ident(expected_table_ident.clone())
+            .updates(vec![table_update_set_snapshot_ref])
+            .requirements(vec![])
+            .build();
+        let table = catalog.update_table(table_commit).await.unwrap();
         let snapshot_refs_map = table.metadata().snapshot_refs();
         assert_eq!(1, snapshot_refs_map.len());
         let snapshot_ref = snapshot_refs_map.get(MAIN_BRANCH).unwrap();
         let expected_snapshot_ref = SnapshotReference {
-            snapshot_id,
+            snapshot_id: 3051729675574597004,
             retention: SnapshotRetention::Branch {
                 min_snapshots_to_keep: Some(10),
-                max_snapshot_age_ms: Some(100),
-                max_ref_age_ms: Some(200),
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
             },
         };
         assert_eq!(snapshot_ref, &expected_snapshot_ref);
