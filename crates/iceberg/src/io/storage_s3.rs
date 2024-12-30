@@ -58,6 +58,8 @@ pub const S3_ASSUME_ROLE_ARN: &str = "client.assume-role.arn";
 pub const S3_ASSUME_ROLE_EXTERNAL_ID: &str = "client.assume-role.external-id";
 /// Optional session name used to assume an IAM role.
 pub const S3_ASSUME_ROLE_SESSION_NAME: &str = "client.assume-role.session-name";
+/// If set to true, the S3 configuration will not be loaded from the default locations.
+pub const S3_DISABLE_CONFIG_LOAD: &str = "s3.disable_config_load";
 
 /// Parse iceberg props to s3 config.
 pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
@@ -125,6 +127,12 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
             }
         }
     };
+
+    if let Some(disable_config_load) = m.remove(S3_DISABLE_CONFIG_LOAD) {
+        if ["true", "True", "1"].contains(&disable_config_load.as_str()) {
+            cfg.disable_config_load = true;
+        }
+    }
 
     Ok(cfg)
 }
