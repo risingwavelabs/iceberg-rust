@@ -218,7 +218,7 @@ impl HttpClient {
 
     #[inline]
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
-        self.client.request(method, url)
+        self.client.request(method, url).headers(self.extra_headers.clone())
     }
 
     pub async fn query<
