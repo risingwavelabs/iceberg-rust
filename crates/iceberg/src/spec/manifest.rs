@@ -1635,7 +1635,7 @@ mod _serde {
 
     /// Data file
     #[serde_as]
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     pub struct DataFile {
         #[serde(default)]
         content: i32,
@@ -1758,7 +1758,7 @@ mod _serde {
     }
 
     #[serde_as]
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
     struct BytesEntry {
         key: i32,
@@ -1802,7 +1802,7 @@ mod _serde {
         Ok(bs)
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
     struct I64Entry {
         key: i32,
