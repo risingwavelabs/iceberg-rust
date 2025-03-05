@@ -2243,7 +2243,7 @@ mod _serde {
     use crate::spec::{PrimitiveType, Type, MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME};
     use crate::{Error, ErrorKind};
 
-    #[derive(SerializeDerive, DeserializeDerive, Debug)]
+    #[derive(SerializeDerive, DeserializeDerive, Debug, Clone)]
     #[serde(transparent)]
     /// Raw literal representation used for serde. The serialize way is used for Avro serializer.
     pub struct RawLiteral(RawLiteralEnum);
