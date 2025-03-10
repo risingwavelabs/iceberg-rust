@@ -17,7 +17,7 @@
 
 use arrow_array::RecordBatch;
 
-use crate::spec::DataFileBuilder;
+use crate::spec::{DataFileBuilder, SchemaRef};
 use crate::writer::CurrentFileStatus;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::{Error, ErrorKind, Result};
@@ -136,6 +136,10 @@ impl<B: FileWriterBuilder> CurrentFileStatus for RollingFileWriter<B> {
 
     fn current_written_size(&self) -> usize {
         self.inner.as_ref().unwrap().current_written_size()
+    }
+
+    fn current_schema(&self) -> SchemaRef {
+        self.inner.as_ref().unwrap().current_schema()
     }
 }
 
