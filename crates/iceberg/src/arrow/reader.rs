@@ -39,7 +39,7 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask, PARQUET_FI
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
-use crate::arrow::record_batch_transformer::RecordBatchTransformer;
+use super::record_batch_transformer::RecordBatchTransformer;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{visit, BoundPredicateVisitor};
@@ -48,7 +48,7 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{DataContentType, Datum, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
@@ -254,13 +254,16 @@ impl ArrowReader {
 
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester.
-        let record_batch_stream =
-            record_batch_stream_builder
-                .build()?
-                .map(move |batch| match batch {
+        let record_batch_stream = record_batch_stream_builder.build()?.map(move |batch| {
+            if matches!(task.data_file_content, DataContentType::PositionDeletes) {
+                Ok(batch?)
+            } else {
+                match batch {
                     Ok(batch) => record_batch_transformer.process_record_batch(batch),
                     Err(err) => Err(err.into()),
-                });
+                }
+            }
+        });
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
@@ -1408,6 +1411,8 @@ message schema {
                 project_field_ids: vec![1],
                 predicate: Some(predicate.bind(schema, true).unwrap()),
                 deletes: vec![],
+                sequence_number: 0,
+                equality_ids: vec![],
             })]
             .into_iter(),
         )) as FileScanTaskStream;
