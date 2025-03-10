@@ -1554,6 +1554,8 @@ impl std::fmt::Display for DataFileFormat {
     }
 }
 
+pub use _serde::DataFile as SerializedDataFile;
+
 mod _serde {
     use std::collections::HashMap;
 
@@ -1632,7 +1634,7 @@ mod _serde {
 
     #[serde_as]
     #[derive(Serialize, Deserialize)]
-    pub(super) struct DataFile {
+    pub struct DataFile {
         #[serde(default)]
         content: i32,
         file_path: String,
