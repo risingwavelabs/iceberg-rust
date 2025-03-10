@@ -20,6 +20,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::i32;
 use std::mem::discriminant;
 use std::ops::RangeFrom;
 
@@ -34,7 +35,8 @@ use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
     ManifestFile, ManifestListWriter, ManifestWriterBuilder, NullOrder, Operation, Snapshot,
     SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct, StructType,
-    Summary, Transform, MAIN_BRANCH,
+    Summary, Transform, MAIN_BRANCH, MAX_REF_AGE_MS, MAX_REF_AGE_MS_DEFAULT, MAX_SNAPSHOT_AGE_MS,
+    MAX_SNAPSHOT_AGE_MS_DEFAULT, MIN_SNAPSHOTS_TO_KEEP, MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
 };
 use crate::table::Table;
 use crate::writer::file_writer::ParquetWriter;
@@ -156,6 +158,11 @@ impl<'a> Transaction<'a> {
             tx: self,
             sort_fields: vec![],
         }
+    }
+
+    /// Creates remove snapshot action.
+    pub fn expire_snapshot(self) -> RemoveSnapshotAction<'a> {
+        RemoveSnapshotAction::new(self)
     }
 
     /// Remove properties in table.
@@ -721,7 +728,6 @@ impl<'a> ReplaceSortOrderAction<'a> {
 /// Transaction action for removing snapshot.
 pub struct RemoveSnapshotAction<'a> {
     tx: Transaction<'a>,
-    commit_uuid: Uuid,
     clear_expire_files: bool,
     ids_to_remove: HashSet<i64>,
     default_expired_older_than: i64,
@@ -733,13 +739,39 @@ pub struct RemoveSnapshotAction<'a> {
 }
 
 impl<'a> RemoveSnapshotAction<'a> {
-    // pub fn new() -> Self {
-    //     Self
-    // }
+    /// Creates a new action.
+    pub fn new(tx: Transaction<'a>) -> Self {
+        let table = tx.table;
+        let properties = table.metadata().properties();
 
-    // pub fn new(tx: Transaction<'a>, commit_uuid: Uuid) -> Self {
-    //     Self { tx, commit_uuid }
-    // }
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let default_max_snapshot_age_ms = properties
+            .get(MAX_SNAPSHOT_AGE_MS)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(MAX_SNAPSHOT_AGE_MS_DEFAULT);
+
+        let default_min_num_snapshots = properties
+            .get(MIN_SNAPSHOTS_TO_KEEP)
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(MIN_SNAPSHOTS_TO_KEEP_DEFAULT);
+
+        let default_max_ref_age_ms = properties
+            .get(MAX_REF_AGE_MS)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(MAX_REF_AGE_MS_DEFAULT);
+
+        Self {
+            tx,
+            clear_expire_files: false,
+            ids_to_remove: HashSet::new(),
+            default_expired_older_than: now - default_max_snapshot_age_ms,
+            default_min_num_snapshots,
+            default_max_ref_age_ms,
+            now,
+            clear_expired_meta_data: false,
+        }
+    }
 
     /// Finished building the action and apply it to the transaction.
     pub fn clear_expire_files(mut self, clear_expire_files: bool) -> Self {
