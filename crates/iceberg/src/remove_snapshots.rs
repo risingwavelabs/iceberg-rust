@@ -110,7 +110,7 @@ impl<'a> RemoveSnapshotAction<'a> {
     }
 
     /// Finished building the action and apply it to the transaction.
-    async fn apply_impl(mut self) -> Result<Transaction<'a>> {
+    pub async fn apply(mut self) -> Result<Transaction<'a>> {
         if self.tx.table.metadata().refs.is_empty() {
             return Ok(self.tx);
         }
@@ -238,11 +238,6 @@ impl<'a> RemoveSnapshotAction<'a> {
         ])?;
 
         Ok(self.tx)
-    }
-
-    /// Finished building the action and apply it to the transaction.
-    pub async fn apply(self) -> Result<Transaction<'a>> {
-        self.apply_impl().await
     }
 
     fn compute_retained_refs(
