@@ -246,6 +246,7 @@ impl Display for TableIdent {
 
 /// TableCreation represents the creation of a table in the catalog.
 #[derive(Debug, TypedBuilder)]
+#[builder(build_method(vis = "pub"))]
 pub struct TableCreation {
     /// The name of the table.
     pub name: String,
