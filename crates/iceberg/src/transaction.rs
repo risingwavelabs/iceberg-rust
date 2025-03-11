@@ -900,26 +900,35 @@ impl<'a> RemoveSnapshotAction<'a> {
                     spec_ids: spec_to_remove,
                 }])?;
 
-            // let schema_to_remove = self
-            //     .tx
-            //     .table
-            //     .metadata()
-            //     .schemas_iter()
-            //     .filter_map(|schema| {
-            //         if !reachable_schemas.contains(&schema.schema_id()) {
-            //             Some(schema.schema_id())
-            //         } else {
-            //             None
-            //         }
-            //     })
-            //     .unique()
-            //     .collect();
+            let schema_to_remove = self
+                .tx
+                .table
+                .metadata()
+                .schemas_iter()
+                .filter_map(|schema| {
+                    if !reachable_schemas.contains(&schema.schema_id()) {
+                        Some(schema.schema_id())
+                    } else {
+                        None
+                    }
+                })
+                .unique()
+                .collect();
 
-            // TODO: RemoveSchemas
-            // self.tx.append_updates(vec![TableUpdate::RemoveSchemas {
-            //     schema_ids: schema_to_remove,
-            // }])?;
+            self.tx.append_updates(vec![TableUpdate::RemoveSchemas {
+                schema_ids: schema_to_remove,
+            }])?;
         }
+
+        self.tx.append_requirements(vec![
+            TableRequirement::UuidMatch {
+                uuid: self.tx.table.metadata().uuid(),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: MAIN_BRANCH.to_string(),
+                snapshot_id: self.tx.table.metadata().current_snapshot_id(),
+            },
+        ])?;
 
         Ok(self.tx)
     }
@@ -1411,6 +1420,39 @@ mod tests {
             .collect();
         for path in file_paths {
             assert!(manifest_paths.contains(&path));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_snapshot_action() {
+        let table = make_v2_table();
+        let table_meta = table.metadata().clone();
+        assert_eq!(2, table_meta.snapshots().count());
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx.expire_snapshot().apply().await.unwrap();
+            // keep the last snapshot
+            for update in &tx.updates {
+                match update {
+                    TableUpdate::RemoveSnapshots { snapshot_ids } => {
+                        assert_eq!(1, snapshot_ids.len());
+                    }
+                    _ => {}
+                }
+            }
+
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
         }
     }
 }
