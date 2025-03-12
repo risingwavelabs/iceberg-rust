@@ -1409,6 +1409,7 @@ message schema {
                 predicate: Some(predicate.bind(schema, true).unwrap()),
                 deletes: vec![],
                 sequence_number: 0,
+                equality_ids: vec![],
             })]
             .into_iter(),
         )) as FileScanTaskStream;
