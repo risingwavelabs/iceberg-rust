@@ -178,7 +178,7 @@ impl PopulatedDeleteFileIndex {
                 // filter that returns true if the provided delete file's sequence number is **greater thano** `seq_num`
                 .filter(|&delete| {
                     seq_num
-                        .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
+                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
