@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use arrow_array::RecordBatch;
 use futures::channel::mpsc::{channel, Sender};
 use futures::stream::BoxStream;
-use futures::{SinkExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{future, SinkExt, StreamExt, TryFutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::arrow::ArrowReaderBuilder;
@@ -70,6 +70,7 @@ pub struct TableScanBuilder<'a> {
     delete_file_processing_enabled: bool,
 }
 
+#[allow(dead_code)]
 impl<'a> TableScanBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         let num_cpus = available_parallelism().get();
@@ -87,6 +88,25 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             delete_file_processing_enabled: false,
+        }
+    }
+
+    pub(crate) fn new_with_delete(table: &'a Table) -> Self {
+        let num_cpus = available_parallelism().get();
+
+        Self {
+            table,
+            column_names: None,
+            snapshot_id: None,
+            batch_size: None,
+            case_sensitive: true,
+            filter: None,
+            concurrency_limit_data_files: num_cpus,
+            concurrency_limit_manifest_entries: num_cpus,
+            concurrency_limit_manifest_files: num_cpus,
+            row_group_filtering_enabled: true,
+            row_selection_enabled: false,
+            delete_file_processing_enabled: true,
         }
     }
 
@@ -480,6 +500,36 @@ impl TableScan {
             .await
     }
 
+    /// Returns an [`ArrowRecordBatchStream`].
+    pub async fn to_arrow_with_type(&self, data_type: DataContentType) -> Result<ArrowRecordBatchStream> {
+        let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
+            .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
+            .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
+            .with_row_selection_enabled(self.row_selection_enabled);
+
+        if let Some(batch_size) = self.batch_size {
+            arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
+        }
+
+        let plan_files_stream = self.plan_files().await?;
+
+        let plan_files_stream = plan_files_stream.filter({
+                    let data_type = data_type.clone();
+                    move |task| {
+                        if let Ok(task) = task {
+                            future::ready(task.data_file_content == data_type)
+                        } else {
+                            future::ready(true)
+                        }
+                    }
+                }).boxed();
+
+        arrow_reader_builder
+            .build()
+            .read(plan_files_stream)
+            .await
+    }
+
     /// Returns a reference to the column names of the table scan.
     pub fn column_names(&self) -> Option<&[String]> {
         self.column_names.as_deref()
@@ -584,6 +634,7 @@ impl TableScan {
             .send(DeleteFileContext {
                 manifest_entry: manifest_entry_context.manifest_entry.clone(),
                 partition_spec_id: manifest_entry_context.partition_spec_id,
+                schema: manifest_entry_context.snapshot_schema.clone(),
             })
             .await?;
 
@@ -695,6 +746,8 @@ impl ManifestEntryContext {
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
 
             deletes,
+            equality_ids: self.manifest_entry.data_file().equality_ids().to_vec(),
+            sequence_number: self.manifest_entry.sequence_number().unwrap_or(0),
         })
     }
 }
@@ -1056,7 +1109,13 @@ pub struct FileScanTask {
     pub predicate: Option<BoundPredicate>,
 
     /// The list of delete files that may need to be applied to this data file
-    pub deletes: Vec<FileScanTaskDeleteFile>,
+    pub deletes: Vec<FileScanTask>,
+
+    /// The list of equality ids for this data file
+    pub equality_ids: Vec<i32>,
+
+    /// The sequence number of the file to scan.
+    pub sequence_number: i64,
 }
 
 /// A task to scan part of file.
@@ -1070,18 +1129,13 @@ pub struct FileScanTaskDeleteFile {
 
     /// partition id
     pub partition_spec_id: i32,
-
-    /// sequence number
-    pub seq_num: i64,
-
-    /// equality ids
-    pub equality_ids: Vec<i32>,
 }
 
 #[derive(Debug)]
 pub(crate) struct DeleteFileContext {
     pub(crate) manifest_entry: ManifestEntryRef,
     pub(crate) partition_spec_id: i32,
+    pub(crate) schema: SchemaRef,
 }
 
 impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
@@ -1090,8 +1144,25 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             file_path: ctx.manifest_entry.file_path().to_string(),
             file_type: ctx.manifest_entry.content_type(),
             partition_spec_id: ctx.partition_spec_id,
-            seq_num: ctx.manifest_entry.sequence_number().unwrap_or(0),
+        }
+    }
+}
+
+impl From<&DeleteFileContext> for FileScanTask {
+    fn from(ctx: &DeleteFileContext) -> Self {
+        FileScanTask {
+            start: 0,
+            length: ctx.manifest_entry.file_size_in_bytes(),
+            record_count: Some(ctx.manifest_entry.record_count()),
+            data_file_path: ctx.manifest_entry.file_path().to_string(),
+            data_file_content: ctx.manifest_entry.content_type(),
+            data_file_format: ctx.manifest_entry.file_format(),
+            schema: ctx.schema.clone(),
+            project_field_ids: vec![],
+            predicate: None,
+            deletes: vec![],
             equality_ids: ctx.manifest_entry.data_file().equality_ids().to_vec(),
+            sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
         }
     }
 }
@@ -2291,6 +2362,8 @@ pub mod tests {
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
+            equality_ids: vec![],
+            sequence_number: 0,
         };
         test_fn(task);
 
@@ -2306,6 +2379,8 @@ pub mod tests {
             record_count: None,
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
+            equality_ids: vec![],
+            sequence_number: 0,
         };
         test_fn(task);
     }

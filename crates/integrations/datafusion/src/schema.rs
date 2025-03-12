@@ -24,6 +24,7 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
+use iceberg::spec::DataContentType;
 use iceberg::{Catalog, NamespaceIdent, Result};
 
 use crate::table::IcebergTableProvider;
@@ -49,6 +50,7 @@ impl IcebergSchemaProvider {
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
+        data_type: DataContentType,
     ) -> Result<Self> {
         // TODO:
         // Tables and providers should be cached based on table_name
@@ -64,7 +66,7 @@ impl IcebergSchemaProvider {
         let providers = try_join_all(
             table_names
                 .iter()
-                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
+                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name,data_type))
                 .collect::<Vec<_>>(),
         )
         .await?;

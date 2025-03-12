@@ -164,12 +164,12 @@ impl ArrowReader {
         row_selection_enabled: bool,
     ) -> Result<ArrowRecordBatchStream> {
         // TODO: add support for delete files
-        if !task.deletes.is_empty() {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Delete files are not yet supported",
-            ));
-        }
+        // if !task.deletes.is_empty() {
+        //     return Err(Error::new(
+        //         ErrorKind::FeatureUnsupported,
+        //         "Delete files are not yet supported",
+        //     ));
+        // }
 
         // Get the metadata for the Parquet file we need to read and build
         // a reader for the data within
@@ -1408,6 +1408,8 @@ message schema {
                 project_field_ids: vec![1],
                 predicate: Some(predicate.bind(schema, true).unwrap()),
                 deletes: vec![],
+                equality_ids: vec![],
+                sequence_number: 0,
             })]
             .into_iter(),
         )) as FileScanTaskStream;

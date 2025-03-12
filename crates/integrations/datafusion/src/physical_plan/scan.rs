@@ -132,6 +132,7 @@ impl ExecutionPlan for IcebergTableScan {
             self.snapshot_id,
             self.projection.clone(),
             self.predicates.clone(),
+            self.data_type,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -171,6 +172,7 @@ async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
+    data_type: DataContentType,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -187,7 +189,7 @@ async fn get_batch_stream(
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     let stream = table_scan
-        .to_arrow()
+        .to_arrow_with_type(data_type)
         .await
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);

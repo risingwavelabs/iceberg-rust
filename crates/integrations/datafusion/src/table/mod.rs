@@ -21,13 +21,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::datatypes::{SchemaRef as ArrowSchemaRef, Field, DataType, Schema};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::spec::DataContentType;
 use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 
@@ -43,14 +44,17 @@ pub struct IcebergTableProvider {
     snapshot_id: Option<i64>,
     /// A reference-counted arrow `Schema`.
     schema: ArrowSchemaRef,
+
+    data_type: DataContentType,
 }
 
 impl IcebergTableProvider {
-    pub(crate) fn new(table: Table, schema: ArrowSchemaRef) -> Self {
+    pub(crate) fn new(table: Table, schema: ArrowSchemaRef,data_type: DataContentType) -> Self {
         IcebergTableProvider {
             table,
             snapshot_id: None,
             schema,
+            data_type,
         }
     }
     /// Asynchronously tries to construct a new [`IcebergTableProvider`]
@@ -60,6 +64,7 @@ impl IcebergTableProvider {
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
+        data_type: DataContentType
     ) -> Result<Self> {
         let ident = TableIdent::new(namespace, name.into());
         let table = client.load_table(&ident).await?;
@@ -70,23 +75,25 @@ impl IcebergTableProvider {
             table,
             snapshot_id: None,
             schema,
+            data_type
         })
     }
 
     /// Asynchronously tries to construct a new [`IcebergTableProvider`]
     /// using the given table. Can be used to create a table provider from an existing table regardless of the catalog implementation.
-    pub async fn try_new_from_table(table: Table) -> Result<Self> {
+    pub async fn try_new_from_table(table: Table,data_type: DataContentType) -> Result<Self> {
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
         Ok(IcebergTableProvider {
             table,
             snapshot_id: None,
             schema,
+            data_type
         })
     }
 
     /// Asynchronously tries to construct a new [`IcebergTableProvider`]
     /// using a specific snapshot of the given table. Can be used to create a table provider from an existing table regardless of the catalog implementation.
-    pub async fn try_new_from_table_snapshot(table: Table, snapshot_id: i64) -> Result<Self> {
+    pub async fn try_new_from_table_snapshot(table: Table, snapshot_id: i64,data_type: DataContentType) -> Result<Self> {
         let snapshot = table
             .metadata()
             .snapshot_by_id(snapshot_id)
@@ -105,6 +112,7 @@ impl IcebergTableProvider {
             table,
             snapshot_id: Some(snapshot_id),
             schema,
+            data_type
         })
     }
 }
@@ -116,7 +124,15 @@ impl TableProvider for IcebergTableProvider {
     }
 
     fn schema(&self) -> ArrowSchemaRef {
-        self.schema.clone()
+        match self.data_type {
+            DataContentType::Data => self.schema.clone(),
+            DataContentType::PositionDeletes => {
+                let file_path = Field::new("file_path", DataType::Utf8, false);
+                let pos = Field::new("pos", DataType::Int64, false);
+                Arc::new(Schema::new(vec![file_path, pos]))
+            },
+            DataContentType::EqualityDeletes => self.schema.clone(),
+        }
     }
 
     fn table_type(&self) -> TableType {
@@ -136,6 +152,7 @@ impl TableProvider for IcebergTableProvider {
             self.schema.clone(),
             projection,
             filters,
+            self.data_type,
         )))
     }
 
@@ -181,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_table() {
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergTableProvider::try_new_from_table(table.clone())
+        let table_provider = IcebergTableProvider::try_new_from_table(table.clone(), DataContentType::Data)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -207,7 +224,7 @@ mod tests {
         let table = get_test_table_from_metadata_file().await;
         let snapshot_id = table.metadata().snapshots().next().unwrap().snapshot_id();
         let table_provider =
-            IcebergTableProvider::try_new_from_table_snapshot(table.clone(), snapshot_id)
+            IcebergTableProvider::try_new_from_table_snapshot(table.clone(), snapshot_id, DataContentType::Data)
                 .await
                 .unwrap();
         let ctx = SessionContext::new();
@@ -231,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn test_physical_input_schema_consistent_with_logical_input_schema() {
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergTableProvider::try_new_from_table(table.clone())
+        let table_provider = IcebergTableProvider::try_new_from_table(table.clone(),DataContentType::Data)
             .await
             .unwrap();
         let ctx = SessionContext::new();
