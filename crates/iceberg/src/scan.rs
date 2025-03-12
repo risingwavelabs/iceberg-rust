@@ -585,6 +585,7 @@ impl TableScan {
                 manifest_entry: manifest_entry_context.manifest_entry.clone(),
                 partition_spec_id: manifest_entry_context.partition_spec_id,
                 snapshot_schema: manifest_entry_context.snapshot_schema.clone(),
+                field_ids: manifest_entry_context.field_ids.clone(),
             })
             .await?;
 
@@ -1084,6 +1085,7 @@ pub(crate) struct DeleteFileContext {
     pub(crate) manifest_entry: ManifestEntryRef,
     pub(crate) partition_spec_id: i32,
     pub(crate) snapshot_schema: SchemaRef,
+    pub(crate) field_ids: Arc<Vec<i32>>,
 }
 
 impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
@@ -1108,7 +1110,7 @@ impl From<&DeleteFileContext> for FileScanTask {
             data_file_format: ctx.manifest_entry.file_format(),
 
             schema: ctx.snapshot_schema.clone(),
-            project_field_ids: vec![],
+            project_field_ids: ctx.field_ids.to_vec(),
             predicate: None,
             deletes: vec![],
             sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
