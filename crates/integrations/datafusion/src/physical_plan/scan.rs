@@ -31,6 +31,7 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProp
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
+use iceberg::spec::DataContentType;
 use iceberg::table::Table;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
@@ -51,6 +52,8 @@ pub(crate) struct IcebergTableScan {
     projection: Option<Vec<String>>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
+
+    data_type: DataContentType,
 }
 
 impl IcebergTableScan {
@@ -61,6 +64,7 @@ impl IcebergTableScan {
         schema: ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
+        data_type: DataContentType,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
@@ -76,6 +80,7 @@ impl IcebergTableScan {
             plan_properties,
             projection,
             predicates,
+            data_type,
         }
     }
 

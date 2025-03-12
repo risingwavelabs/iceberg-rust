@@ -1070,6 +1070,12 @@ pub struct FileScanTaskDeleteFile {
 
     /// partition id
     pub partition_spec_id: i32,
+
+    /// sequence number
+    pub seq_num: i64,
+
+    /// equality ids
+    pub equality_ids: Vec<i32>,
 }
 
 #[derive(Debug)]
@@ -1084,6 +1090,8 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             file_path: ctx.manifest_entry.file_path().to_string(),
             file_type: ctx.manifest_entry.content_type(),
             partition_spec_id: ctx.partition_spec_id,
+            seq_num: ctx.manifest_entry.sequence_number().unwrap_or(0),
+            equality_ids: ctx.manifest_entry.data_file().equality_ids().to_vec(),
         }
     }
 }
