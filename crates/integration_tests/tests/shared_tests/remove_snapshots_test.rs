@@ -132,7 +132,6 @@ async fn test_expire_snapshots_by_count() {
         .apply()
         .await
         .unwrap();
-    // assert_eq!(5, remove_action.updates().len());
     let t = remove_action.commit(&rest_catalog).await.unwrap();
     assert_eq!(5, t.metadata().snapshots().count());
 }

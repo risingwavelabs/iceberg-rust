@@ -163,12 +163,15 @@ impl<'a> RemoveSnapshotAction<'a> {
         }
 
         if !snapshot_to_remove.is_empty() {
-            self.tx.apply(
-                vec![TableUpdate::RemoveSnapshots {
-                    snapshot_ids: snapshot_to_remove,
-                }],
-                vec![],
-            )?;
+            // TODO: batch remove when server supports it
+            for snapshot_id in snapshot_to_remove {
+                self.tx.apply(
+                    vec![TableUpdate::RemoveSnapshots {
+                        snapshot_ids: vec![snapshot_id],
+                    }],
+                    vec![],
+                )?;
+            }
         }
 
         if self.clear_expired_meta_data {
