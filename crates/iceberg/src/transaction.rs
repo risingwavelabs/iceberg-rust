@@ -799,6 +799,25 @@ mod tests {
             .unwrap()
     }
 
+    fn make_v2_table_with_mutli_snapshot() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2ValidMultiSnapshot.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn test_upgrade_table_version_v1_to_v2() {
         let table = make_v1_table();
@@ -1079,22 +1098,71 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_snapshot_action() {
-        let table = make_v2_table();
+        let table = make_v2_table_with_mutli_snapshot();
         let table_meta = table.metadata().clone();
-        assert_eq!(2, table_meta.snapshots().count());
+        assert_eq!(5, table_meta.snapshots().count());
         {
             let tx = Transaction::new(&table);
             let tx = tx.expire_snapshot().apply().await.unwrap();
-            // keep the last snapshot
             for update in &tx.updates {
                 match update {
                     TableUpdate::RemoveSnapshots { snapshot_ids } => {
-                        assert_eq!(1, snapshot_ids.len());
+                        assert_eq!(4, snapshot_ids.len());
                     }
                     _ => {}
                 }
             }
 
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx.expire_snapshot().retain_last(2).apply().await.unwrap();
+            for update in &tx.updates {
+                match update {
+                    TableUpdate::RemoveSnapshots { snapshot_ids } => {
+                        assert_eq!(3, snapshot_ids.len());
+                    }
+                    _ => {}
+                }
+            }
+
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .expire_snapshot()
+                .retain_last(100)
+                .expire_older_than(100)
+                .apply()
+                .await
+                .unwrap();
+            assert_eq!(0, tx.updates.len());
             assert_eq!(
                 vec![
                     TableRequirement::UuidMatch {
@@ -1120,7 +1188,7 @@ mod tests {
                 .err()
                 .unwrap();
             assert_eq!(
-                "DataInvalid => Cannot remove snapshot 3055729675574597004 with retained references: Some([\"main\"])",
+                "DataInvalid => Cannot remove snapshot 3067729675574597004 with retained references: Some([\"main\"])",
                 err.to_string()
             )
         }

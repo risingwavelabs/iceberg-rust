@@ -24,9 +24,9 @@ use itertools::Itertools;
 
 use crate::error::Result;
 use crate::spec::{
-    SnapshotReference, SnapshotRetention, MAIN_BRANCH, MAX_REF_AGE_MS, MAX_REF_AGE_MS_DEFAULT,
-    MAX_SNAPSHOT_AGE_MS, MAX_SNAPSHOT_AGE_MS_DEFAULT, MIN_SNAPSHOTS_TO_KEEP,
-    MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+    ancestors_of, SnapshotReference, SnapshotRetention, MAIN_BRANCH, MAX_REF_AGE_MS,
+    MAX_REF_AGE_MS_DEFAULT, MAX_SNAPSHOT_AGE_MS, MAX_SNAPSHOT_AGE_MS_DEFAULT,
+    MIN_SNAPSHOTS_TO_KEEP, MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
 };
 use crate::transaction::Transaction;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
@@ -160,9 +160,11 @@ impl<'a> RemoveSnapshotAction<'a> {
             }
         }
 
-        self.tx.append_updates(vec![TableUpdate::RemoveSnapshots {
-            snapshot_ids: snapshot_to_remove,
-        }])?;
+        if !snapshot_to_remove.is_empty() {
+            self.tx.append_updates(vec![TableUpdate::RemoveSnapshots {
+                snapshot_ids: snapshot_to_remove,
+            }])?;
+        }
 
         if self.clear_expired_meta_data {
             let mut reachable_specs = HashSet::new();
@@ -291,10 +293,14 @@ impl<'a> RemoveSnapshotAction<'a> {
                         max_ref_age_ms: _,
                     } => max_snapshot_age_ms,
                     SnapshotRetention::Tag { max_ref_age_ms: _ } => None,
-                }
-                .unwrap_or(self.default_expired_older_than);
+                };
 
-                let expire_snapshot_older_than = self.now - max_snapshot_age_ms;
+                let expire_snapshot_older_than =
+                    if let Some(max_snapshot_age_ms) = max_snapshot_age_ms {
+                        self.now - max_snapshot_age_ms
+                    } else {
+                        self.default_expired_older_than
+                    };
 
                 let min_snapshots_to_keep = match snapshot_ref.retention {
                     SnapshotRetention::Branch {
@@ -326,17 +332,15 @@ impl<'a> RemoveSnapshotAction<'a> {
         let mut ids_to_retain = HashSet::new();
         let table_meta = self.tx.table.metadata();
         if let Some(snapshot) = table_meta.snapshot_by_id(snapshot_id) {
-            let mut snapshot = snapshot.clone();
-            while let Some(ancestor) = snapshot.parent_snapshot(table_meta) {
+            let ancestors = ancestors_of(snapshot.clone(), table_meta);
+            for ancestor in ancestors {
                 if ids_to_retain.len() < min_snapshots_to_keep
-                    || snapshot.timestamp_ms() >= expire_snapshots_older_than
+                    || ancestor.timestamp_ms() >= expire_snapshots_older_than
                 {
-                    ids_to_retain.insert(snapshot.snapshot_id());
+                    ids_to_retain.insert(ancestor.snapshot_id());
                 } else {
                     return ids_to_retain;
                 }
-
-                snapshot = ancestor;
             }
         }
 
@@ -348,6 +352,7 @@ impl<'a> RemoveSnapshotAction<'a> {
         refs: impl Iterator<Item = &SnapshotReference>,
     ) -> HashSet<i64> {
         let mut ids_to_retain = HashSet::new();
+        let mut referenced_snapshots = HashSet::new();
 
         for snapshot_ref in refs {
             if snapshot_ref.is_branch() {
@@ -357,15 +362,21 @@ impl<'a> RemoveSnapshotAction<'a> {
                     .metadata()
                     .snapshot_by_id(snapshot_ref.snapshot_id)
                 {
-                    let mut snapshot = snapshot.clone();
-                    while let Some(ancestor) = snapshot.parent_snapshot(self.tx.table.metadata()) {
-                        ids_to_retain.insert(snapshot.snapshot_id());
-
-                        snapshot = ancestor;
+                    let ancestors = ancestors_of(snapshot.clone(), self.tx.table.metadata());
+                    for ancestor in ancestors {
+                        referenced_snapshots.insert(ancestor.snapshot_id());
                     }
                 }
             } else {
-                ids_to_retain.insert(snapshot_ref.snapshot_id);
+                referenced_snapshots.insert(snapshot_ref.snapshot_id);
+            }
+        }
+
+        for snapshot in self.tx.table.metadata().snapshots() {
+            if !referenced_snapshots.contains(&snapshot.snapshot_id())
+                && snapshot.timestamp_ms() >= self.default_expired_older_than
+            {
+                ids_to_retain.insert(snapshot.snapshot_id());
             }
         }
 

@@ -400,6 +400,36 @@ impl SnapshotRetention {
     }
 }
 
+/// An iterator over the ancestors of a snapshot.
+pub struct AncestorIterator<'a> {
+    current: Option<SnapshotRef>,
+    table_metadata: &'a TableMetadata,
+}
+
+impl<'a> Iterator for AncestorIterator<'a> {
+    type Item = SnapshotRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current.take()?;
+
+        let next = current.parent_snapshot(self.table_metadata);
+        self.current = next;
+
+        Some(current)
+    }
+}
+
+/// Returns an iterator over the ancestors of a snapshot.
+pub fn ancestors_of<'a>(
+    snapshot: SnapshotRef,
+    table_metadata: &'a TableMetadata,
+) -> AncestorIterator<'a> {
+    AncestorIterator {
+        current: Some(snapshot),
+        table_metadata,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
