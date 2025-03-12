@@ -1554,6 +1554,9 @@ impl std::fmt::Display for DataFileFormat {
     }
 }
 
+/// Data file
+pub use _serde::DataFile as SerializedDataFile;
+
 mod _serde {
     use std::collections::HashMap;
 
@@ -1630,9 +1633,10 @@ mod _serde {
         }
     }
 
+    /// Data file
     #[serde_as]
-    #[derive(Serialize, Deserialize)]
-    pub(super) struct DataFile {
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct DataFile {
         #[serde(default)]
         content: i32,
         file_path: String,
@@ -1656,6 +1660,7 @@ mod _serde {
     }
 
     impl DataFile {
+        /// Convert to a data file with the given partition type.
         pub fn try_from(
             value: super::DataFile,
             partition_type: &StructType,
@@ -1686,6 +1691,7 @@ mod _serde {
             })
         }
 
+        /// Convert to a data file with the given partition type.
         pub fn try_into(
             self,
             partition_type: &StructType,
@@ -1796,7 +1802,7 @@ mod _serde {
         Ok(bs)
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
     struct I64Entry {
         key: i32,
