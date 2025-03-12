@@ -111,7 +111,8 @@ impl<'a> Transaction<'a> {
         Ok(self)
     }
 
-    fn generate_unique_snapshot_id(&self) -> i64 {
+    /// Generate a unique snapshot id.
+    pub fn generate_unique_snapshot_id(&self) -> i64 {
         let generate_random_id = || -> i64 {
             let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
             let snapshot_id = (lhs ^ rhs) as i64;
@@ -136,10 +137,26 @@ impl<'a> Transaction<'a> {
     /// Creates a fast append action.
     pub fn fast_append(
         self,
+        snapshot_id: Option<i64>,
         commit_uuid: Option<Uuid>,
         key_metadata: Vec<u8>,
     ) -> Result<FastAppendAction<'a>> {
-        let snapshot_id = self.generate_unique_snapshot_id();
+        let snapshot_id = if let Some(snapshot_id) = snapshot_id {
+            if self
+                .table
+                .metadata()
+                .snapshots()
+                .any(|s| s.snapshot_id() == snapshot_id)
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot id {} already exists", snapshot_id),
+                ));
+            }
+            snapshot_id
+        } else {
+            self.generate_unique_snapshot_id()
+        };
         FastAppendAction::new(
             self,
             snapshot_id,
@@ -894,7 +911,7 @@ mod tests {
     async fn test_fast_append_action() {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
-        let mut action = tx.fast_append(None, vec![]).unwrap();
+        let mut action = tx.fast_append(None, None, vec![]).unwrap();
 
         // check add data file with incompatible partition value
         let data_file = DataFileBuilder::default()
@@ -1001,7 +1018,7 @@ mod tests {
             format!("{}/3.parquet", &fixture.table_location),
         ];
 
-        let fast_append_action = tx.fast_append(None, vec![]).unwrap();
+        let fast_append_action = tx.fast_append(None, None, vec![]).unwrap();
 
         // Attempt to add the existing Parquet files with fast append.
         let new_tx = fast_append_action
