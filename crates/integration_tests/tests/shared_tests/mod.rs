@@ -29,8 +29,8 @@ mod conflict_commit_test;
 mod datafusion;
 mod read_evolved_schema;
 mod read_positional_deletes;
-mod scan_all_type;
 mod remove_snapshots_test;
+mod scan_all_type;
 
 pub async fn random_ns() -> Namespace {
     let fixture = get_shared_containers();
