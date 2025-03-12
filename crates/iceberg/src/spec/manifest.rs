@@ -1554,6 +1554,7 @@ impl std::fmt::Display for DataFileFormat {
     }
 }
 
+/// Data file
 pub use _serde::DataFile as SerializedDataFile;
 
 mod _serde {
@@ -1632,6 +1633,7 @@ mod _serde {
         }
     }
 
+    /// Data file
     #[serde_as]
     #[derive(Serialize, Deserialize)]
     pub struct DataFile {
@@ -1658,6 +1660,7 @@ mod _serde {
     }
 
     impl DataFile {
+        /// Convert to a data file with the given partition type.
         pub fn try_from(
             value: super::DataFile,
             partition_type: &StructType,
@@ -1688,6 +1691,7 @@ mod _serde {
             })
         }
 
+        /// Convert to a data file with the given partition type.
         pub fn try_into(
             self,
             partition_type: &StructType,

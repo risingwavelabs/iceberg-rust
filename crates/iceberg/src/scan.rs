@@ -695,6 +695,7 @@ impl ManifestEntryContext {
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
 
             deletes,
+            sequence_number: self.manifest_entry.sequence_number().unwrap_or(0),
         })
     }
 }
@@ -1057,6 +1058,8 @@ pub struct FileScanTask {
 
     /// The list of delete files that may need to be applied to this data file
     pub deletes: Vec<FileScanTaskDeleteFile>,
+    /// sequence number
+    pub sequence_number: i64,
 }
 
 /// A task to scan part of file.
@@ -1070,6 +1073,10 @@ pub struct FileScanTaskDeleteFile {
 
     /// partition id
     pub partition_spec_id: i32,
+    /// sequence number
+    pub sequence_number: i64,
+    /// equality ids
+    pub equality_ids: Vec<i32>,
 }
 
 #[derive(Debug)]
@@ -1084,6 +1091,8 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             file_path: ctx.manifest_entry.file_path().to_string(),
             file_type: ctx.manifest_entry.content_type(),
             partition_spec_id: ctx.partition_spec_id,
+            sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
+            equality_ids: ctx.manifest_entry.data_file().equality_ids().to_vec(),
         }
     }
 }
@@ -2283,6 +2292,7 @@ pub mod tests {
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
+            sequence_number: 0,
         };
         test_fn(task);
 
@@ -2298,6 +2308,7 @@ pub mod tests {
             record_count: None,
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
+            sequence_number: 0,
         };
         test_fn(task);
     }
