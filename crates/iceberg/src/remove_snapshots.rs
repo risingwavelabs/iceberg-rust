@@ -47,7 +47,7 @@ pub struct RemoveSnapshotAction<'a> {
 impl<'a> RemoveSnapshotAction<'a> {
     /// Creates a new action.
     pub fn new(tx: Transaction<'a>) -> Self {
-        let table = tx.table;
+        let table = &tx.current_table;
         let properties = table.metadata().properties();
 
         let now = chrono::Utc::now().timestamp_millis();
@@ -111,11 +111,11 @@ impl<'a> RemoveSnapshotAction<'a> {
 
     /// Finished building the action and apply it to the transaction.
     pub async fn apply(mut self) -> Result<Transaction<'a>> {
-        if self.tx.table.metadata().refs.is_empty() {
+        if self.tx.current_table.metadata().refs.is_empty() {
             return Ok(self.tx);
         }
 
-        let table_meta = self.tx.table.metadata().clone();
+        let table_meta = self.tx.current_table.metadata().clone();
 
         let mut ids_to_retain = HashSet::new();
         let retained_refs = self.compute_retained_refs(&table_meta.refs);
@@ -146,10 +146,12 @@ impl<'a> RemoveSnapshotAction<'a> {
 
         for ref_name in table_meta.refs.keys() {
             if !retained_refs.contains_key(ref_name) {
-                self.tx
-                    .append_updates(vec![TableUpdate::RemoveSnapshotRef {
+                self.tx.apply(
+                    vec![TableUpdate::RemoveSnapshotRef {
                         ref_name: ref_name.clone(),
-                    }])?;
+                    }],
+                    vec![],
+                )?;
             }
         }
 
@@ -161,9 +163,12 @@ impl<'a> RemoveSnapshotAction<'a> {
         }
 
         if !snapshot_to_remove.is_empty() {
-            self.tx.append_updates(vec![TableUpdate::RemoveSnapshots {
-                snapshot_ids: snapshot_to_remove,
-            }])?;
+            self.tx.apply(
+                vec![TableUpdate::RemoveSnapshots {
+                    snapshot_ids: snapshot_to_remove,
+                }],
+                vec![],
+            )?;
         }
 
         if self.clear_expired_meta_data {
@@ -176,7 +181,7 @@ impl<'a> RemoveSnapshotAction<'a> {
             for snapshot in table_meta.snapshots() {
                 if ids_to_retain.contains(&snapshot.snapshot_id()) {
                     let manifest_list = snapshot
-                        .load_manifest_list(self.tx.table.file_io(), &table_meta)
+                        .load_manifest_list(self.tx.current_table.file_io(), &table_meta)
                         .await?;
 
                     for manifest in manifest_list.entries() {
@@ -191,7 +196,7 @@ impl<'a> RemoveSnapshotAction<'a> {
 
             let spec_to_remove = self
                 .tx
-                .table
+                .current_table
                 .metadata()
                 .partition_specs_iter()
                 .filter_map(|spec| {
@@ -204,14 +209,16 @@ impl<'a> RemoveSnapshotAction<'a> {
                 .unique()
                 .collect();
 
-            self.tx
-                .append_updates(vec![TableUpdate::RemovePartitionSpecs {
+            self.tx.apply(
+                vec![TableUpdate::RemovePartitionSpecs {
                     spec_ids: spec_to_remove,
-                }])?;
+                }],
+                vec![],
+            )?;
 
             let schema_to_remove = self
                 .tx
-                .table
+                .current_table
                 .metadata()
                 .schemas_iter()
                 .filter_map(|schema| {
@@ -224,18 +231,21 @@ impl<'a> RemoveSnapshotAction<'a> {
                 .unique()
                 .collect();
 
-            self.tx.append_updates(vec![TableUpdate::RemoveSchemas {
-                schema_ids: schema_to_remove,
-            }])?;
+            self.tx.apply(
+                vec![TableUpdate::RemoveSchemas {
+                    schema_ids: schema_to_remove,
+                }],
+                vec![],
+            )?;
         }
 
-        self.tx.append_requirements(vec![
+        self.tx.apply(vec![], vec![
             TableRequirement::UuidMatch {
-                uuid: self.tx.table.metadata().uuid(),
+                uuid: self.tx.current_table.metadata().uuid(),
             },
             TableRequirement::RefSnapshotIdMatch {
                 r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: self.tx.table.metadata().current_snapshot_id(),
+                snapshot_id: self.tx.current_table.metadata().current_snapshot_id(),
             },
         ])?;
 
@@ -246,7 +256,7 @@ impl<'a> RemoveSnapshotAction<'a> {
         &self,
         snapshot_refs: &HashMap<String, SnapshotReference>,
     ) -> HashMap<String, SnapshotReference> {
-        let table_meta = self.tx.table.metadata();
+        let table_meta = self.tx.current_table.metadata();
         let mut retained_refs = HashMap::new();
 
         for (ref_name, snapshot_ref) in snapshot_refs {
@@ -330,7 +340,7 @@ impl<'a> RemoveSnapshotAction<'a> {
         min_snapshots_to_keep: usize,
     ) -> HashSet<i64> {
         let mut ids_to_retain = HashSet::new();
-        let table_meta = self.tx.table.metadata();
+        let table_meta = self.tx.current_table.metadata();
         if let Some(snapshot) = table_meta.snapshot_by_id(snapshot_id) {
             let ancestors = ancestors_of(snapshot.clone(), table_meta);
             for ancestor in ancestors {
@@ -358,11 +368,12 @@ impl<'a> RemoveSnapshotAction<'a> {
             if snapshot_ref.is_branch() {
                 if let Some(snapshot) = self
                     .tx
-                    .table
+                    .current_table
                     .metadata()
                     .snapshot_by_id(snapshot_ref.snapshot_id)
                 {
-                    let ancestors = ancestors_of(snapshot.clone(), self.tx.table.metadata());
+                    let ancestors =
+                        ancestors_of(snapshot.clone(), self.tx.current_table.metadata());
                     for ancestor in ancestors {
                         referenced_snapshots.insert(ancestor.snapshot_id());
                     }
@@ -372,7 +383,7 @@ impl<'a> RemoveSnapshotAction<'a> {
             }
         }
 
-        for snapshot in self.tx.table.metadata().snapshots() {
+        for snapshot in self.tx.current_table.metadata().snapshots() {
             if !referenced_snapshots.contains(&snapshot.snapshot_id())
                 && snapshot.timestamp_ms() >= self.default_expired_older_than
             {
