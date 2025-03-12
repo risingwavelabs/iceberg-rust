@@ -1018,7 +1018,7 @@ mod tests {
             format!("{}/3.parquet", &fixture.table_location),
         ];
 
-        let fast_append_action = tx.fast_append(None, vec![]).unwrap();
+        let fast_append_action = tx.fast_append(None, None, vec![]).unwrap();
 
         // Attempt to add the existing Parquet files with fast append.
         let new_tx = fast_append_action
