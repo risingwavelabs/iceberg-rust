@@ -1758,7 +1758,7 @@ mod _serde {
     }
 
     #[serde_as]
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
     struct BytesEntry {
         key: i32,
