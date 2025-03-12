@@ -38,6 +38,7 @@ datafusion = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 tokio = { workspace = true }
+async-stream = { workspace = true }
 
 [dev-dependencies]
 iceberg-catalog-memory = { workspace = true }

@@ -20,8 +20,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use async_stream::try_stream;
+use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -130,15 +131,52 @@ async fn get_batch_stream(
     table: Table,
     file_scan_tasks: Vec<FileScanTask>,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
-    let arrow_reader_builder = ArrowReaderBuilder::new(table.file_io().clone());
-    let task_stream = futures::stream::iter(file_scan_tasks.into_iter().map(Ok)).boxed();
-    let stream = arrow_reader_builder
-        .build()
-        .read(task_stream)
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
+    let stream = try_stream! {
+        for task in file_scan_tasks {
+            let data_file_content = task.data_file_content;
+            let sequence_number = task.sequence_number;
+            let task_stream = futures::stream::iter(vec![Ok(task)]).boxed();
+            let arrow_reader_builder = ArrowReaderBuilder::new(table.file_io().clone());
+            let mut batch_stream = arrow_reader_builder.build()
+                .read(task_stream)
+                .await
+                .map_err(to_datafusion_error)?;
+
+            while let Some(batch) = batch_stream.next().await {
+                let batch = batch.map_err(to_datafusion_error)?;
+                let batch = match data_file_content {
+                    iceberg::spec::DataContentType::Data => {
+                        add_seq_num_into_batch(batch, sequence_number)?
+                    }
+                    iceberg::spec::DataContentType::PositionDeletes => {
+                        batch
+                    },
+                    iceberg::spec::DataContentType::EqualityDeletes => {
+                        add_seq_num_into_batch(batch, sequence_number)?
+                    },
+                };
+                yield batch;
+            }
+        }
+    };
     Ok(Box::pin(stream))
+}
+
+fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBatch> {
+    let schema = batch.schema();
+    let new_field = Arc::new(Field::new(
+        "seq_num",
+        datafusion::arrow::datatypes::DataType::Int64,
+        false,
+    ));
+    let mut new_fields = schema.fields().to_vec();
+    new_fields.push(new_field);
+    let new_schema = Arc::new(Schema::new(new_fields));
+
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int64Array::from(vec![seq_num; batch.num_rows()])));
+    RecordBatch::try_new(new_schema, columns)
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
 }
 
 impl DisplayAs for IcebergFileTaskScan {
