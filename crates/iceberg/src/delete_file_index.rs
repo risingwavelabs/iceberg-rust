@@ -26,7 +26,7 @@ use futures::channel::mpsc::{channel, Sender};
 use futures::StreamExt;
 
 use crate::runtime::spawn;
-use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
+use crate::scan::{DeleteFileContext, FileScanTask};
 use crate::spec::{DataContentType, DataFile, Struct};
 use crate::{Error, ErrorKind, Result};
 
@@ -142,7 +142,7 @@ impl PopulatedDeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Vec<FileScanTaskDeleteFile> {
+    ) -> Vec<FileScanTask> {
         let mut results = vec![];
 
         self.global_deletes
@@ -195,7 +195,7 @@ pub(crate) struct DeletesForDataFile<'a> {
 }
 
 impl Future for DeletesForDataFile<'_> {
-    type Output = Result<Vec<FileScanTaskDeleteFile>>;
+    type Output = Result<Vec<FileScanTask>>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.state.try_read() {
