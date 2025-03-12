@@ -110,10 +110,11 @@ impl PopulatedDeleteFileIndex {
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
             if partition.fields().is_empty() {
                 // TODO: confirm we're good to skip here if we encounter a pos del
-                if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
-                    global_deletes.push(arc_ctx);
-                    return;
-                }
+                // FIXME(Dylan): allow putting position delete to global deletes.
+                // if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
+                global_deletes.push(arc_ctx);
+                return;
+                // }
             }
 
             let destination_map = match arc_ctx.manifest_entry.content_type() {
