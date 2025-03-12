@@ -21,12 +21,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider, TableProviderFactory};
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::sql::TableReference;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::FileIO;
-use iceberg::spec::DataContentType;
 use iceberg::table::StaticTable;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
 
@@ -120,13 +119,6 @@ impl TableProviderFactory for IcebergTableProviderFactory {
         let metadata_file_path = &cmd.location;
         let options = &cmd.options;
 
-        let data_type = match options.get("data_type").unwrap_or(&"data".to_owned()).as_str() {
-            "data" => DataContentType::Data,
-            "position_deletes" => DataContentType::PositionDeletes,
-            "equality_deletes" => DataContentType::EqualityDeletes,
-            _ => return Err(DataFusionError::Execution("Invalid data type".to_string())),
-        };
-
         let table_name_with_ns = complement_namespace_if_necessary(table_name);
 
         let table = create_static_table(table_name_with_ns, metadata_file_path, options)
@@ -137,7 +129,7 @@ impl TableProviderFactory for IcebergTableProviderFactory {
         let schema = schema_to_arrow_schema(table.metadata().current_schema())
             .map_err(to_datafusion_error)?;
 
-        Ok(Arc::new(IcebergTableProvider::new(table, Arc::new(schema),data_type)))
+        Ok(Arc::new(IcebergTableProvider::new(table, Arc::new(schema))))
     }
 }
 

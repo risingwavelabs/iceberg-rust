@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use arrow_array::RecordBatch;
 use futures::channel::mpsc::{channel, Sender};
 use futures::stream::BoxStream;
-use futures::{future, SinkExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{SinkExt, StreamExt, TryFutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::arrow::ArrowReaderBuilder;
@@ -88,25 +88,6 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             delete_file_processing_enabled: false,
-        }
-    }
-
-    pub(crate) fn new_with_delete(table: &'a Table) -> Self {
-        let num_cpus = available_parallelism().get();
-
-        Self {
-            table,
-            column_names: None,
-            snapshot_id: None,
-            batch_size: None,
-            case_sensitive: true,
-            filter: None,
-            concurrency_limit_data_files: num_cpus,
-            concurrency_limit_manifest_entries: num_cpus,
-            concurrency_limit_manifest_files: num_cpus,
-            row_group_filtering_enabled: true,
-            row_selection_enabled: false,
-            delete_file_processing_enabled: true,
         }
     }
 
@@ -497,36 +478,6 @@ impl TableScan {
         arrow_reader_builder
             .build()
             .read(self.plan_files().await?)
-            .await
-    }
-
-    /// Returns an [`ArrowRecordBatchStream`].
-    pub async fn to_arrow_with_type(&self, data_type: DataContentType) -> Result<ArrowRecordBatchStream> {
-        let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
-            .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
-            .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
-
-        if let Some(batch_size) = self.batch_size {
-            arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
-        }
-
-        let plan_files_stream = self.plan_files().await?;
-
-        let plan_files_stream = plan_files_stream.filter({
-                    let data_type = data_type.clone();
-                    move |task| {
-                        if let Ok(task) = task {
-                            future::ready(task.data_file_content == data_type)
-                        } else {
-                            future::ready(true)
-                        }
-                    }
-                }).boxed();
-
-        arrow_reader_builder
-            .build()
-            .read(plan_files_stream)
             .await
     }
 

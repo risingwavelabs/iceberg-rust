@@ -16,4 +16,5 @@
 // under the License.
 
 pub(crate) mod expr_to_predicate;
+pub(crate) mod file_task_scan;
 pub(crate) mod scan;

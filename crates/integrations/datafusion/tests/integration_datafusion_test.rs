@@ -93,7 +93,7 @@ async fn test_provider_plan_stream_schema() -> Result<()> {
     iceberg_catalog.create_table(&namespace, creation).await?;
 
     let client = Arc::new(iceberg_catalog);
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client, DataContentType::Data).await?);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
 
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
@@ -145,7 +145,7 @@ async fn test_provider_list_table_names() -> Result<()> {
     iceberg_catalog.create_table(&namespace, creation).await?;
 
     let client = Arc::new(iceberg_catalog);
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client,DataContentType::Data).await?);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
 
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
@@ -168,7 +168,7 @@ async fn test_provider_list_schema_names() -> Result<()> {
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
     let client = Arc::new(iceberg_catalog);
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client,DataContentType::Data).await?);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
 
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
@@ -202,7 +202,7 @@ async fn test_table_projection() -> Result<()> {
     iceberg_catalog.create_table(&namespace, creation).await?;
 
     let client = Arc::new(iceberg_catalog);
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client,DataContentType::Data).await?);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
 
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
@@ -268,7 +268,7 @@ async fn test_table_predict_pushdown() -> Result<()> {
     iceberg_catalog.create_table(&namespace, creation).await?;
 
     let client = Arc::new(iceberg_catalog);
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client,DataContentType::Data).await?);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
 
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);

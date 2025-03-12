@@ -198,7 +198,7 @@ impl Table {
 
     /// Creates a table scan.
     pub fn scan(&self) -> TableScanBuilder<'_> {
-        TableScanBuilder::new_with_delete(self)
+        TableScanBuilder::new(self)
     }
 
     /// Creates a metadata table which provides table-like APIs for inspecting metadata.

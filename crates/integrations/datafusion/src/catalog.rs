@@ -19,9 +19,9 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::{catalog::{CatalogProvider, SchemaProvider}};
+use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use futures::future::try_join_all;
-use iceberg::{spec::DataContentType, Catalog, NamespaceIdent, Result};
+use iceberg::{Catalog, NamespaceIdent, Result};
 
 use crate::schema::IcebergSchemaProvider;
 
@@ -46,7 +46,7 @@ impl IcebergCatalogProvider {
     /// This method retrieves the list of namespace names
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
-    pub async fn try_new(client: Arc<dyn Catalog>, data_type: DataContentType) -> Result<Self> {
+    pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
         // TODO:
         // Schemas and providers should be cached and evicted based on time
         // As of right now; schemas might become stale.
@@ -64,7 +64,6 @@ impl IcebergCatalogProvider {
                     IcebergSchemaProvider::try_new(
                         client.clone(),
                         NamespaceIdent::new(name.clone()),
-                        data_type
                     )
                 })
                 .collect::<Vec<_>>(),
