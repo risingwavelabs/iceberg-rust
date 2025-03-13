@@ -121,7 +121,7 @@ async fn test_append_data_file() {
     for _ in 0..3 {
         let data_file = write_new_data_file(&table).await;
         let tx = Transaction::new(&table);
-        let mut append_action = tx.fast_append(None, vec![]).unwrap();
+        let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(data_file.clone()).unwrap();
         let tx = append_action.apply().await.unwrap();
         table = tx.commit(&rest_catalog).await.unwrap()
