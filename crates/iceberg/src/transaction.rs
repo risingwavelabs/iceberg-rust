@@ -1151,11 +1151,8 @@ mod tests {
             let tx = Transaction::new(&table);
             let tx = tx.expire_snapshot().apply().await.unwrap();
             for update in &tx.updates {
-                match update {
-                    TableUpdate::RemoveSnapshots { snapshot_ids } => {
-                        assert_eq!(4, snapshot_ids.len());
-                    }
-                    _ => {}
+                if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
+                    assert_eq!(4, snapshot_ids.len());
                 }
             }
 
@@ -1177,11 +1174,8 @@ mod tests {
             let tx = Transaction::new(&table);
             let tx = tx.expire_snapshot().retain_last(2).apply().await.unwrap();
             for update in &tx.updates {
-                match update {
-                    TableUpdate::RemoveSnapshots { snapshot_ids } => {
-                        assert_eq!(3, snapshot_ids.len());
-                    }
-                    _ => {}
+                if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
+                    assert_eq!(3, snapshot_ids.len());
                 }
             }
 

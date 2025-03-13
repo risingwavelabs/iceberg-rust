@@ -18,7 +18,6 @@
 //! Transaction action for removing snapshot.
 
 use std::collections::{HashMap, HashSet};
-use std::i32;
 
 use itertools::Itertools;
 
@@ -131,14 +130,15 @@ impl<'a> RemoveSnapshotAction<'a> {
         }
 
         for id_to_remove in &self.ids_to_remove {
-            let refs_for_id = retained_id_to_refs.get(id_to_remove);
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot remove snapshot {:?} with retained references: {:?}",
-                    id_to_remove, refs_for_id
-                ),
-            ));
+            if let Some(refs_for_id) = retained_id_to_refs.get(id_to_remove) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot remove snapshot {:?} with retained references: {:?}",
+                        id_to_remove, refs_for_id
+                    ),
+                ));
+            }
         }
 
         ids_to_retain.extend(self.compute_all_branch_snapshots_to_retain(table_meta.refs.values()));

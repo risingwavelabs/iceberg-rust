@@ -420,10 +420,7 @@ impl<'a> Iterator for AncestorIterator<'a> {
 }
 
 /// Returns an iterator over the ancestors of a snapshot.
-pub fn ancestors_of<'a>(
-    snapshot: SnapshotRef,
-    table_metadata: &'a TableMetadata,
-) -> AncestorIterator<'a> {
+pub fn ancestors_of(snapshot: SnapshotRef, table_metadata: &TableMetadata) -> AncestorIterator<'_> {
     AncestorIterator {
         current: Some(snapshot),
         table_metadata,
