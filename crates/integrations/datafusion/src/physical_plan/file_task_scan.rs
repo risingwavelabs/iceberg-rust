@@ -192,7 +192,7 @@ fn add_file_path_pos_into_batch(batch: RecordBatch, file_path: &str, index_start
     ));
     let pos_field = Arc::new(Field::new(
         "pos",
-        datafusion::arrow::datatypes::DataType::Utf8,
+        datafusion::arrow::datatypes::DataType::Int64,
         false,
     ));
     let mut new_fields = schema.fields().to_vec();
