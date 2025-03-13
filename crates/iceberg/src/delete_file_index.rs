@@ -110,10 +110,11 @@ impl PopulatedDeleteFileIndex {
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
             if partition.fields().is_empty() {
                 // TODO: confirm we're good to skip here if we encounter a pos del
-                if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
-                    global_deletes.push(arc_ctx);
-                    return;
-                }
+                // FIXME(Dylan): allow putting position delete to global deletes.
+                // if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
+                global_deletes.push(arc_ctx);
+                return;
+                // }
             }
 
             let destination_map = match arc_ctx.manifest_entry.content_type() {
@@ -161,7 +162,7 @@ impl PopulatedDeleteFileIndex {
                 // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
                 .filter(|&delete| {
                     seq_num
-                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
+                        .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
                         .unwrap_or_else(|| true)
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
@@ -177,7 +178,7 @@ impl PopulatedDeleteFileIndex {
                 // filter that returns true if the provided delete file's sequence number is **greater thano** `seq_num`
                 .filter(|&delete| {
                     seq_num
-                        .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
+                        .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));

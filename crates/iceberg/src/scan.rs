@@ -585,7 +585,8 @@ impl TableScan {
             .send(DeleteFileContext {
                 manifest_entry: manifest_entry_context.manifest_entry.clone(),
                 partition_spec_id: manifest_entry_context.partition_spec_id,
-                schema: manifest_entry_context.snapshot_schema.clone(),
+                snapshot_schema: manifest_entry_context.snapshot_schema.clone(),
+                field_ids: manifest_entry_context.field_ids.clone(),
             })
             .await?;
 
@@ -697,8 +698,8 @@ impl ManifestEntryContext {
                 .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
 
             deletes,
-            equality_ids: self.manifest_entry.data_file().equality_ids().to_vec(),
             sequence_number: self.manifest_entry.sequence_number().unwrap_or(0),
+            equality_ids: self.manifest_entry.data_file().equality_ids().to_vec(),
         })
     }
 }
@@ -1061,12 +1062,10 @@ pub struct FileScanTask {
 
     /// The list of delete files that may need to be applied to this data file
     pub deletes: Vec<FileScanTask>,
-
-    /// The list of equality ids for this data file
-    pub equality_ids: Vec<i32>,
-
-    /// The sequence number of the file to scan.
+    /// sequence number
     pub sequence_number: i64,
+    /// equality ids
+    pub equality_ids: Vec<i32>,
 }
 
 /// A task to scan part of file.
@@ -1086,7 +1085,8 @@ pub struct FileScanTaskDeleteFile {
 pub(crate) struct DeleteFileContext {
     pub(crate) manifest_entry: ManifestEntryRef,
     pub(crate) partition_spec_id: i32,
-    pub(crate) schema: SchemaRef,
+    pub(crate) snapshot_schema: SchemaRef,
+    pub(crate) field_ids: Arc<Vec<i32>>,
 }
 
 impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
@@ -1105,15 +1105,17 @@ impl From<&DeleteFileContext> for FileScanTask {
             start: 0,
             length: ctx.manifest_entry.file_size_in_bytes(),
             record_count: Some(ctx.manifest_entry.record_count()),
+
             data_file_path: ctx.manifest_entry.file_path().to_string(),
             data_file_content: ctx.manifest_entry.content_type(),
             data_file_format: ctx.manifest_entry.file_format(),
-            schema: ctx.schema.clone(),
-            project_field_ids: vec![],
+
+            schema: ctx.snapshot_schema.clone(),
+            project_field_ids: ctx.field_ids.to_vec(),
             predicate: None,
             deletes: vec![],
-            equality_ids: ctx.manifest_entry.data_file().equality_ids().to_vec(),
             sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
+            equality_ids: ctx.manifest_entry.data_file().equality_ids().to_vec(),
         }
     }
 }
@@ -2313,8 +2315,8 @@ pub mod tests {
             record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
-            equality_ids: vec![],
             sequence_number: 0,
+            equality_ids: vec![],
         };
         test_fn(task);
 
@@ -2330,8 +2332,8 @@ pub mod tests {
             record_count: None,
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
-            equality_ids: vec![],
             sequence_number: 0,
+            equality_ids: vec![],
         };
         test_fn(task);
     }

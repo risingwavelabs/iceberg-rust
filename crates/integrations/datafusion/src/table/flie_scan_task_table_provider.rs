@@ -38,11 +38,7 @@ pub struct IcebergFileScanTaskTableProvider {
     table: Table,
 }
 impl IcebergFileScanTaskTableProvider {
-    pub fn new(
-        file_scan_tasks: Vec<FileScanTask>,
-        schema: ArrowSchemaRef,
-        table: Table,
-    ) -> Self {
+    pub fn new(file_scan_tasks: Vec<FileScanTask>, schema: ArrowSchemaRef, table: Table) -> Self {
         Self {
             file_scan_tasks,
             schema,
