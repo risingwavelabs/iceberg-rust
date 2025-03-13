@@ -113,7 +113,7 @@ async fn test_expire_snapshots_by_count() {
 
     for _ in 0..10 {
         let tx = Transaction::new(&table);
-        let mut append_action = tx.fast_append(None, vec![]).unwrap();
+        let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(data_file.clone()).unwrap();
         let tx = append_action.apply().await.unwrap();
         table = tx.commit(&rest_catalog).await.unwrap();
