@@ -318,7 +318,7 @@ mod test {
                 location_gen.clone(),
                 file_name_gen.clone(),
             );
-            DataFileWriterBuilder::new(pw.clone(), None, None)
+            DataFileWriterBuilder::new(pw.clone(), None, 0)
         };
         let position_delete_writer_builder = {
             let pw = ParquetWriterBuilder::new(
@@ -331,7 +331,7 @@ mod test {
             SortPositionDeleteWriterBuilder::new(pw.clone(), 100, None, None)
         };
         let equality_delete_writer_builder = {
-            let config = EqualityDeleteWriterConfig::new(vec![1, 2], schema, None, None)?;
+            let config = EqualityDeleteWriterConfig::new(vec![1, 2], schema, None, 0)?;
             let pw = ParquetWriterBuilder::new(
                 WriterProperties::builder().build(),
                 arrow_schema_to_schema(config.projected_arrow_schema_ref())
