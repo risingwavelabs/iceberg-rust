@@ -37,7 +37,19 @@ pub struct IcebergFileScanTaskTableProvider {
     schema: ArrowSchemaRef,
     table: Table,
 }
-
+impl IcebergFileScanTaskTableProvider {
+    pub fn new(
+        file_scan_tasks: Vec<FileScanTask>,
+        schema: ArrowSchemaRef,
+        table: Table,
+    ) -> Self {
+        Self {
+            file_scan_tasks,
+            schema,
+            table,
+        }
+    }
+}
 #[async_trait]
 impl TableProvider for IcebergFileScanTaskTableProvider {
     fn as_any(&self) -> &dyn Any {
