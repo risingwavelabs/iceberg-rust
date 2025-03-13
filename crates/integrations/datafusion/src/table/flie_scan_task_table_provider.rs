@@ -36,13 +36,23 @@ pub struct IcebergFileScanTaskTableProvider {
     file_scan_tasks: Vec<FileScanTask>,
     schema: ArrowSchemaRef,
     table: Table,
+    need_seq_num: bool,
+    need_file_path_and_pos: bool,
 }
 impl IcebergFileScanTaskTableProvider {
-    pub fn new(file_scan_tasks: Vec<FileScanTask>, schema: ArrowSchemaRef, table: Table) -> Self {
+    pub fn new(
+        file_scan_tasks: Vec<FileScanTask>,
+        schema: ArrowSchemaRef,
+        table: Table,
+        need_seq_num: bool,
+        need_file_path_and_pos: bool,
+    ) -> Self {
         Self {
             file_scan_tasks,
             schema,
             table,
+            need_seq_num,
+            need_file_path_and_pos,
         }
     }
 }
@@ -73,6 +83,8 @@ impl TableProvider for IcebergFileScanTaskTableProvider {
             projection,
             filters,
             self.table.clone(),
+            self.need_seq_num,
+            self.need_file_path_and_pos,
         )))
     }
 

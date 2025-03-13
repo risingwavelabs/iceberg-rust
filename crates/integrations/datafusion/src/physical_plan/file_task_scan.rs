@@ -47,6 +47,8 @@ pub(crate) struct IcebergFileTaskScan {
     projection: Option<Vec<String>>,
     predicates: Option<Predicate>,
     table: Table,
+    need_seq_num: bool,
+    need_file_path_and_pos: bool,
 }
 
 impl IcebergFileTaskScan {
@@ -56,6 +58,8 @@ impl IcebergFileTaskScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         table: Table,
+        need_seq_num: bool,
+        need_file_path_and_pos: bool,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
@@ -71,6 +75,8 @@ impl IcebergFileTaskScan {
             projection,
             predicates,
             table,
+            need_seq_num,
+            need_file_path_and_pos,
         }
     }
 
@@ -117,7 +123,12 @@ impl ExecutionPlan for IcebergFileTaskScan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let fut = get_batch_stream(self.table.clone(), self.file_scan_tasks.clone());
+        let fut = get_batch_stream(
+            self.table.clone(),
+            self.file_scan_tasks.clone(),
+            self.need_seq_num,
+            self.need_file_path_and_pos,
+        );
         let stream = futures::stream::once(fut).try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -130,6 +141,8 @@ impl ExecutionPlan for IcebergFileTaskScan {
 async fn get_batch_stream(
     table: Table,
     file_scan_tasks: Vec<FileScanTask>,
+    need_seq_num: bool,
+    need_file_path_and_pos: bool,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
     let stream = try_stream! {
         for task in file_scan_tasks {
@@ -144,12 +157,16 @@ async fn get_batch_stream(
                 .map_err(to_datafusion_error)?;
             let mut index_start = 0;
             while let Some(batch) = batch_stream.next().await {
-                let batch = batch.map_err(to_datafusion_error)?;
+                let mut batch = batch.map_err(to_datafusion_error)?;
                 let batch = match data_file_content {
                     iceberg::spec::DataContentType::Data => {
-                        let batch = add_seq_num_into_batch(batch, sequence_number)?;
-                        let batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
-                        index_start += batch.num_rows() as i64;
+                        if need_seq_num{
+                            batch = add_seq_num_into_batch(batch, sequence_number)?;
+                        }
+                        if need_file_path_and_pos {
+                            batch = add_file_path_pos_into_batch(batch, &file_path, index_start)?;
+                            index_start += batch.num_rows() as i64;
+                        }
                         batch
                     }
                     iceberg::spec::DataContentType::PositionDeletes => {
@@ -183,7 +200,11 @@ fn add_seq_num_into_batch(batch: RecordBatch, seq_num: i64) -> DFResult<RecordBa
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
 }
 
-fn add_file_path_pos_into_batch(batch: RecordBatch, file_path: &str, index_start: i64) -> DFResult<RecordBatch> {
+fn add_file_path_pos_into_batch(
+    batch: RecordBatch,
+    file_path: &str,
+    index_start: i64,
+) -> DFResult<RecordBatch> {
     let schema = batch.schema();
     let file_path_field = Arc::new(Field::new(
         "file_path",
@@ -201,7 +222,10 @@ fn add_file_path_pos_into_batch(batch: RecordBatch, file_path: &str, index_start
     let new_schema = Arc::new(Schema::new(new_fields));
 
     let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(StringArray::from(vec![file_path; batch.num_rows()])));
+    columns.push(Arc::new(StringArray::from(vec![
+        file_path;
+        batch.num_rows()
+    ])));
     columns.push(Arc::new(Int64Array::from_iter(
         (index_start..(index_start + batch.num_rows() as i64)).collect::<Vec<i64>>(),
     )));
