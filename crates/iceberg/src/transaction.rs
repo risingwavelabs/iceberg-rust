@@ -167,7 +167,7 @@ impl<'a> Transaction<'a> {
     ) -> Result<FastAppendAction<'a>> {
         let snapshot_id = if let Some(snapshot_id) = snapshot_id {
             if self
-                .table
+                .current_table
                 .metadata()
                 .snapshots()
                 .any(|s| s.snapshot_id() == snapshot_id)
