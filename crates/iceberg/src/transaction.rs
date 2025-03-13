@@ -1150,11 +1150,7 @@ mod tests {
         {
             let tx = Transaction::new(&table);
             let tx = tx.expire_snapshot().apply().await.unwrap();
-            for update in &tx.updates {
-                if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
-                    assert_eq!(4, snapshot_ids.len());
-                }
-            }
+            assert_eq!(4, tx.updates.len());
 
             assert_eq!(
                 vec![
@@ -1173,11 +1169,7 @@ mod tests {
         {
             let tx = Transaction::new(&table);
             let tx = tx.expire_snapshot().retain_last(2).apply().await.unwrap();
-            for update in &tx.updates {
-                if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
-                    assert_eq!(3, snapshot_ids.len());
-                }
-            }
+            assert_eq!(3, tx.updates.len());
 
             assert_eq!(
                 vec![
@@ -1228,7 +1220,7 @@ mod tests {
                 .err()
                 .unwrap();
             assert_eq!(
-                "DataInvalid => Cannot remove snapshot 3067729675574597004 with retained references: Some([\"main\"])",
+                "DataInvalid => Cannot remove snapshot 3067729675574597004 with retained references: [\"main\"]",
                 err.to_string()
             )
         }

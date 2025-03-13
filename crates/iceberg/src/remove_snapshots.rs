@@ -141,8 +141,10 @@ impl<'a> RemoveSnapshotAction<'a> {
             }
         }
 
-        ids_to_retain.extend(self.compute_all_branch_snapshots_to_retain(table_meta.refs.values()));
-        ids_to_retain.extend(self.unreferenced_snapshots_to_retain(table_meta.refs.values()));
+        ids_to_retain
+            .extend(self.compute_all_branch_snapshots_to_retain(table_meta.refs.values().cloned()));
+        ids_to_retain
+            .extend(self.unreferenced_snapshots_to_retain(table_meta.refs.values().cloned()));
 
         for ref_name in table_meta.refs.keys() {
             if !retained_refs.contains_key(ref_name) {
@@ -294,7 +296,7 @@ impl<'a> RemoveSnapshotAction<'a> {
 
     fn compute_all_branch_snapshots_to_retain(
         &self,
-        refs: impl Iterator<Item = &'_ SnapshotReference>,
+        refs: impl Iterator<Item = SnapshotReference>,
     ) -> HashSet<i64> {
         let mut branch_snapshots_to_retain = HashSet::new();
         for snapshot_ref in refs {
@@ -362,7 +364,7 @@ impl<'a> RemoveSnapshotAction<'a> {
 
     fn unreferenced_snapshots_to_retain(
         &self,
-        refs: impl Iterator<Item = &SnapshotReference>,
+        refs: impl Iterator<Item = SnapshotReference>,
     ) -> HashSet<i64> {
         let mut ids_to_retain = HashSet::new();
         let mut referenced_snapshots = HashSet::new();
