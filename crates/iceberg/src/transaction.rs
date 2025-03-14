@@ -232,6 +232,22 @@ impl<'a> Transaction<'a> {
         RemoveSnapshotAction::new(self)
     }
 
+    /// Creates rewrite files action.
+    pub fn rewrite_files(
+        self,
+        commit_uuid: Option<Uuid>,
+        key_metadata: Vec<u8>,
+    ) -> Result<RewriteFilesAction<'a>> {
+        let snapshot_id = self.generate_unique_snapshot_id();
+        RewriteFilesAction::new(
+            self,
+            snapshot_id,
+            commit_uuid.unwrap_or_else(Uuid::now_v7),
+            key_metadata,
+            HashMap::new(),
+        )
+    }
+
     /// Remove properties in table.
     pub fn remove_properties(mut self, keys: Vec<String>) -> Result<Self> {
         self.apply(
