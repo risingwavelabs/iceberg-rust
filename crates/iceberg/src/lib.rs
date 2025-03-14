@@ -77,6 +77,7 @@ pub mod inspect;
 pub mod scan;
 
 pub mod expr;
+pub mod remove_snapshots;
 pub mod transaction;
 pub mod transform;
 
