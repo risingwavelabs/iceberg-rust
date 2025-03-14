@@ -3551,6 +3551,7 @@ dependencies = [
  "tera",
  "thrift",
  "tokio",
+ "tracing",
  "typed-builder 0.20.1",
  "url",
  "uuid",
@@ -3692,6 +3693,7 @@ version = "0.6.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "chrono",
  "ctor",
  "datafusion",
  "futures",
