@@ -18,10 +18,11 @@
 //! This module contains transaction api.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::mem::discriminant;
 use std::ops::RangeFrom;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::StringArray;
@@ -29,24 +30,36 @@ use futures::TryStreamExt;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::io::OutputFile;
+use crate::io::FileIO;
+use crate::remove_snapshots::RemoveSnapshotAction;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriterBuilder, NullOrder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct, StructType,
-    Summary, Transform, MAIN_BRANCH,
+    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
+    NullOrder, Operation, Snapshot, SnapshotReference, SnapshotRetention, SortDirection, SortField,
+    SortOrder, Struct, StructType, Summary, Transform, MAIN_BRANCH,
 };
 use crate::table::Table;
+use crate::utils::bin::ListPacker;
 use crate::writer::file_writer::ParquetWriter;
 use crate::TableUpdate::UpgradeFormatVersion;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
+/// Target size of manifest file when merging manifests.
+pub const MANIFEST_TARGET_SIZE_BYTES: &str = "commit.manifest.target-size-bytes";
+const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024; // 8 MB
+/// Minimum number of manifests to merge.
+pub const MANIFEST_MIN_MERGE_COUNT: &str = "commit.manifest.min-count-to-merge";
+const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
+/// Whether allow to merge manifests.
+pub const MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
+const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
+
 /// Table transaction.
 pub struct Transaction<'a> {
     base_table: &'a Table,
-    current_table: Table,
+    pub(crate) current_table: Table,
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
 }
@@ -74,7 +87,7 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    fn apply(
+    pub(crate) fn apply(
         &mut self,
         updates: Vec<TableUpdate>,
         requirements: Vec<TableRequirement>,
@@ -167,7 +180,7 @@ impl<'a> Transaction<'a> {
     ) -> Result<FastAppendAction<'a>> {
         let snapshot_id = if let Some(snapshot_id) = snapshot_id {
             if self
-                .base_table
+                .current_table
                 .metadata()
                 .snapshots()
                 .any(|s| s.snapshot_id() == snapshot_id)
@@ -190,12 +203,33 @@ impl<'a> Transaction<'a> {
         )
     }
 
+    /// Creates a merge append action.
+    pub fn merge_append(
+        self,
+        commit_uuid: Option<Uuid>,
+        key_metadata: Vec<u8>,
+    ) -> Result<MergeAppendAction<'a>> {
+        let snapshot_id = self.generate_unique_snapshot_id();
+        MergeAppendAction::new(
+            self,
+            snapshot_id,
+            commit_uuid.unwrap_or_else(Uuid::now_v7),
+            key_metadata,
+            HashMap::new(),
+        )
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(self) -> ReplaceSortOrderAction<'a> {
         ReplaceSortOrderAction {
             tx: self,
             sort_fields: vec![],
         }
+    }
+
+    /// Creates remove snapshot action.
+    pub fn expire_snapshot(self) -> RemoveSnapshotAction<'a> {
+        RemoveSnapshotAction::new(self)
     }
 
     /// Remove properties in table.
@@ -338,6 +372,86 @@ impl<'a> FastAppendAction<'a> {
     }
 }
 
+/// MergeAppendAction is a transaction action similar to fast append except that it will merge manifests
+/// based on the target size.
+pub struct MergeAppendAction<'a> {
+    snapshot_produce_action: SnapshotProduceAction<'a>,
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+    merge_enabled: bool,
+}
+
+impl<'a> MergeAppendAction<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        tx: Transaction<'a>,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        key_metadata: Vec<u8>,
+        snapshot_properties: HashMap<String, String>,
+    ) -> Result<Self> {
+        let target_size_bytes: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_TARGET_SIZE_BYTES)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_TARGET_SIZE_BYTES_DEFAULT);
+        let min_count_to_merge: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MIN_MERGE_COUNT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MIN_MERGE_COUNT_DEFAULT);
+        let merge_enabled = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MERGE_ENABLED)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
+        Ok(Self {
+            snapshot_produce_action: SnapshotProduceAction::new(
+                tx,
+                snapshot_id,
+                key_metadata,
+                commit_uuid,
+                snapshot_properties,
+            )?,
+            target_size_bytes,
+            min_count_to_merge,
+            merge_enabled,
+        })
+    }
+
+    /// Add data files to the snapshot.
+    pub fn add_data_files(
+        &mut self,
+        data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        self.snapshot_produce_action.add_data_files(data_files)?;
+        Ok(self)
+    }
+
+    /// Finished building the action and apply it to the transaction.
+    pub async fn apply(self) -> Result<Transaction<'a>> {
+        if self.merge_enabled {
+            let process = MergeManifestProcess {
+                target_size_bytes: self.target_size_bytes,
+                min_count_to_merge: self.min_count_to_merge,
+            };
+            self.snapshot_produce_action
+                .apply(FastAppendOperation, process)
+                .await
+        } else {
+            self.snapshot_produce_action
+                .apply(FastAppendOperation, DefaultManifestProcess)
+                .await
+        }
+    }
+}
+
 struct FastAppendOperation;
 
 impl SnapshotProduceOperation for FastAppendOperation {
@@ -397,13 +511,208 @@ trait SnapshotProduceOperation: Send + Sync {
 struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifeset(&self, manifests: Vec<ManifestFile>) -> Vec<ManifestFile> {
-        manifests
+    async fn process_manifest<'a>(
+        &self,
+        _snapshot_producer: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
+    }
+}
+
+struct MergeManifestProcess {
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+}
+
+impl MergeManifestProcess {
+    pub fn new(target_size_bytes: u32, min_count_to_merge: u32) -> Self {
+        Self {
+            target_size_bytes,
+            min_count_to_merge,
+        }
+    }
+}
+
+impl ManifestProcess for MergeManifestProcess {
+    async fn process_manifest<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let (unmerge_data_manifest, unmerge_delete_manifest): (Vec<_>, Vec<_>) = manifests
+            .into_iter()
+            .partition(|manifest| matches!(manifest.content, ManifestContentType::Data));
+        let mut data_manifest = {
+            let manifest_merge_manager = MergeManifestManager::new(
+                self.target_size_bytes,
+                self.min_count_to_merge,
+                ManifestContentType::Data,
+            );
+            manifest_merge_manager
+                .merge_manifest(snapshot_produce, unmerge_data_manifest)
+                .await?
+        };
+        data_manifest.extend(unmerge_delete_manifest);
+        Ok(data_manifest)
+    }
+}
+
+struct MergeManifestManager {
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+    content: ManifestContentType,
+}
+
+impl MergeManifestManager {
+    pub fn new(
+        target_size_bytes: u32,
+        min_count_to_merge: u32,
+        content: ManifestContentType,
+    ) -> Self {
+        Self {
+            target_size_bytes,
+            min_count_to_merge,
+            content,
+        }
+    }
+
+    fn group_by_spec(&self, manifests: Vec<ManifestFile>) -> BTreeMap<i32, Vec<ManifestFile>> {
+        let mut grouped_manifests = BTreeMap::new();
+        for manifest in manifests {
+            grouped_manifests
+                .entry(manifest.partition_spec_id)
+                .or_insert_with(Vec::new)
+                .push(manifest);
+        }
+        grouped_manifests
+    }
+
+    async fn merge_bin(
+        &self,
+        snapshot_id: i64,
+        file_io: FileIO,
+        manifest_bin: Vec<ManifestFile>,
+        mut writer: ManifestWriter,
+    ) -> Result<ManifestFile> {
+        for manifest_file in manifest_bin {
+            let manifest_file = manifest_file.load_manifest(&file_io).await?;
+            for manifest_entry in manifest_file.entries() {
+                if manifest_entry.status() == ManifestStatus::Deleted
+                    && manifest_entry
+                        .snapshot_id()
+                        .is_some_and(|id| id == snapshot_id)
+                {
+                    //only files deleted by this snapshot should be added to the new manifest
+                    writer.add_delete_entry(manifest_entry.as_ref().clone())?;
+                } else if manifest_entry.status() == ManifestStatus::Added
+                    && manifest_entry
+                        .snapshot_id()
+                        .is_some_and(|id| id == snapshot_id)
+                {
+                    //added entries from this snapshot are still added, otherwise they should be existing
+                    writer.add_entry(manifest_entry.as_ref().clone())?;
+                } else if manifest_entry.status() != ManifestStatus::Deleted {
+                    // add all non-deleted files from the old manifest as existing files
+                    writer.add_existing_entry(manifest_entry.as_ref().clone())?;
+                }
+            }
+        }
+
+        writer.write_manifest_file().await
+    }
+
+    async fn merge_group<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        first_manifest: &ManifestFile,
+        group_manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let packer: ListPacker<ManifestFile> = ListPacker::new(self.target_size_bytes);
+        let manifest_bins =
+            packer.pack(group_manifests, |manifest| manifest.manifest_length as u32);
+
+        let manifest_merge_futures = manifest_bins
+            .into_iter()
+            .map(|manifest_bin| {
+                if manifest_bin.len() == 1 {
+                    Ok(Box::pin(async { Ok(manifest_bin) })
+                        as Pin<
+                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                        >)
+                }
+                //  if the bin has the first manifest (the new data files or an appended manifest file) then only
+                //  merge it if the number of manifests is above the minimum count. this is applied only to bins
+                //  with an in-memory manifest so that large manifests don't prevent merging older groups.
+                else if manifest_bin
+                    .iter()
+                    .any(|manifest| manifest == first_manifest)
+                    && manifest_bin.len() < self.min_count_to_merge as usize
+                {
+                    Ok(Box::pin(async { Ok(manifest_bin) })
+                        as Pin<
+                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                        >)
+                } else {
+                    let writer = snapshot_produce.new_manifest_writer(&self.content,snapshot_produce.tx.current_table.metadata().default_partition_spec_id())?;
+                    let snapshot_id = snapshot_produce.snapshot_id;
+                    let file_io = snapshot_produce.tx.current_table.file_io().clone();
+                    Ok((Box::pin(async move {
+                        Ok(vec![
+                            self.merge_bin(
+                                snapshot_id,
+                                file_io,
+                                manifest_bin,
+                                writer,
+                            )
+                            .await?,
+                        ])
+                    }))
+                        as Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>)
+                }
+            })
+            .collect::<Result<Vec<Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>>>>()?;
+
+        let merged_bins: Vec<Vec<ManifestFile>> =
+            futures::future::join_all(manifest_merge_futures.into_iter())
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+        Ok(merged_bins.into_iter().flatten().collect())
+    }
+
+    pub(crate) async fn merge_manifest<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        if manifests.is_empty() {
+            return Ok(manifests);
+        }
+
+        let first_manifest = manifests[0].clone();
+
+        let group_manifests = self.group_by_spec(manifests);
+
+        let mut merge_manifests = vec![];
+        for (_spec_id, manifests) in group_manifests.into_iter().rev() {
+            merge_manifests.extend(
+                self.merge_group(snapshot_produce, &first_manifest, manifests)
+                    .await?,
+            );
+        }
+
+        Ok(merge_manifests)
     }
 }
 
 trait ManifestProcess: Send + Sync {
-    fn process_manifeset(&self, manifests: Vec<ManifestFile>) -> Vec<ManifestFile>;
+    fn process_manifest<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 struct SnapshotProduceAction<'a> {
@@ -414,6 +723,9 @@ struct SnapshotProduceAction<'a> {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
+    removed_data_files: Vec<DataFile>,
+    removed_delete_files: Vec<DataFile>,
+
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -435,6 +747,8 @@ impl<'a> SnapshotProduceAction<'a> {
             snapshot_properties,
             added_data_files: vec![],
             added_delete_files: vec![],
+            removed_data_files: vec![],
+            removed_delete_files: vec![],
             manifest_counter: (0..),
             key_metadata,
         })
@@ -493,7 +807,32 @@ impl<'a> SnapshotProduceAction<'a> {
         Ok(self)
     }
 
-    fn new_manifest_output(&mut self) -> Result<OutputFile> {
+    /// Add remove files to the snapshot.
+    #[allow(dead_code)]
+    pub fn delete_files(
+        &mut self,
+        remove_data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        // let data_files: Vec<DataFile> = remove_data_files.into_iter().collect();
+        for data_file in remove_data_files.into_iter() {
+            Self::validate_partition_value(
+                data_file.partition(),
+                self.tx.current_table.metadata().default_partition_type(),
+            )?;
+            if data_file.content_type() == DataContentType::Data {
+                self.removed_data_files.push(data_file);
+            } else {
+                self.removed_delete_files.push(data_file);
+            }
+        }
+        Ok(self)
+    }
+
+    fn new_manifest_writer(
+        &mut self,
+        content_type: &ManifestContentType,
+        partition_spec_id: i32,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.tx.current_table.metadata().location(),
@@ -502,10 +841,40 @@ impl<'a> SnapshotProduceAction<'a> {
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
         );
-        self.tx
+        let output = self
+            .tx
             .current_table
             .file_io()
-            .new_output(new_manifest_path)
+            .new_output(new_manifest_path)?;
+        let partition_spec = self
+            .tx
+            .current_table
+            .metadata()
+            .partition_spec_by_id(partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Invalid partition spec id for new manifest writer",
+                )
+                .with_context("partition spec id", partition_spec_id.to_string())
+            })?
+            .as_ref()
+            .clone();
+        let builder = ManifestWriterBuilder::new(
+            output,
+            Some(self.snapshot_id),
+            self.key_metadata.clone(),
+            self.tx.current_table.metadata().current_schema().clone(),
+            partition_spec,
+        );
+        if self.tx.current_table.metadata().format_version() == FormatVersion::V1 {
+            Ok(builder.build_v1())
+        } else {
+            match content_type {
+                ManifestContentType::Data => Ok(builder.build_v2_data()),
+                ManifestContentType::Deletes => Ok(builder.build_v2_deletes()),
+            }
+        }
     }
 
     // Write manifest file for added data files and return the ManifestFile for ManifestList.
@@ -538,7 +907,7 @@ impl<'a> SnapshotProduceAction<'a> {
         };
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
+                .status(ManifestStatus::Added)
                 .data_file(data_file);
             if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
@@ -548,32 +917,67 @@ impl<'a> SnapshotProduceAction<'a> {
                 builder.build()
             }
         });
-        let mut writer = {
-            let builder = ManifestWriterBuilder::new(
-                self.new_manifest_output()?,
-                Some(self.snapshot_id),
-                self.key_metadata.clone(),
-                self.tx.current_table.metadata().current_schema().clone(),
-                self.tx
-                    .current_table
-                    .metadata()
-                    .default_partition_spec()
-                    .as_ref()
-                    .clone(),
-            );
-            if self.tx.current_table.metadata().format_version() == FormatVersion::V1 {
-                builder.build_v1()
-            } else {
-                match content_type {
-                    ManifestContentType::Data => builder.build_v2_data(),
-                    ManifestContentType::Deletes => builder.build_v2_deletes(),
-                }
-            }
-        };
+        let mut writer = self.new_manifest_writer(
+            &content_type,
+            self.tx.current_table.metadata().default_partition_spec_id(),
+        )?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
         writer.write_manifest_file().await
+    }
+
+    async fn write_delete_manifest(
+        &mut self,
+        deleted_entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        if deleted_entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group deleted entries by spec_id
+        let mut partition_groups = HashMap::new();
+        for entry in deleted_entries {
+            partition_groups
+                .entry(entry.data_file().partition_spec_id)
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+
+        // Write a delete manifest per spec_id group
+        let mut deleted_manifests = Vec::new();
+        for (spec_id, entries) in partition_groups {
+            let mut data_file_writer: Option<ManifestWriter> = None;
+            let mut delete_file_writer: Option<ManifestWriter> = None;
+            for entry in entries {
+                match entry.content_type() {
+                    DataContentType::Data => {
+                        if data_file_writer.is_none() {
+                            data_file_writer = Some(
+                                self.new_manifest_writer(&ManifestContentType::Data, spec_id)?,
+                            );
+                        }
+                        data_file_writer.as_mut().unwrap().add_entry(entry)?;
+                    }
+                    DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
+                        if delete_file_writer.is_none() {
+                            delete_file_writer = Some(
+                                self.new_manifest_writer(&ManifestContentType::Deletes, spec_id)?,
+                            );
+                        }
+                        delete_file_writer.as_mut().unwrap().add_entry(entry)?;
+                    }
+                }
+            }
+            if let Some(writer) = data_file_writer {
+                deleted_manifests.push(writer.write_manifest_file().await?);
+            }
+            if let Some(writer) = delete_file_writer {
+                deleted_manifests.push(writer.write_manifest_file().await?);
+            }
+        }
+
+        Ok(deleted_manifests)
     }
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
@@ -583,20 +987,27 @@ impl<'a> SnapshotProduceAction<'a> {
     ) -> Result<Vec<ManifestFile>> {
         let mut manifest_files = vec![];
         let data_files = std::mem::take(&mut self.added_data_files);
-        let delete_files = std::mem::take(&mut self.added_delete_files);
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if !data_files.is_empty() {
             let added_manifest = self.write_added_manifest(data_files).await?;
             manifest_files.push(added_manifest);
         }
-        if !delete_files.is_empty() {
-            let added_delete_manifest = self.write_added_manifest(delete_files).await?;
+        if !added_delete_files.is_empty() {
+            let added_delete_manifest = self.write_added_manifest(added_delete_files).await?;
             manifest_files.push(added_delete_manifest);
         }
-        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
+        let delete_manifests = self
+            .write_delete_manifest(snapshot_produce_operation.delete_entries(self).await?)
+            .await?;
+        manifest_files.extend(delete_manifests);
+
+        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         manifest_files.extend(existing_manifests);
-        let manifest_files = manifest_process.process_manifeset(manifest_files);
-        Ok(manifest_files)
+
+        manifest_process
+            .process_manifest(self, manifest_files)
+            .await
     }
 
     // # TODO
@@ -779,6 +1190,175 @@ impl<'a> ReplaceSortOrderAction<'a> {
     }
 }
 
+/// Transaction action for rewriting files.
+#[allow(dead_code)]
+pub struct RewriteFilesAction<'a> {
+    snapshot_produce_action: SnapshotProduceAction<'a>,
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+    merge_enabled: bool,
+}
+
+#[allow(dead_code)]
+struct RewriteFilesOperation;
+
+impl<'a> RewriteFilesAction<'a> {
+    #[allow(dead_code)]
+    fn new(
+        tx: Transaction<'a>,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        key_metadata: Vec<u8>,
+        snapshot_properties: HashMap<String, String>,
+    ) -> Result<Self> {
+        let target_size_bytes: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_TARGET_SIZE_BYTES)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_TARGET_SIZE_BYTES_DEFAULT);
+        let min_count_to_merge: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MIN_MERGE_COUNT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MIN_MERGE_COUNT_DEFAULT);
+        let merge_enabled = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MERGE_ENABLED)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
+
+        Ok(Self {
+            snapshot_produce_action: SnapshotProduceAction::new(
+                tx,
+                snapshot_id,
+                key_metadata,
+                commit_uuid,
+                snapshot_properties,
+            )
+            .unwrap(),
+            target_size_bytes,
+            min_count_to_merge,
+            merge_enabled,
+        })
+    }
+
+    /// Add data files to the snapshot.
+
+    pub fn add_data_files(
+        &mut self,
+        data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        self.snapshot_produce_action.add_data_files(data_files)?;
+        Ok(self)
+    }
+
+    /// Add remove files to the snapshot.
+    pub fn delete_files(
+        &mut self,
+        remove_data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        self.snapshot_produce_action
+            .delete_files(remove_data_files)?;
+        Ok(self)
+    }
+
+    /// Finished building the action and apply it to the transaction.
+    pub async fn apply(self) -> Result<Transaction<'a>> {
+        if self.merge_enabled {
+            let process = MergeManifestProcess {
+                target_size_bytes: self.target_size_bytes,
+                min_count_to_merge: self.min_count_to_merge,
+            };
+            self.snapshot_produce_action
+                .apply(RewriteFilesOperation, process)
+                .await
+        } else {
+            self.snapshot_produce_action
+                .apply(RewriteFilesOperation, DefaultManifestProcess)
+                .await
+        }
+    }
+}
+
+impl SnapshotProduceOperation for RewriteFilesOperation {
+    fn operation(&self) -> Operation {
+        Operation::Replace
+    }
+
+    async fn delete_entries(
+        &self,
+        snapshot_produce: &SnapshotProduceAction<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        // generate delete manifest entries from removed files
+        let format_version = snapshot_produce
+            .tx
+            .current_table
+            .metadata()
+            .format_version();
+
+        let gen_manifest_entry = |data_file: &DataFile| {
+            let builder = ManifestEntry::builder()
+                .status(ManifestStatus::Deleted)
+                .data_file(data_file.clone());
+            if format_version == FormatVersion::V1 {
+                builder.snapshot_id(snapshot_produce.snapshot_id).build()
+            } else {
+                // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
+                // commit failed.
+                builder.build()
+            }
+        };
+
+        let data_manifest_entries = snapshot_produce
+            .removed_data_files
+            .iter()
+            .map(gen_manifest_entry);
+
+        let delete_manifest_entries = snapshot_produce
+            .removed_delete_files
+            .iter()
+            .map(gen_manifest_entry);
+
+        Ok(data_manifest_entries
+            .chain(delete_manifest_entries)
+            .collect())
+    }
+
+    async fn existing_manifest(
+        &self,
+        snapshot_produce: &SnapshotProduceAction<'_>,
+    ) -> Result<Vec<ManifestFile>> {
+        let Some(snapshot) = snapshot_produce
+            .tx
+            .current_table
+            .metadata()
+            .current_snapshot()
+        else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(
+                snapshot_produce.tx.current_table.file_io(),
+                snapshot_produce.tx.current_table.metadata(),
+            )
+            .await?;
+
+        Ok(manifest_list
+            .entries()
+            .iter()
+            .filter(|entry| entry.has_added_files() || entry.has_existing_files())
+            .cloned()
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -838,6 +1418,25 @@ mod tests {
             "{}/testdata/table_metadata/{}",
             env!("CARGO_MANIFEST_DIR"),
             "TableMetadataV2ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .build()
+            .unwrap()
+    }
+
+    fn make_v2_table_with_mutli_snapshot() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2ValidMultiSnapshot.json"
         ))
         .unwrap();
         let reader = BufReader::new(file);
@@ -1131,5 +1730,89 @@ mod tests {
         );
         // Upgrade v2 to v1, return error.
         assert!(tx.upgrade_table_version(FormatVersion::V1).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_remove_snapshot_action() {
+        let table = make_v2_table_with_mutli_snapshot();
+        let table_meta = table.metadata().clone();
+        assert_eq!(5, table_meta.snapshots().count());
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx.expire_snapshot().apply().await.unwrap();
+            assert_eq!(4, tx.updates.len());
+
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.current_table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx.expire_snapshot().retain_last(2).apply().await.unwrap();
+            assert_eq!(3, tx.updates.len());
+
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.current_table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .expire_snapshot()
+                .retain_last(100)
+                .expire_older_than(100)
+                .apply()
+                .await
+                .unwrap();
+            assert_eq!(0, tx.updates.len());
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.current_table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            // test remove main current snapshot
+            let tx = Transaction::new(&table);
+            let err = tx
+                .expire_snapshot()
+                .expire_snapshot_id(table.metadata().current_snapshot_id().unwrap())
+                .apply()
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                "DataInvalid => Cannot remove snapshot 3067729675574597004 with retained references: [\"main\"]",
+                err.to_string()
+            )
+        }
     }
 }
