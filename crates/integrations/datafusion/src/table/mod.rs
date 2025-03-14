@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod flie_scan_task_table_provider;
 pub mod table_provider_factory;
 
 use std::any::Any;
