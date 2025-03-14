@@ -723,6 +723,9 @@ struct SnapshotProduceAction<'a> {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
+    removed_data_files: Vec<DataFile>,
+    removed_delete_files: Vec<DataFile>,
+
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -744,6 +747,8 @@ impl<'a> SnapshotProduceAction<'a> {
             snapshot_properties,
             added_data_files: vec![],
             added_delete_files: vec![],
+            removed_data_files: vec![],
+            removed_delete_files: vec![],
             manifest_counter: (0..),
             key_metadata,
         })
@@ -797,6 +802,27 @@ impl<'a> SnapshotProduceAction<'a> {
                 self.added_data_files.push(data_file);
             } else {
                 self.added_delete_files.push(data_file);
+            }
+        }
+        Ok(self)
+    }
+
+    /// Add remove files to the snapshot.
+    #[allow(dead_code)]
+    pub fn delete_files(
+        &mut self,
+        remove_data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        // let data_files: Vec<DataFile> = remove_data_files.into_iter().collect();
+        for data_file in remove_data_files.into_iter() {
+            Self::validate_partition_value(
+                data_file.partition(),
+                self.tx.current_table.metadata().default_partition_type(),
+            )?;
+            if data_file.content_type() == DataContentType::Data {
+                self.removed_data_files.push(data_file);
+            } else {
+                self.removed_delete_files.push(data_file);
             }
         }
         Ok(self)
@@ -881,7 +907,7 @@ impl<'a> SnapshotProduceAction<'a> {
         };
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
+                .status(ManifestStatus::Added)
                 .data_file(data_file);
             if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
@@ -1161,6 +1187,175 @@ impl<'a> ReplaceSortOrderAction<'a> {
 
         self.sort_fields.push(sort_field);
         Ok(self)
+    }
+}
+
+/// Transaction action for rewriting files.
+#[allow(dead_code)]
+pub struct RewriteFilesAction<'a> {
+    snapshot_produce_action: SnapshotProduceAction<'a>,
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+    merge_enabled: bool,
+}
+
+#[allow(dead_code)]
+struct RewriteFilesOperation;
+
+impl<'a> RewriteFilesAction<'a> {
+    #[allow(dead_code)]
+    fn new(
+        tx: Transaction<'a>,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        key_metadata: Vec<u8>,
+        snapshot_properties: HashMap<String, String>,
+    ) -> Result<Self> {
+        let target_size_bytes: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_TARGET_SIZE_BYTES)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_TARGET_SIZE_BYTES_DEFAULT);
+        let min_count_to_merge: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MIN_MERGE_COUNT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MIN_MERGE_COUNT_DEFAULT);
+        let merge_enabled = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MERGE_ENABLED)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
+
+        Ok(Self {
+            snapshot_produce_action: SnapshotProduceAction::new(
+                tx,
+                snapshot_id,
+                key_metadata,
+                commit_uuid,
+                snapshot_properties,
+            )
+            .unwrap(),
+            target_size_bytes,
+            min_count_to_merge,
+            merge_enabled,
+        })
+    }
+
+    /// Add data files to the snapshot.
+
+    pub fn add_data_files(
+        &mut self,
+        data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        self.snapshot_produce_action.add_data_files(data_files)?;
+        Ok(self)
+    }
+
+    /// Add remove files to the snapshot.
+    pub fn delete_files(
+        &mut self,
+        remove_data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        self.snapshot_produce_action
+            .delete_files(remove_data_files)?;
+        Ok(self)
+    }
+
+    /// Finished building the action and apply it to the transaction.
+    pub async fn apply(self) -> Result<Transaction<'a>> {
+        if self.merge_enabled {
+            let process = MergeManifestProcess {
+                target_size_bytes: self.target_size_bytes,
+                min_count_to_merge: self.min_count_to_merge,
+            };
+            self.snapshot_produce_action
+                .apply(RewriteFilesOperation, process)
+                .await
+        } else {
+            self.snapshot_produce_action
+                .apply(RewriteFilesOperation, DefaultManifestProcess)
+                .await
+        }
+    }
+}
+
+impl SnapshotProduceOperation for RewriteFilesOperation {
+    fn operation(&self) -> Operation {
+        Operation::Replace
+    }
+
+    async fn delete_entries(
+        &self,
+        snapshot_produce: &SnapshotProduceAction<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        // generate delete manifest entries from removed files
+        let format_version = snapshot_produce
+            .tx
+            .current_table
+            .metadata()
+            .format_version();
+
+        let gen_manifest_entry = |data_file: &DataFile| {
+            let builder = ManifestEntry::builder()
+                .status(ManifestStatus::Deleted)
+                .data_file(data_file.clone());
+            if format_version == FormatVersion::V1 {
+                builder.snapshot_id(snapshot_produce.snapshot_id).build()
+            } else {
+                // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
+                // commit failed.
+                builder.build()
+            }
+        };
+
+        let data_manifest_entries = snapshot_produce
+            .removed_data_files
+            .iter()
+            .map(|data_file| gen_manifest_entry(data_file));
+
+        let delete_manifest_entries = snapshot_produce
+            .removed_delete_files
+            .iter()
+            .map(|data_file| gen_manifest_entry(data_file));
+
+        Ok(data_manifest_entries
+            .chain(delete_manifest_entries)
+            .collect())
+    }
+
+    async fn existing_manifest(
+        &self,
+        snapshot_produce: &SnapshotProduceAction<'_>,
+    ) -> Result<Vec<ManifestFile>> {
+        let Some(snapshot) = snapshot_produce
+            .tx
+            .current_table
+            .metadata()
+            .current_snapshot()
+        else {
+            return Ok(vec![]);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(
+                snapshot_produce.tx.current_table.file_io(),
+                snapshot_produce.tx.current_table.metadata(),
+            )
+            .await?;
+
+        Ok(manifest_list
+            .entries()
+            .iter()
+            .filter(|entry| entry.has_added_files() || entry.has_existing_files())
+            .cloned()
+            .collect())
     }
 }
 
