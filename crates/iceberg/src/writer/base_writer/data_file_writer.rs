@@ -76,6 +76,7 @@ impl<B: FileWriterBuilder> IcebergWriter for DataFileWriter<B> {
             .map(|mut res| {
                 res.content(DataContentType::Data);
                 res.partition(self.partition_value.clone());
+                res.partition_spec_id(0);
                 res.build().expect("Guaranteed to be valid")
             })
             .collect_vec())
