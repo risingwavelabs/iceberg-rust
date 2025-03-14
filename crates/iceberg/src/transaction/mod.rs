@@ -56,7 +56,7 @@ use std::collections::HashMap;
 
 pub use action::*;
 mod append;
-pub mod remove_snapshots;
+mod remove_snapshots;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -67,7 +67,9 @@ mod upgrade_format_version;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use append::{MANIFEST_MERGE_ENABLED, MANIFEST_MIN_MERGE_COUNT, MANIFEST_TARGET_SIZE_BYTES};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+use remove_snapshots::RemoveSnapshotAction;
 
 use crate::error::Result;
 use crate::spec::{
@@ -77,9 +79,7 @@ use crate::spec::{
     PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS, PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT,
 };
 use crate::table::Table;
-use crate::transaction::action::BoxedTransactionAction;
-use crate::transaction::append::FastAppendAction;
-use crate::transaction::remove_snapshots::RemoveSnapshotAction;
+use crate::transaction::append::{FastAppendAction, MergeAppendAction};
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -150,6 +150,11 @@ impl Transaction {
         FastAppendAction::new()
     }
 
+    /// Creates a merge append action.
+    pub fn merge_append(&self) -> MergeAppendAction {
+        MergeAppendAction::new()
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
@@ -169,7 +174,7 @@ impl Transaction {
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
     }
-    
+
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
