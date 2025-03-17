@@ -1334,6 +1334,7 @@ async fn added_files_between(
             let manifest = object_cache.get_manifest(manifest_file).await?;
             let entries = manifest.entries().iter().filter(|entry| {
                 matches!(entry.status(), ManifestStatus::Added)
+                    && matches!(entry.data_file().content_type(), DataContentType::Data)
                     && (
                         // Is it possible that the snapshot id here is not contained?
                         entry.snapshot_id().is_none()
