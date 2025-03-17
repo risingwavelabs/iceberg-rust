@@ -1338,7 +1338,7 @@ mod tests {
         let mut action = tx.fast_append(None, None, vec![]).unwrap();
 
         // check add data file with incompatible partition value
-        let data_file = DataFileBuilder::default()
+        let data_file = DataFileBuilder::default().partition_spec_id(0)
             .content(DataContentType::Data)
             .file_path("test/3.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
@@ -1349,7 +1349,7 @@ mod tests {
             .unwrap();
         assert!(action.add_data_files(vec![data_file.clone()]).is_err());
 
-        let data_file = DataFileBuilder::default()
+        let data_file = DataFileBuilder::default().partition_spec_id(0)
             .content(DataContentType::Data)
             .file_path("test/3.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
