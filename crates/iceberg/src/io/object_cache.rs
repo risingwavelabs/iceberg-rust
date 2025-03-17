@@ -276,7 +276,7 @@ mod tests {
                     ManifestEntry::builder()
                         .status(ManifestStatus::Added)
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/1.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)

@@ -318,7 +318,7 @@ mod test {
                 location_gen.clone(),
                 file_name_gen.clone(),
             );
-            DataFileWriterBuilder::new(pw.clone(), None)
+            DataFileWriterBuilder::new(pw.clone(), None, 0)
         };
         let position_delete_writer_builder = {
             let pw = ParquetWriterBuilder::new(
