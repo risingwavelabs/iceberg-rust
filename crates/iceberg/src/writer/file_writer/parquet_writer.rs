@@ -492,6 +492,7 @@ impl ParquetWriter {
             .file_path(file_path)
             .file_format(DataFileFormat::Parquet)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .record_count(metadata.file_metadata().num_rows() as u64)
             .file_size_in_bytes(written_size as u64)
             .column_sizes(column_sizes)
@@ -840,6 +841,7 @@ mod tests {
             // Put dummy field for build successfully.
             .content(crate::spec::DataContentType::Data)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .build()
             .unwrap();
 
@@ -1035,6 +1037,7 @@ mod tests {
             // Put dummy field for build successfully.
             .content(crate::spec::DataContentType::Data)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .build()
             .unwrap();
 
@@ -1225,6 +1228,7 @@ mod tests {
             // Put dummy field for build successfully.
             .content(crate::spec::DataContentType::Data)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .build()
             .unwrap();
 
@@ -1373,6 +1377,7 @@ mod tests {
             .unwrap()
             .content(crate::spec::DataContentType::Data)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .build()
             .unwrap();
         assert_eq!(
@@ -1425,6 +1430,7 @@ mod tests {
             .unwrap()
             .content(crate::spec::DataContentType::Data)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .build()
             .unwrap();
         assert_eq!(
@@ -1483,6 +1489,7 @@ mod tests {
             .unwrap()
             .content(crate::spec::DataContentType::Data)
             .partition(Struct::empty())
+            .partition_spec_id(0)
             .build()
             .unwrap();
         assert_eq!(
@@ -1537,7 +1544,7 @@ mod tests {
         //     .next()
         //     .unwrap()
         //     .content(crate::spec::DataContentType::Data)
-        //     .partition(Struct::empty())
+        //     .partition(Struct::empty()).partition_spec_id(0)
         //     .build()
         //     .unwrap();
         // assert_eq!(
