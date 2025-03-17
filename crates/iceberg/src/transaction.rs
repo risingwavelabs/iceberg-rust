@@ -1371,6 +1371,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         let removed_data_files_set = snapshot_produce
             .removed_data_files
             .iter()
+            .chain(snapshot_produce.removed_delete_files.iter())
             .map(|data_file| data_file.file_path().to_string())
             .collect::<HashSet<_>>();
 
@@ -1379,10 +1380,16 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 .load_manifest(snapshot_produce.tx.current_table.file_io())
                 .await?;
 
-            let found_deleted_data_files: Vec<_> = manifest
+            let found_deleted_data_files: HashSet<_> = manifest
                 .entries()
                 .iter()
-                .filter(|entry| removed_data_files_set.contains(entry.data_file().file_path()))
+                .filter_map(|entry| {
+                    if removed_data_files_set.contains(entry.data_file().file_path()) {
+                        Some(entry.data_file().file_path().to_string())
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             if found_deleted_data_files.is_empty() {
@@ -1407,7 +1414,9 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     )?;
 
                     for entry in existing_entries {
-                        manifest_writer.add_existing_entry((*entry).clone())?;
+                        if !found_deleted_data_files.contains(entry.data_file().file_path()) {
+                            manifest_writer.add_entry((*entry).clone())?;
+                        }
                     }
 
                     existing_files.push(manifest_writer.write_manifest_file().await?);
@@ -1618,7 +1627,8 @@ mod tests {
         let mut action = tx.fast_append(None, None, vec![]).unwrap();
 
         // check add data file with incompatible partition value
-        let data_file = DataFileBuilder::default().partition_spec_id(0)
+        let data_file = DataFileBuilder::default()
+            .partition_spec_id(0)
             .content(DataContentType::Data)
             .file_path("test/3.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
@@ -1629,7 +1639,8 @@ mod tests {
             .unwrap();
         assert!(action.add_data_files(vec![data_file.clone()]).is_err());
 
-        let data_file = DataFileBuilder::default().partition_spec_id(0)
+        let data_file = DataFileBuilder::default()
+            .partition_spec_id(0)
             .content(DataContentType::Data)
             .file_path("test/3.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
