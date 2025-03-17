@@ -1308,7 +1308,7 @@ pub mod tests {
                     ManifestEntry::builder()
                         .status(ManifestStatus::Added)
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/1.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
@@ -1330,7 +1330,7 @@ pub mod tests {
                         .sequence_number(parent_snapshot.sequence_number())
                         .file_sequence_number(parent_snapshot.sequence_number())
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/2.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
@@ -1351,7 +1351,7 @@ pub mod tests {
                         .sequence_number(parent_snapshot.sequence_number())
                         .file_sequence_number(parent_snapshot.sequence_number())
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/3.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
@@ -1521,7 +1521,7 @@ pub mod tests {
                     ManifestEntry::builder()
                         .status(ManifestStatus::Added)
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/1.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
@@ -1544,7 +1544,7 @@ pub mod tests {
                         .sequence_number(parent_snapshot.sequence_number())
                         .file_sequence_number(parent_snapshot.sequence_number())
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/2.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
@@ -1566,7 +1566,7 @@ pub mod tests {
                         .sequence_number(parent_snapshot.sequence_number())
                         .file_sequence_number(parent_snapshot.sequence_number())
                         .data_file(
-                            DataFileBuilder::default()
+                            DataFileBuilder::default().partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/3.parquet", &self.table_location))
                                 .file_format(DataFileFormat::Parquet)
