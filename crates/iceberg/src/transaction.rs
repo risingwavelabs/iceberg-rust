@@ -484,7 +484,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
 
     async fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProduceAction<'_>,
+        snapshot_produce: &mut SnapshotProduceAction<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce
             .tx
@@ -520,7 +520,7 @@ trait SnapshotProduceOperation: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send;
     fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProduceAction,
+        snapshot_produce: &mut SnapshotProduceAction,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
@@ -1348,7 +1348,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 
     async fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProduceAction<'_>,
+        snapshot_produce: &mut SnapshotProduceAction<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce
             .tx
@@ -1366,12 +1366,56 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             )
             .await?;
 
-        Ok(manifest_list
-            .entries()
+        let mut existing_files = Vec::new();
+
+        let removed_data_files_set = snapshot_produce
+            .removed_data_files
             .iter()
-            .filter(|entry| entry.has_added_files() || entry.has_existing_files())
-            .cloned()
-            .collect())
+            .map(|data_file| data_file.file_path().to_string())
+            .collect::<HashSet<_>>();
+
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(snapshot_produce.tx.current_table.file_io())
+                .await?;
+
+            let found_deleted_data_files: Vec<_> = manifest
+                .entries()
+                .iter()
+                .filter(|entry| removed_data_files_set.contains(entry.data_file().file_path()))
+                .collect();
+
+            if found_deleted_data_files.is_empty() {
+                existing_files.push(manifest_file.clone());
+            } else {
+                // Rewrite the manifest file without the deleted data files
+                let existing_entries: Vec<_> = manifest
+                    .entries()
+                    .iter()
+                    .filter(|entry| !removed_data_files_set.contains(entry.data_file().file_path()))
+                    .cloned()
+                    .collect();
+
+                if !existing_entries.is_empty() {
+                    let mut manifest_writer = snapshot_produce.new_manifest_writer(
+                        &ManifestContentType::Data,
+                        snapshot_produce
+                            .tx
+                            .current_table
+                            .metadata()
+                            .default_partition_spec_id(),
+                    )?;
+
+                    for entry in existing_entries {
+                        manifest_writer.add_existing_entry((*entry).clone())?;
+                    }
+
+                    existing_files.push(manifest_writer.write_manifest_file().await?);
+                }
+            }
+        }
+
+        Ok(existing_files)
     }
 }
 
