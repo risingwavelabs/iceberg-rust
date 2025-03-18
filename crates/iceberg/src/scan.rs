@@ -1304,7 +1304,11 @@ fn ancestors_between(
 }
 
 /// Get all added files between two snapshots.
-/// The files in `latest_snapshot_id` (inclusive) but not in `oldest_snapshot_id` (exclusive).
+/// - data files in `Append` and `Overwrite` snapshots are included.
+/// - delete files are ignored
+/// - `Replace` snapshots (e.g., compaction) are ignored.
+///
+/// `latest_snapshot_id` is inclusive, `oldest_snapshot_id` is exclusive.
 async fn added_files_between(
     object_cache: &ObjectCache,
     table_metadata: &TableMetadataRef,
@@ -1313,16 +1317,20 @@ async fn added_files_between(
 ) -> Result<Vec<ManifestEntryRef>> {
     let mut added_files = vec![];
 
-    let append_snapshots =
-        ancestors_between(table_metadata, latest_snapshot_id, oldest_snapshot_id)
-            .filter(|snapshot| matches!(snapshot.summary().operation, Operation::Append))
-            .collect_vec();
-    let snapshot_ids: HashSet<i64> = append_snapshots
+    let snapshots = ancestors_between(table_metadata, latest_snapshot_id, oldest_snapshot_id)
+        .filter(|snapshot| {
+            matches!(
+                snapshot.summary().operation,
+                Operation::Append | Operation::Overwrite
+            )
+        })
+        .collect_vec();
+    let snapshot_ids: HashSet<i64> = snapshots
         .iter()
         .map(|snapshot| snapshot.snapshot_id())
         .collect();
 
-    for snapshot in append_snapshots {
+    for snapshot in snapshots {
         let manifest_list = object_cache
             .get_manifest_list(&snapshot, table_metadata)
             .await?;
