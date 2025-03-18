@@ -742,6 +742,10 @@ struct SnapshotProduceAction<'a> {
     removed_data_files: Vec<DataFile>,
     removed_delete_files: Vec<DataFile>,
 
+    // for filtering out files that are removed by action
+    removed_data_file_paths: HashSet<String>,
+    removed_delete_file_paths: HashSet<String>,
+
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -765,6 +769,8 @@ impl<'a> SnapshotProduceAction<'a> {
             added_delete_files: vec![],
             removed_data_files: vec![],
             removed_delete_files: vec![],
+            removed_data_file_paths: HashSet::new(),
+            removed_delete_file_paths: HashSet::new(),
             manifest_counter: (0..),
             key_metadata,
         })
@@ -836,8 +842,12 @@ impl<'a> SnapshotProduceAction<'a> {
                 self.tx.current_table.metadata().default_partition_type(),
             )?;
             if data_file.content_type() == DataContentType::Data {
+                self.removed_data_file_paths
+                    .insert(data_file.file_path.clone());
                 self.removed_data_files.push(data_file);
             } else {
+                self.removed_delete_file_paths
+                    .insert(data_file.file_path.clone());
                 self.removed_delete_files.push(data_file);
             }
         }
@@ -973,7 +983,7 @@ impl<'a> SnapshotProduceAction<'a> {
                                 self.new_manifest_writer(&ManifestContentType::Data, spec_id)?,
                             );
                         }
-                        data_file_writer.as_mut().unwrap().add_entry(entry)?;
+                        data_file_writer.as_mut().unwrap().add_delete_entry(entry)?;
                     }
                     DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
                         if delete_file_writer.is_none() {
@@ -981,7 +991,10 @@ impl<'a> SnapshotProduceAction<'a> {
                                 self.new_manifest_writer(&ManifestContentType::Deletes, spec_id)?,
                             );
                         }
-                        delete_file_writer.as_mut().unwrap().add_entry(entry)?;
+                        delete_file_writer
+                            .as_mut()
+                            .unwrap()
+                            .add_delete_entry(entry)?;
                     }
                 }
             }
@@ -1312,38 +1325,62 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         snapshot_produce: &SnapshotProduceAction<'_>,
     ) -> Result<Vec<ManifestEntry>> {
         // generate delete manifest entries from removed files
-        let format_version = snapshot_produce
+        let snapshot = snapshot_produce
             .tx
             .current_table
             .metadata()
-            .format_version();
+            .current_snapshot();
 
-        let gen_manifest_entry = |data_file: &DataFile| {
-            let builder = ManifestEntry::builder()
-                .status(ManifestStatus::Deleted)
-                .data_file(data_file.clone());
-            if format_version == FormatVersion::V1 {
-                builder.snapshot_id(snapshot_produce.snapshot_id).build()
-            } else {
-                // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
-                // commit failed.
+        if let Some(snapshot) = snapshot {
+            let gen_manifest_entry = |old_entry: &Arc<ManifestEntry>| {
+                let builder = ManifestEntry::builder()
+                    .status(ManifestStatus::Deleted)
+                    .snapshot_id(old_entry.snapshot_id().unwrap())
+                    .sequence_number(old_entry.sequence_number().unwrap())
+                    .file_sequence_number(old_entry.file_sequence_number().unwrap())
+                    .data_file(old_entry.data_file().clone());
+
                 builder.build()
+            };
+
+            let manifest_list = snapshot
+                .load_manifest_list(
+                    snapshot_produce.tx.current_table.file_io(),
+                    snapshot_produce.tx.current_table.metadata(),
+                )
+                .await?;
+
+            let mut deleted_entries = Vec::new();
+
+            for manifest_file in manifest_list.entries() {
+                let manifest = manifest_file
+                    .load_manifest(snapshot_produce.tx.current_table.file_io())
+                    .await?;
+
+                for entry in manifest.entries() {
+                    if entry.content_type() == DataContentType::Data
+                        && snapshot_produce
+                            .removed_data_file_paths
+                            .contains(entry.data_file().file_path())
+                    {
+                        deleted_entries.push(gen_manifest_entry(entry));
+                    }
+
+                    if entry.content_type() == DataContentType::PositionDeletes
+                        || entry.content_type() == DataContentType::EqualityDeletes
+                            && snapshot_produce
+                                .removed_delete_file_paths
+                                .contains(entry.data_file().file_path())
+                    {
+                        deleted_entries.push(gen_manifest_entry(entry));
+                    }
+                }
             }
-        };
 
-        let data_manifest_entries = snapshot_produce
-            .removed_data_files
-            .iter()
-            .map(gen_manifest_entry);
-
-        let delete_manifest_entries = snapshot_produce
-            .removed_delete_files
-            .iter()
-            .map(gen_manifest_entry);
-
-        Ok(data_manifest_entries
-            .chain(delete_manifest_entries)
-            .collect())
+            Ok(deleted_entries)
+        } else {
+            Ok(vec![])
+        }
     }
 
     async fn existing_manifest(
@@ -1368,13 +1405,6 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 
         let mut existing_files = Vec::new();
 
-        let removed_data_files_set = snapshot_produce
-            .removed_data_files
-            .iter()
-            .chain(snapshot_produce.removed_delete_files.iter())
-            .map(|data_file| data_file.file_path().to_string())
-            .collect::<HashSet<_>>();
-
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file
                 .load_manifest(snapshot_produce.tx.current_table.file_io())
@@ -1384,7 +1414,10 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 .entries()
                 .iter()
                 .filter_map(|entry| {
-                    if removed_data_files_set.contains(entry.data_file().file_path()) {
+                    if snapshot_produce
+                        .removed_data_file_paths
+                        .contains(entry.data_file().file_path())
+                    {
                         Some(entry.data_file().file_path().to_string())
                     } else {
                         None
@@ -1399,7 +1432,11 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 let existing_entries: Vec<_> = manifest
                     .entries()
                     .iter()
-                    .filter(|entry| !removed_data_files_set.contains(entry.data_file().file_path()))
+                    .filter(|entry| {
+                        !snapshot_produce
+                            .removed_data_file_paths
+                            .contains(entry.data_file().file_path())
+                    })
                     .cloned()
                     .collect();
 
@@ -1885,5 +1922,138 @@ mod tests {
                 err.to_string()
             )
         }
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_action() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+        let mut action = tx.rewrite_files(None, vec![]).unwrap();
+
+        // check add data file with incompatible partition value
+        let data_file_1 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/4.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(1))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![data_file_1.clone()]).unwrap();
+
+        let data_file_2 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/5.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(2))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![data_file_2.clone()]).unwrap();
+
+        let tx = action.apply().await.unwrap();
+
+        // check updates and requirements
+        assert!(
+            matches!((&tx.updates[0],&tx.updates[1]), (TableUpdate::AddSnapshot { snapshot },TableUpdate::SetSnapshotRef { reference,ref_name }) if snapshot.snapshot_id() == reference.snapshot_id && ref_name == MAIN_BRANCH)
+        );
+        // requriments is based on original table metadata
+        assert_eq!(
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid()
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: table.metadata().current_snapshot_id()
+                }
+            ],
+            tx.requirements
+        );
+
+        // check manifest list
+        let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &tx.updates[0] {
+            snapshot
+        } else {
+            unreachable!()
+        };
+
+        let manifest_list = new_snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        assert_eq!(1, manifest_list.entries().len());
+
+        // Load the manifest from the manifest list
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+
+        // Check that the manifest contains one entry.
+        assert_eq!(2, manifest.entries().len());
+
+        assert_eq!(
+            new_snapshot.snapshot_id(),
+            manifest.entries()[0].snapshot_id().unwrap()
+        );
+        assert_eq!(data_file_1, *manifest.entries()[0].data_file());
+
+        // rewrite files with new data file
+
+        let data_file_3 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/6.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(3))]))
+            .build()
+            .unwrap();
+
+        let mut action = tx.rewrite_files(None, vec![]).unwrap();
+        action.add_data_files(vec![data_file_3.clone()]).unwrap();
+        action.delete_files(vec![data_file_1.clone()]).unwrap();
+        action.delete_files(vec![data_file_2.clone()]).unwrap();
+
+        let tx = action.apply().await.unwrap();
+
+        // check updates and requirements
+        assert!(
+            matches!((&tx.updates[0],&tx.updates[1]), (TableUpdate::AddSnapshot { snapshot },TableUpdate::SetSnapshotRef { reference,ref_name }) if snapshot.snapshot_id() == reference.snapshot_id && ref_name == MAIN_BRANCH)
+        );
+
+        // requriments is based on original table metadata
+        assert_eq!(
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid()
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: table.metadata().current_snapshot_id()
+                }
+            ],
+            tx.requirements
+        );
+
+        // check manifest list
+        let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &tx.updates[0] {
+            snapshot
+        } else {
+            unreachable!()
+        };
+
+        let manifest_list = new_snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        assert_eq!(1, manifest_list.entries().len());
     }
 }
