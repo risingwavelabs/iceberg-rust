@@ -1379,10 +1379,16 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 .load_manifest(snapshot_produce.tx.current_table.file_io())
                 .await?;
 
-            let found_deleted_data_files: Vec<_> = manifest
+            let found_deleted_data_files: HashSet<_> = manifest
                 .entries()
                 .iter()
-                .filter(|entry| removed_data_files_set.contains(entry.data_file().file_path()))
+                .filter_map(|entry| {
+                    if removed_data_files_set.contains(entry.data_file().file_path()) {
+                        Some(entry.data_file().file_path().to_string())
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             if found_deleted_data_files.is_empty() {
@@ -1407,7 +1413,9 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     )?;
 
                     for entry in existing_entries {
-                        manifest_writer.add_existing_entry((*entry).clone())?;
+                        if !found_deleted_data_files.contains(entry.data_file().file_path()) {
+                            manifest_writer.add_entry((*entry).clone())?;
+                        }
                     }
 
                     existing_files.push(manifest_writer.write_manifest_file().await?);
