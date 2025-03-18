@@ -931,7 +931,7 @@ impl<'a> SnapshotProduceAction<'a> {
                                 self.new_manifest_writer(&ManifestContentType::Data, spec_id)?,
                             );
                         }
-                        data_file_writer.as_mut().unwrap().add_entry(entry)?;
+                        data_file_writer.as_mut().unwrap().add_delete_entry(entry)?;
                     }
                     DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
                         if delete_file_writer.is_none() {
@@ -939,7 +939,10 @@ impl<'a> SnapshotProduceAction<'a> {
                                 self.new_manifest_writer(&ManifestContentType::Deletes, spec_id)?,
                             );
                         }
-                        delete_file_writer.as_mut().unwrap().add_entry(entry)?;
+                        delete_file_writer
+                            .as_mut()
+                            .unwrap()
+                            .add_delete_entry(entry)?;
                     }
                 }
             }
