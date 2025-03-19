@@ -1471,8 +1471,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct,
-        TableMetadata,
+        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, ManifestStatus,
+        Struct, TableMetadata,
     };
     use crate::table::Table;
     use crate::transaction::{Transaction, MAIN_BRANCH};
@@ -2051,35 +2051,244 @@ mod tests {
             .await
             .unwrap();
 
-        for manifest in manifest_list.entries() {
-            let manifest = manifest.load_manifest(table.file_io()).await.unwrap();
-            // println!(
-            //     "RESULT manifest {:?} entries_len {} manifest_entries {:?}",
-            //     manifest,
-            //     manifest.entries().len(),
-            //     manifest.entries()
-            // );
+        assert_eq!(2, manifest_list.entries().len());
 
-            for e in manifest.entries() {
-                println!(
-                    "RESULT manifest entry {:?} {:?}",
-                    e.status(),
-                    e.data_file().file_path()
-                );
-            }
-        }
+        let manifest_0 = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(1, manifest_0.entries().len());
+        let entry_0 = manifest_0.entries()[0].clone();
+        assert_eq!(data_file_3, *entry_0.data_file());
+        assert_eq!(new_snapshot.snapshot_id(), entry_0.snapshot_id().unwrap());
+        assert_eq!(ManifestStatus::Added, entry_0.status());
+
+        let manifest_1 = manifest_list.entries()[1]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+
+        assert_eq!(2, manifest_1.entries().len());
+        let entry_1 = manifest_1.entries()[0].clone();
+        assert_eq!(data_file_1, *entry_1.data_file());
+        assert_eq!(ManifestStatus::Deleted, entry_1.status());
+        let entry_2 = manifest_1.entries()[1].clone();
+        assert_eq!(data_file_2, *entry_2.data_file());
+        assert_eq!(ManifestStatus::Deleted, entry_2.status());
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_action_with_delete_files() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+        let mut action = tx.fast_append(None, None, vec![]).unwrap();
+
+        // check add data file with incompatible partition value
+        let data_file_1 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/4.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(1))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![data_file_1.clone()]).unwrap();
+
+        let data_file_2 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/5.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(2))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![data_file_2.clone()]).unwrap();
+
+        let delete_file_1 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/6.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(3))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![delete_file_1.clone()]).unwrap();
+
+        let delete_file_2 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::EqualityDeletes)
+            .file_path("test/7.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(4))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![delete_file_2.clone()]).unwrap();
+
+        let tx = action.apply().await.unwrap();
+
+        // check updates and requirements
+        assert!(
+            matches!((&tx.updates[0],&tx.updates[1]), (TableUpdate::AddSnapshot { snapshot },TableUpdate::SetSnapshotRef { reference,ref_name }) if snapshot.snapshot_id() == reference.snapshot_id && ref_name == MAIN_BRANCH)
+        );
+
+        // requriments is based on original table metadata
+        assert_eq!(
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid()
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: table.metadata().current_snapshot_id()
+                }
+            ],
+            tx.requirements
+        );
+
+        // check manifest list
+        let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &tx.updates[0] {
+            snapshot
+        } else {
+            unreachable!()
+        };
+
+        let manifest_list = new_snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        assert_eq!(2, manifest_list.entries().len());
 
         // Load the manifest from the manifest list
-        // let manifest = manifest_list.entries()[0]
-        //     .load_manifest(table.file_io())
-        //     .await
-        //     .unwrap();
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
 
-        println!("RESULT new_snapshot {:?}", new_snapshot);
+        // Check that the manifest
+        assert_eq!(2, manifest.entries().len());
 
-        // println!("RESULT manifest entries: {:?}", manifest.entries());
+        assert_eq!(
+            new_snapshot.snapshot_id(),
+            manifest.entries()[0].snapshot_id().unwrap()
+        );
 
-        // Check that the manifest contains one entry.
-        // assert_eq!(1, manifest.entries().len());
+        assert_eq!(data_file_1, *manifest.entries()[0].data_file());
+        assert_eq!(data_file_2, *manifest.entries()[1].data_file());
+
+        let manifest = manifest_list.entries()[1]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+
+        assert_eq!(2, manifest.entries().len());
+        assert_eq!(
+            new_snapshot.snapshot_id(),
+            manifest.entries()[0].snapshot_id().unwrap()
+        );
+        assert_eq!(delete_file_1, *manifest.entries()[0].data_file());
+        assert_eq!(delete_file_2, *manifest.entries()[1].data_file());
+
+        // rewrite files with new data file
+
+        let data_file_3 = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/8.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(5))]))
+            .build()
+            .unwrap();
+
+        let mut action = tx.rewrite_files(None, vec![]).unwrap();
+        action.add_data_files(vec![data_file_3.clone()]).unwrap();
+        action.delete_files(vec![data_file_1.clone()]).unwrap();
+        action.delete_files(vec![data_file_2.clone()]).unwrap();
+        action.delete_files(vec![delete_file_1.clone()]).unwrap();
+        action.delete_files(vec![delete_file_2.clone()]).unwrap();
+
+        let tx = action.apply().await.unwrap();
+        // check updates and requirements
+
+        assert!(
+            matches!((&tx.updates[2],&tx.updates[3]), (TableUpdate::AddSnapshot { snapshot },TableUpdate::SetSnapshotRef { reference,ref_name }) if snapshot.snapshot_id() == reference.snapshot_id && ref_name == MAIN_BRANCH)
+        );
+
+        // requriments is based on original table metadata
+
+        assert_eq!(
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid()
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: table.metadata().current_snapshot_id()
+                }
+            ],
+            tx.requirements
+        );
+
+        // check manifest list
+
+        let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &tx.updates[2] {
+            snapshot
+        } else {
+            unreachable!()
+        };
+
+        let manifest_list = new_snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        assert_eq!(3, manifest_list.entries().len());
+
+        let manifest_0 = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+
+        assert_eq!(1, manifest_0.entries().len());
+        let entry_0 = manifest_0.entries()[0].clone();
+        assert_eq!(data_file_3, *entry_0.data_file());
+        assert_eq!(new_snapshot.snapshot_id(), entry_0.snapshot_id().unwrap());
+        assert_eq!(ManifestStatus::Added, entry_0.status());
+
+        let manifest_1 = manifest_list.entries()[1]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+
+        assert_eq!(2, manifest_1.entries().len());
+        let entry_1 = manifest_1.entries()[0].clone();
+        assert_eq!(data_file_1, *entry_1.data_file());
+        assert_eq!(ManifestStatus::Deleted, entry_1.status());
+        let entry_2 = manifest_1.entries()[1].clone();
+        assert_eq!(data_file_2, *entry_2.data_file());
+        assert_eq!(ManifestStatus::Deleted, entry_2.status());
+
+        let manifest_2 = manifest_list.entries()[2]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(2, manifest_2.entries().len());
+
+        let entry_3 = manifest_2.entries()[0].clone();
+        assert_eq!(delete_file_1, *entry_3.data_file());
+        assert_eq!(ManifestStatus::Deleted, entry_3.status());
+        let entry_4 = manifest_2.entries()[1].clone();
+        assert_eq!(delete_file_2, *entry_4.data_file());
+        assert_eq!(ManifestStatus::Deleted, entry_4.status());
     }
 }
