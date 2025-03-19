@@ -30,12 +30,12 @@ use crate::Result;
 pub struct DataFileWriterBuilder<B: FileWriterBuilder> {
     inner: B,
     partition_value: Option<Struct>,
-    partition_spec_id: i32,
+    partition_spec_id: Option<i32>,
 }
 
 impl<B: FileWriterBuilder> DataFileWriterBuilder<B> {
     /// Create a new `DataFileWriterBuilder` using a `FileWriterBuilder`.
-    pub fn new(inner: B, partition_value: Option<Struct>, partition_spec_id: i32) -> Self {
+    pub fn new(inner: B, partition_value: Option<Struct>, partition_spec_id: Option<i32>) -> Self {
         Self {
             inner,
             partition_value,
@@ -52,7 +52,7 @@ impl<B: FileWriterBuilder> IcebergWriterBuilder for DataFileWriterBuilder<B> {
         Ok(DataFileWriter {
             inner_writer: Some(self.inner.clone().build().await?),
             partition_value: self.partition_value.unwrap_or(Struct::empty()),
-            partition_spec_id: self.partition_spec_id,
+            partition_spec_id: self.partition_spec_id.unwrap_or(0),
         })
     }
 }
@@ -151,7 +151,7 @@ mod test {
             file_name_gen,
         );
 
-        let mut data_file_writer = DataFileWriterBuilder::new(pw, None, 0)
+        let mut data_file_writer = DataFileWriterBuilder::new(pw, None, None)
             .build()
             .await
             .unwrap();
@@ -223,7 +223,7 @@ mod test {
         );
 
         let mut data_file_writer =
-            DataFileWriterBuilder::new(parquet_writer_builder, Some(partition_value.clone()), 0)
+            DataFileWriterBuilder::new(parquet_writer_builder, Some(partition_value.clone()), None)
                 .build()
                 .await?;
 
