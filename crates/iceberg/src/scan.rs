@@ -242,6 +242,13 @@ impl<'a> TableScanBuilder<'a> {
                     "snapshot_id should not be set for incremental scan. Use from_snapshot_id and to_snapshot_id instead.",
                 ));
             }
+
+            if self.delete_file_processing_enabled {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "delete_file_processing_enabled should not be set for incremental scan",
+                ));
+            }
         }
 
         let snapshot = match self.snapshot_id {
@@ -796,6 +803,13 @@ impl PlanContext {
                 // - `Replace` snapshots (e.g., compaction) are ignored.
                 //
                 // `latest_snapshot_id` is inclusive, `oldest_snapshot_id` is exclusive.
+
+                // prevent misuse
+                assert!(
+                    delete_file_idx_and_tx.is_none(),
+                    "delete file is not supported in incremental scan mode"
+                );
+
                 let snapshots =
                     ancestors_between(&self.table_metadata, to_snapshot_id, self.from_snapshot_id)
                         .filter(|snapshot| {
