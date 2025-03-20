@@ -18,15 +18,18 @@
 //! This module contains transaction api.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::mem::discriminant;
+use std::hash::Hash;
+use std::mem::{self, discriminant};
 use std::ops::RangeFrom;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::StringArray;
 use futures::TryStreamExt;
+use itertools::Itertools;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -34,9 +37,10 @@ use crate::io::FileIO;
 use crate::remove_snapshots::RemoveSnapshotAction;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
-    NullOrder, Operation, Snapshot, SnapshotReference, SnapshotRetention, SortDirection, SortField,
-    SortOrder, Struct, StructType, Summary, Transform, MAIN_BRANCH,
+    ManifestFile, ManifestList, ManifestListWriter, ManifestStatus, ManifestWriter,
+    ManifestWriterBuilder, NullOrder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
+    SortDirection, SortField, SortOrder, Struct, StructType, Summary, Transform, MAIN_BRANCH,
+    UNASSIGNED_SEQUENCE_NUMBER, UNASSIGNED_SNAPSHOT_ID,
 };
 use crate::table::Table;
 use crate::utils::bin::ListPacker;
@@ -55,6 +59,9 @@ const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
 /// Whether allow to merge manifests.
 pub const MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
 const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
+/// Whether allow to inherit snapshot id.
+pub const SNAPSHOT_ID_INHERITANCE_ENABLED: &str = "compatibility.snapshot-id-inheritance.enabled";
+const SNAPSHOT_ID_INHERITANCE_ENABLED_DEFAULT: bool = false;
 
 /// Table transaction.
 pub struct Transaction<'a> {
@@ -239,6 +246,42 @@ impl<'a> Transaction<'a> {
             vec![],
         )?;
         Ok(self)
+    }
+
+    /// Rewrite manifest file.
+    pub fn rewrite_manifest<T: Hash + Eq>(
+        self,
+        cluster_by_func: Option<ClusterFunc<T>>,
+        manifest_predicate: Option<PredicateFunc>,
+        snapshot_id: Option<i64>,
+        commit_uuid: Option<Uuid>,
+        key_metadata: Vec<u8>,
+    ) -> Result<RewriteManifsetAction<'a, T>> {
+        let snapshot_id = if let Some(snapshot_id) = snapshot_id {
+            if self
+                .current_table
+                .metadata()
+                .snapshots()
+                .any(|s| s.snapshot_id() == snapshot_id)
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot id {} already exists", snapshot_id),
+                ));
+            }
+            snapshot_id
+        } else {
+            self.generate_unique_snapshot_id()
+        };
+        RewriteManifsetAction::new(
+            self,
+            cluster_by_func,
+            manifest_predicate,
+            snapshot_id,
+            commit_uuid.unwrap_or_else(Uuid::now_v7),
+            key_metadata,
+            HashMap::new(),
+        )
     }
 
     /// Commit transaction.
@@ -467,7 +510,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
     }
 
     async fn existing_manifest(
-        &self,
+        &mut self,
         snapshot_produce: &SnapshotProduceAction<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce
@@ -503,22 +546,17 @@ trait SnapshotProduceOperation: Send + Sync {
         snapshot_produce: &SnapshotProduceAction,
     ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send;
     fn existing_manifest(
-        &self,
+        &mut self,
         snapshot_produce: &SnapshotProduceAction,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+    fn summary(&mut self) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 struct DefaultManifestProcess;
 
-impl ManifestProcess for DefaultManifestProcess {
-    async fn process_manifest<'a>(
-        &self,
-        _snapshot_producer: &mut SnapshotProduceAction<'a>,
-        manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<ManifestFile>> {
-        Ok(manifests)
-    }
-}
+impl ManifestProcess for DefaultManifestProcess {}
 
 struct MergeManifestProcess {
     target_size_bytes: u32,
@@ -710,9 +748,15 @@ impl MergeManifestManager {
 trait ManifestProcess: Send + Sync {
     fn process_manifest<'a>(
         &self,
-        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        _snapshot_produce: &mut SnapshotProduceAction<'a>,
         manifests: Vec<ManifestFile>,
-    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send {
+        async { Ok(manifests) }
+    }
+    #[allow(unused)]
+    fn summary(&mut self) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 struct SnapshotProduceAction<'a> {
@@ -727,6 +771,7 @@ struct SnapshotProduceAction<'a> {
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
+    enable_inherit_snapshot_id: bool,
 }
 
 impl<'a> SnapshotProduceAction<'a> {
@@ -737,6 +782,15 @@ impl<'a> SnapshotProduceAction<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
     ) -> Result<Self> {
+        let enable_inherit_snapshot_id = tx.current_table.metadata().format_version()
+            > FormatVersion::V1
+            || tx
+                .current_table
+                .metadata()
+                .properties()
+                .get(SNAPSHOT_ID_INHERITANCE_ENABLED)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(SNAPSHOT_ID_INHERITANCE_ENABLED_DEFAULT);
         Ok(Self {
             tx,
             snapshot_id,
@@ -746,6 +800,7 @@ impl<'a> SnapshotProduceAction<'a> {
             added_delete_files: vec![],
             manifest_counter: (0..),
             key_metadata,
+            enable_inherit_snapshot_id,
         })
     }
 
@@ -959,7 +1014,7 @@ impl<'a> SnapshotProduceAction<'a> {
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
-        snapshot_produce_operation: &OP,
+        snapshot_produce_operation: &mut OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
         let mut manifest_files = vec![];
@@ -989,10 +1044,21 @@ impl<'a> SnapshotProduceAction<'a> {
 
     // # TODO
     // Fulfill this function
-    fn summary<OP: SnapshotProduceOperation>(&self, snapshot_produce_operation: &OP) -> Summary {
+    fn summary<OP: SnapshotProduceOperation, MP: ManifestProcess>(
+        &self,
+        snapshot_produce_operation: &mut OP,
+        manifest_process: &mut MP,
+    ) -> Summary {
+        let operation_summary = snapshot_produce_operation.summary();
+        let manifest_process = manifest_process.summary();
+
+        let mut combined_summary = self.snapshot_properties.clone();
+        combined_summary.extend(operation_summary);
+        combined_summary.extend(manifest_process);
+
         Summary {
             operation: snapshot_produce_operation.operation(),
-            additional_properties: self.snapshot_properties.clone(),
+            additional_properties: combined_summary,
         }
     }
 
@@ -1009,17 +1075,17 @@ impl<'a> SnapshotProduceAction<'a> {
     }
 
     /// Finished building the action and apply it to the transaction.
-    pub async fn apply<OP: SnapshotProduceOperation, MP: ManifestProcess>(
+    pub async fn apply(
         mut self,
-        snapshot_produce_operation: OP,
-        process: MP,
+        mut snapshot_produce_operation: impl SnapshotProduceOperation,
+        mut process: impl ManifestProcess,
     ) -> Result<Transaction<'a>> {
         let new_manifests = self
-            .manifest_file(&snapshot_produce_operation, &process)
+            .manifest_file(&mut snapshot_produce_operation, &process)
             .await?;
         let next_seq_num = self.tx.current_table.metadata().next_sequence_number();
 
-        let summary = self.summary(&snapshot_produce_operation);
+        let summary = self.summary(&mut snapshot_produce_operation, &mut process);
 
         let manifest_list_path = self.generate_manifest_list_file_path(0);
 
@@ -1164,6 +1230,362 @@ impl<'a> ReplaceSortOrderAction<'a> {
 
         self.sort_fields.push(sort_field);
         Ok(self)
+    }
+}
+
+/// New created manifest count during rewrite manifest action.
+pub const CREATED_MANIFESTS_COUNT: &str = "manifests-created";
+/// Kept manifest count during rewrite manifest action.
+pub const KEPT_MANIFESTS_COUNT: &str = "manifests-kept";
+/// Count of manifest been rewrite and delete during rewrite manifest action.
+pub const REPLACED_MANIFESTS_COUNT: &str = "manifests-replaced";
+/// Count of manifest entry been process during rewrite manifest action.
+pub const PROCESSED_ENTRY_COUNT: &str = "entries-processed";
+
+type ClusterFunc<T> = Box<dyn Fn(&DataFile) -> T>;
+type PredicateFunc = Box<dyn Fn(&ManifestFile) -> Pin<Box<dyn Future<Output = bool> + Send>>>;
+
+/// Action used for rewriting manifests for a table.
+pub struct RewriteManifsetAction<'a, T> {
+    cluster_by_func: Option<ClusterFunc<T>>,
+    manifset_predicate: Option<PredicateFunc>,
+    manifset_writers: HashMap<(T, i32), ManifestWriter>,
+
+    // Manifest file that user added to the snapshot
+    added_manifests: Vec<ManifestFile>,
+    // Manifest file that user deleted from the snapshot
+    deleted_manifests: Vec<ManifestFile>,
+    // New manifest files that generated after rewriting
+    new_manifests: Vec<ManifestFile>,
+    // Original manifest file that don't need to rewrite
+    keep_manifests: Vec<ManifestFile>,
+
+    // Used to record the manifests that need to be rewritten
+    rewrite_manifests: HashSet<ManifestFile>,
+
+    snapshot_produce_action: SnapshotProduceAction<'a>,
+
+    /// Statistics for count of process manifest entries
+    process_entry_count: usize,
+}
+
+impl<'a, T: Hash + Eq> RewriteManifsetAction<'a, T> {
+    pub(crate) fn new(
+        tx: Transaction<'a>,
+        cluster_by_func: Option<ClusterFunc<T>>,
+        manifest_predicate: Option<PredicateFunc>,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        key_metadata: Vec<u8>,
+        snapshot_properties: HashMap<String, String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            cluster_by_func,
+            manifset_predicate: manifest_predicate,
+            manifset_writers: HashMap::new(),
+            added_manifests: vec![],
+            deleted_manifests: vec![],
+            new_manifests: vec![],
+            keep_manifests: vec![],
+            snapshot_produce_action: SnapshotProduceAction::new(
+                tx,
+                snapshot_id,
+                key_metadata,
+                commit_uuid,
+                snapshot_properties,
+            )?,
+            rewrite_manifests: HashSet::new(),
+            process_entry_count: 0,
+        })
+    }
+
+    /// Add the manifset file for new snapshot
+    pub fn add_manifest(&mut self, manifest: ManifestFile) -> Result<()> {
+        if manifest.has_added_files() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot add manifest file with added files to the snapshot in RewriteManifest action",
+            ));
+        }
+        if manifest.has_deleted_files() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot add manifest file with deleted files to the snapshot in RewriteManifest action",
+            ));
+        }
+        if manifest.added_snapshot_id != UNASSIGNED_SNAPSHOT_ID {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot add manifest file with non-empty snapshot id to the snapshot in RewriteManifest action. Snapshot id will be assigned during commit",
+            ));
+        }
+        if manifest.sequence_number != UNASSIGNED_SEQUENCE_NUMBER {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot add manifest file with non-empty sequence number to the snapshot in RewriteManifest action. Sequence number will be assigned during commit",
+            ));
+        }
+
+        if self.snapshot_produce_action.enable_inherit_snapshot_id {
+            self.added_manifests.push(manifest);
+        } else {
+            // # TODO
+            // For table can't inherit snapshot id, we should rewrite the whole manifest file and add it at rewritten_added_manifests.
+            // See: https://github.com/apache/iceberg/blob/4dbcdfc85a64dc1d97d7434e353c7f9e4c18e1b3/core/src/main/java/org/apache/iceberg/BaseRewriteManifests.java#L48
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Rewrite manifest file is supported: Cannot add manifest file to the snapshot in RewriteManifest action when snapshot id inheritance is disabled",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Delete the manifset file from snapshot
+    pub fn delete_manifset(&mut self, manifset: ManifestFile) -> Result<()> {
+        self.deleted_manifests.push(manifset);
+        Ok(())
+    }
+
+    fn require_rewrite(&self) -> bool {
+        self.cluster_by_func.is_some()
+    }
+
+    #[inline]
+    async fn if_rewrite(&self, manifest: &ManifestFile) -> bool {
+        // Always rewrite if not predicate is provided
+        if let Some(predicate) = self.manifset_predicate.as_ref() {
+            predicate(manifest).await
+        } else {
+            true
+        }
+    }
+
+    async fn perform_rewrite(&mut self, manifest_list: ManifestList) -> Result<()> {
+        let remain_manifest = manifest_list
+            .consume_entries()
+            .into_iter()
+            .filter(|manifest| !self.deleted_manifests.contains(manifest));
+        for manifest in remain_manifest {
+            if manifest.content == ManifestContentType::Deletes || !self.if_rewrite(&manifest).await
+            {
+                self.keep_manifests.push(manifest.clone());
+            } else {
+                self.rewrite_manifests.insert(manifest.clone());
+                let (manifest_enries, _) = manifest
+                    .load_manifest(self.snapshot_produce_action.tx.current_table.file_io())
+                    .await?
+                    .into_parts();
+                // # TODO
+                // If we ignore delete entry here, how to clean the file?
+                for entry in manifest_enries.into_iter().filter(|e| e.is_alive()) {
+                    let key = (
+                        self.cluster_by_func
+                            .as_ref()
+                            .expect("Never enter this function if cluster_by_func is None")(
+                            entry.data_file(),
+                        ),
+                        manifest.partition_spec_id,
+                    );
+                    match self.manifset_writers.entry(key) {
+                        Entry::Occupied(mut e) => {
+                            // # TODO
+                            // Close when file reach target size and reset the writer
+                            e.get_mut().add_existing_entry(entry.as_ref().clone())?;
+                        }
+                        Entry::Vacant(e) => {
+                            let mut writer = self.snapshot_produce_action.new_manifest_writer(
+                                &manifest.content,
+                                manifest.partition_spec_id,
+                            )?;
+                            writer.add_existing_entry(entry.as_ref().clone())?;
+                            e.insert(writer);
+                        }
+                    }
+                    self.process_entry_count += 1;
+                }
+            }
+        }
+        // write all manifest files
+        for (_, writer) in self.manifset_writers.drain() {
+            let manifest_file = writer.write_manifest_file().await?;
+            self.new_manifests.push(manifest_file);
+        }
+        Ok(())
+    }
+
+    fn keep_active_manifests(&mut self, manifest_list: ManifestList) -> Result<()> {
+        self.keep_manifests.clear();
+        self.keep_manifests
+            .extend(
+                manifest_list
+                    .consume_entries()
+                    .into_iter()
+                    .filter(|manifest| {
+                        // # TODO
+                        // Which case will reach here?
+                        !self.rewrite_manifests.contains(manifest)
+                            && !self.deleted_manifests.contains(manifest)
+                    }),
+            );
+        Ok(())
+    }
+
+    #[inline]
+    fn active_file_count<'t>(manifest_iter: impl Iterator<Item = &'t ManifestFile>) -> Result<u32> {
+        let mut count = 0;
+        for manifest in manifest_iter {
+            count += manifest.added_files_count.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Manifest file should have added files count",
+                )
+            })?;
+            count += manifest.existing_files_count.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Manifest file should have existing files count",
+                )
+            })?;
+        }
+        Ok(count)
+    }
+
+    async fn validate_files_counts(&self) -> Result<()> {
+        let create_manifest = self.new_manifests.iter().chain(self.added_manifests.iter());
+        let create_manifest_file_count = Self::active_file_count(create_manifest)?;
+
+        let replaced_manifest = self
+            .rewrite_manifests
+            .iter()
+            .chain(self.deleted_manifests.iter());
+        let replaced_manifest_file_count = Self::active_file_count(replaced_manifest)?;
+
+        if replaced_manifest_file_count != create_manifest_file_count {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "The number of files in the new manifest files should be equal to the number of files in the replaced manifest files",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn summary(&self) -> Result<HashMap<String, String>> {
+        let mut summary = HashMap::new();
+        summary.insert(
+            CREATED_MANIFESTS_COUNT.to_string(),
+            (self.new_manifests.len() + self.added_manifests.len()).to_string(),
+        );
+        summary.insert(
+            KEPT_MANIFESTS_COUNT.to_string(),
+            self.keep_manifests.len().to_string(),
+        );
+        summary.insert(
+            REPLACED_MANIFESTS_COUNT.to_string(),
+            (self.rewrite_manifests.len() + self.deleted_manifests.len()).to_string(),
+        );
+        summary.insert(
+            PROCESSED_ENTRY_COUNT.to_string(),
+            self.process_entry_count.to_string(),
+        );
+        // # TODO
+        // Sets the maximum number of changed partitions before partition summaries will be excluded.
+        Ok(summary)
+    }
+
+    /// Apply the change to table
+    pub async fn apply(mut self) -> Result<Transaction<'a>> {
+        // read all manifest files of current snapshot
+        let current_manifests_list = if let Some(snapshot) = self
+            .snapshot_produce_action
+            .tx
+            .current_table
+            .metadata()
+            .current_snapshot()
+        {
+            snapshot
+                .load_manifest_list(
+                    self.snapshot_produce_action.tx.current_table.file_io(),
+                    &self.snapshot_produce_action.tx.current_table.metadata_ref(),
+                )
+                .await?
+        } else {
+            // Do nothing for empty snapshot
+            return Ok(self.snapshot_produce_action.tx);
+        };
+
+        // validate delete manifest file, make sure they are in the current manifest
+        if self
+            .deleted_manifests
+            .iter()
+            .any(|m| !current_manifests_list.entries().contains(m))
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Cannot delete manifest file that is not in the current snapshot",
+            ));
+        }
+
+        if self.require_rewrite() {
+            self.perform_rewrite(current_manifests_list).await?;
+        } else {
+            self.keep_active_manifests(current_manifests_list)?;
+        }
+
+        self.validate_files_counts().await?;
+
+        let summary = self.summary()?;
+
+        // Rewrite the snapshot id of all added manifest
+        let existing_manifests = self
+            .new_manifests
+            .into_iter()
+            .chain(self.added_manifests.into_iter())
+            .map(|mut manifest_file| {
+                manifest_file.added_snapshot_id = self.snapshot_produce_action.snapshot_id;
+                manifest_file
+            })
+            .chain(self.keep_manifests.into_iter())
+            .collect_vec();
+
+        self.snapshot_produce_action
+            .apply(
+                RewriteManifsetActionOperation {
+                    existing_manifests,
+                    summary,
+                },
+                DefaultManifestProcess,
+            )
+            .await
+    }
+}
+
+struct RewriteManifsetActionOperation {
+    existing_manifests: Vec<ManifestFile>,
+    summary: HashMap<String, String>,
+}
+
+impl SnapshotProduceOperation for RewriteManifsetActionOperation {
+    fn operation(&self) -> Operation {
+        Operation::Replace
+    }
+
+    async fn delete_entries(
+        &self,
+        _snapshot_produce: &SnapshotProduceAction<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        Ok(vec![])
+    }
+
+    async fn existing_manifest(
+        &mut self,
+        _snapshot_produce: &SnapshotProduceAction<'_>,
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(mem::take(&mut self.existing_manifests))
+    }
+
+    fn summary(&mut self) -> HashMap<String, String> {
+        mem::take(&mut self.summary)
     }
 }
 
