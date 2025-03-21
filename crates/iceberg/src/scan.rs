@@ -242,6 +242,13 @@ impl<'a> TableScanBuilder<'a> {
                     "snapshot_id should not be set for incremental scan. Use from_snapshot_id and to_snapshot_id instead.",
                 ));
             }
+
+            if self.delete_file_processing_enabled {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "delete_file_processing_enabled should not be set for incremental scan",
+                ));
+            }
         }
 
         let snapshot = match self.snapshot_id {
@@ -419,65 +426,6 @@ impl TableScan {
         // used to stream the results back to the caller
         let (file_scan_task_tx, file_scan_task_rx) = channel(concurrency_limit_manifest_entries);
 
-        if let Some(to_snapshot_id) = self.plan_context.to_snapshot_id {
-            // Incremental scan mode
-            let added_files = added_files_between(
-                &self.plan_context.object_cache,
-                &self.plan_context.table_metadata,
-                to_snapshot_id,
-                self.plan_context.from_snapshot_id,
-            )
-            .await?;
-
-            for entry in added_files {
-                let manifest_entry_context = ManifestEntryContext {
-                    manifest_entry: entry,
-                    expression_evaluator_cache: self
-                        .plan_context
-                        .expression_evaluator_cache
-                        .clone(),
-                    field_ids: self.plan_context.field_ids.clone(),
-                    bound_predicates: None, // TODO: support predicates in incremental scan
-                    partition_spec_id: 0,   // TODO: get correct partition spec id
-                    // It's used to skip any data file whose partition data indicates that it can't contain
-                    // any data that matches this scan's filter
-                    snapshot_schema: self.plan_context.snapshot_schema.clone(),
-                    // delete is not supported in incremental scan
-                    delete_file_index: None,
-                };
-
-                manifest_entry_data_ctx_tx
-                    .clone()
-                    .send(manifest_entry_context)
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::Unexpected, "mpsc channel SendError"))?;
-            }
-
-            let mut channel_for_manifest_entry_error = file_scan_task_tx.clone();
-
-            // Process the [`ManifestEntry`] stream in parallel
-            spawn(async move {
-                let result = manifest_entry_data_ctx_rx
-                    .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
-                    .try_for_each_concurrent(
-                        concurrency_limit_manifest_entries,
-                        |(manifest_entry_context, tx)| async move {
-                            spawn(async move {
-                                Self::process_data_manifest_entry(manifest_entry_context, tx).await
-                            })
-                            .await
-                        },
-                    )
-                    .await;
-
-                if let Err(error) = result {
-                    let _ = channel_for_manifest_entry_error.send(Err(error)).await;
-                }
-            });
-
-            return Ok(file_scan_task_rx.boxed());
-        }
-
         let delete_file_idx_and_tx: Option<(DeleteFileIndex, Sender<DeleteFileContext>)> =
             if self.delete_file_processing_enabled {
                 Some(DeleteFileIndex::new())
@@ -485,18 +433,18 @@ impl TableScan {
                 None
             };
 
-        let manifest_list = self.plan_context.get_manifest_list().await?;
-
         // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
         // whose partitions cannot match this
         // scan's filter
-        let manifest_file_contexts = self.plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx_and_tx.as_ref().map(|(delete_file_idx, _)| {
-                (delete_file_idx.clone(), manifest_entry_delete_ctx_tx)
-            }),
-        )?;
+        let manifest_file_contexts = self
+            .plan_context
+            .build_manifest_file_contexts(
+                manifest_entry_data_ctx_tx,
+                delete_file_idx_and_tx.as_ref().map(|(delete_file_idx, _)| {
+                    (delete_file_idx.clone(), manifest_entry_delete_ctx_tx)
+                }),
+            )
+            .await?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
 
@@ -512,8 +460,6 @@ impl TableScan {
                 let _ = channel_for_manifest_error.send(Err(error)).await;
             }
         });
-
-        let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
 
         if let Some((_, delete_file_tx)) = delete_file_idx_and_tx {
             let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
@@ -543,6 +489,7 @@ impl TableScan {
             .await;
         }
 
+        let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
@@ -701,6 +648,7 @@ struct BoundPredicates {
     snapshot_bound_predicate: BoundPredicate,
 }
 
+type ManifestEntryFilterFn = dyn Fn(&ManifestEntryRef) -> bool + Send + Sync;
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
 struct ManifestFileContext {
@@ -714,6 +662,10 @@ struct ManifestFileContext {
     snapshot_schema: SchemaRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: Option<DeleteFileIndex>,
+
+    /// filter manifest entries.
+    /// Used for different kind of scans, e.g., only scan newly added files without delete files.
+    filter_fn: Option<Arc<ManifestEntryFilterFn>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -742,12 +694,13 @@ impl ManifestFileContext {
             mut sender,
             expression_evaluator_cache,
             delete_file_index,
-            ..
+            filter_fn,
         } = self;
+        let filter_fn = filter_fn.unwrap_or_else(|| Arc::new(|_| true));
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
 
-        for manifest_entry in manifest.entries() {
+        for manifest_entry in manifest.entries().iter().filter(|e| filter_fn(e)) {
             let manifest_entry_context = ManifestEntryContext {
                 // TODO: refactor to avoid the expensive ManifestEntry clone
                 manifest_entry: manifest_entry.clone(),
@@ -835,18 +788,77 @@ impl PlanContext {
         Ok(partition_filter)
     }
 
-    fn build_manifest_file_contexts(
+    async fn build_manifest_file_contexts(
         &self,
-        manifest_list: Arc<ManifestList>,
         tx_data: Sender<ManifestEntryContext>,
         delete_file_idx_and_tx: Option<(DeleteFileIndex, Sender<ManifestEntryContext>)>,
     ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
-        let manifest_files = manifest_list.entries().iter();
+        let mut filter_fn: Option<Arc<ManifestEntryFilterFn>> = None;
+        let manifest_files = {
+            if let Some(to_snapshot_id) = self.to_snapshot_id {
+                // Incremental scan mode:
+                // Get all added files between two snapshots.
+                // - data files in `Append` and `Overwrite` snapshots are included.
+                // - delete files are ignored
+                // - `Replace` snapshots (e.g., compaction) are ignored.
+                //
+                // `latest_snapshot_id` is inclusive, `oldest_snapshot_id` is exclusive.
+
+                // prevent misuse
+                assert!(
+                    delete_file_idx_and_tx.is_none(),
+                    "delete file is not supported in incremental scan mode"
+                );
+
+                let snapshots =
+                    ancestors_between(&self.table_metadata, to_snapshot_id, self.from_snapshot_id)
+                        .filter(|snapshot| {
+                            matches!(
+                                snapshot.summary().operation,
+                                Operation::Append | Operation::Overwrite
+                            )
+                        })
+                        .collect_vec();
+                let snapshot_ids: HashSet<i64> = snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_id())
+                    .collect();
+
+                let mut manifest_files = vec![];
+                for snapshot in snapshots {
+                    let manifest_list = self
+                        .object_cache
+                        .get_manifest_list(&snapshot, &self.table_metadata)
+                        .await?;
+                    for entry in manifest_list.entries() {
+                        if !snapshot_ids.contains(&entry.added_snapshot_id) {
+                            continue;
+                        }
+                        manifest_files.push(entry.clone());
+                    }
+                }
+
+                filter_fn = Some(Arc::new(move |entry: &ManifestEntryRef| {
+                    matches!(entry.status(), ManifestStatus::Added)
+                        && matches!(entry.data_file().content_type(), DataContentType::Data)
+                        && (
+                            // Is it possible that the snapshot id here is not contained?
+                            entry.snapshot_id().is_none()
+                                || snapshot_ids.contains(&entry.snapshot_id().unwrap())
+                        )
+                }));
+
+                manifest_files
+            } else {
+                let manifest_list = self.get_manifest_list().await?;
+                manifest_list.entries().to_vec()
+            }
+        };
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
 
-        for manifest_file in manifest_files {
+        for manifest_file in &manifest_files {
             let (delete_file_idx, tx) = if manifest_file.content == ManifestContentType::Deletes {
                 let Some((delete_file_idx, tx)) = delete_file_idx_and_tx.as_ref() else {
                     continue;
@@ -885,6 +897,7 @@ impl PlanContext {
                 partition_bound_predicate,
                 tx,
                 delete_file_idx,
+                filter_fn.clone(),
             );
 
             filtered_mfcs.push(Ok(mfc));
@@ -899,6 +912,7 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: Option<DeleteFileIndex>,
+        filter_fn: Option<Arc<ManifestEntryFilterFn>>,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -921,6 +935,7 @@ impl PlanContext {
             field_ids: self.field_ids.clone(),
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
+            filter_fn,
         }
     }
 }
@@ -1301,59 +1316,6 @@ fn ancestors_between(
         ancestors_of(table_metadata, latest_snapshot_id)
             .take_while(move |snapshot| snapshot.snapshot_id() != oldest_snapshot_id),
     )
-}
-
-/// Get all added files between two snapshots.
-/// - data files in `Append` and `Overwrite` snapshots are included.
-/// - delete files are ignored
-/// - `Replace` snapshots (e.g., compaction) are ignored.
-///
-/// `latest_snapshot_id` is inclusive, `oldest_snapshot_id` is exclusive.
-async fn added_files_between(
-    object_cache: &ObjectCache,
-    table_metadata: &TableMetadataRef,
-    latest_snapshot_id: i64,
-    oldest_snapshot_id: Option<i64>,
-) -> Result<Vec<ManifestEntryRef>> {
-    let mut added_files = vec![];
-
-    let snapshots = ancestors_between(table_metadata, latest_snapshot_id, oldest_snapshot_id)
-        .filter(|snapshot| {
-            matches!(
-                snapshot.summary().operation,
-                Operation::Append | Operation::Overwrite
-            )
-        })
-        .collect_vec();
-    let snapshot_ids: HashSet<i64> = snapshots
-        .iter()
-        .map(|snapshot| snapshot.snapshot_id())
-        .collect();
-
-    for snapshot in snapshots {
-        let manifest_list = object_cache
-            .get_manifest_list(&snapshot, table_metadata)
-            .await?;
-
-        for manifest_file in manifest_list.entries() {
-            if !snapshot_ids.contains(&manifest_file.added_snapshot_id) {
-                continue;
-            }
-            let manifest = object_cache.get_manifest(manifest_file).await?;
-            let entries = manifest.entries().iter().filter(|entry| {
-                matches!(entry.status(), ManifestStatus::Added)
-                    && matches!(entry.data_file().content_type(), DataContentType::Data)
-                    && (
-                        // Is it possible that the snapshot id here is not contained?
-                        entry.snapshot_id().is_none()
-                            || snapshot_ids.contains(&entry.snapshot_id().unwrap())
-                    )
-            });
-            added_files.extend(entries.cloned());
-        }
-    }
-
-    Ok(added_files)
 }
 
 #[cfg(test)]
