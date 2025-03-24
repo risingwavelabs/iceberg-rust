@@ -15,18 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use arrow_array::StringArray;
 use futures::TryStreamExt;
 use uuid::Uuid;
 
+use super::snapshot::ManifestProcess;
+use super::{
+    MANIFEST_MERGE_ENABLED, MANIFEST_MERGE_ENABLED_DEFAULT, MANIFEST_MIN_MERGE_COUNT,
+    MANIFEST_MIN_MERGE_COUNT_DEFAULT, MANIFEST_TARGET_SIZE_BYTES,
+    MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
+};
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::io::FileIO;
+use crate::spec::{
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, ManifestWriter,
+    Operation,
+};
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceAction, SnapshotProduceOperation,
 };
 use crate::transaction::Transaction;
+use crate::utils::bin::ListPacker;
 use crate::writer::file_writer::ParquetWriter;
 use crate::{Error, ErrorKind};
 
@@ -78,7 +91,7 @@ impl<'a> FastAppendAction<'a> {
         if !self
             .snapshot_produce_action
             .tx
-            .table
+            .current_table
             .metadata()
             .default_spec
             .is_unpartitioned()
@@ -89,10 +102,10 @@ impl<'a> FastAppendAction<'a> {
             ));
         }
 
-        let table_metadata = self.snapshot_produce_action.tx.table.metadata();
+        let table_metadata = self.snapshot_produce_action.tx.current_table.metadata();
 
         let data_files = ParquetWriter::parquet_files_to_data_files(
-            self.snapshot_produce_action.tx.table.file_io(),
+            self.snapshot_produce_action.tx.current_table.file_io(),
             file_path,
             table_metadata,
         )
@@ -117,7 +130,7 @@ impl<'a> FastAppendAction<'a> {
             let mut manifest_stream = self
                 .snapshot_produce_action
                 .tx
-                .table
+                .current_table
                 .inspect()
                 .manifests()
                 .scan()
@@ -179,14 +192,19 @@ impl SnapshotProduceOperation for FastAppendOperation {
         &self,
         snapshot_produce: &SnapshotProduceAction<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.tx.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce
+            .tx
+            .current_table
+            .metadata()
+            .current_snapshot()
+        else {
             return Ok(vec![]);
         };
 
         let manifest_list = snapshot
             .load_manifest_list(
-                snapshot_produce.tx.table.file_io(),
-                &snapshot_produce.tx.table.metadata_ref(),
+                snapshot_produce.tx.current_table.file_io(),
+                &snapshot_produce.tx.current_table.metadata_ref(),
             )
             .await?;
 
@@ -196,6 +214,273 @@ impl SnapshotProduceOperation for FastAppendOperation {
             .filter(|entry| entry.has_added_files() || entry.has_existing_files())
             .cloned()
             .collect())
+    }
+}
+
+/// MergeAppendAction is a transaction action similar to fast append except that it will merge manifests
+/// based on the target size.
+pub struct MergeAppendAction<'a> {
+    snapshot_produce_action: SnapshotProduceAction<'a>,
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+    merge_enabled: bool,
+}
+
+impl<'a> MergeAppendAction<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        tx: Transaction<'a>,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        key_metadata: Vec<u8>,
+        snapshot_properties: HashMap<String, String>,
+    ) -> Result<Self> {
+        let target_size_bytes: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_TARGET_SIZE_BYTES)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_TARGET_SIZE_BYTES_DEFAULT);
+        let min_count_to_merge: u32 = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MIN_MERGE_COUNT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MIN_MERGE_COUNT_DEFAULT);
+        let merge_enabled = tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(MANIFEST_MERGE_ENABLED)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
+        Ok(Self {
+            snapshot_produce_action: SnapshotProduceAction::new(
+                tx,
+                snapshot_id,
+                key_metadata,
+                commit_uuid,
+                snapshot_properties,
+            )?,
+            target_size_bytes,
+            min_count_to_merge,
+            merge_enabled,
+        })
+    }
+
+    /// Add data files to the snapshot.
+    pub fn add_data_files(
+        &mut self,
+        data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        self.snapshot_produce_action.add_data_files(data_files)?;
+        Ok(self)
+    }
+
+    /// Finished building the action and apply it to the transaction.
+    pub async fn apply(self) -> Result<Transaction<'a>> {
+        if self.merge_enabled {
+            let process = MergeManifestProcess {
+                target_size_bytes: self.target_size_bytes,
+                min_count_to_merge: self.min_count_to_merge,
+            };
+            self.snapshot_produce_action
+                .apply(FastAppendOperation, process)
+                .await
+        } else {
+            self.snapshot_produce_action
+                .apply(FastAppendOperation, DefaultManifestProcess)
+                .await
+        }
+    }
+}
+
+struct MergeManifestProcess {
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+}
+
+impl MergeManifestProcess {
+    pub fn new(target_size_bytes: u32, min_count_to_merge: u32) -> Self {
+        Self {
+            target_size_bytes,
+            min_count_to_merge,
+        }
+    }
+}
+
+impl ManifestProcess for MergeManifestProcess {
+    async fn process_manifest<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let (unmerge_data_manifest, unmerge_delete_manifest): (Vec<_>, Vec<_>) = manifests
+            .into_iter()
+            .partition(|manifest| matches!(manifest.content, ManifestContentType::Data));
+        let mut data_manifest = {
+            let manifest_merge_manager = MergeManifestManager::new(
+                self.target_size_bytes,
+                self.min_count_to_merge,
+                ManifestContentType::Data,
+            );
+            manifest_merge_manager
+                .merge_manifest(snapshot_produce, unmerge_data_manifest)
+                .await?
+        };
+        data_manifest.extend(unmerge_delete_manifest);
+        Ok(data_manifest)
+    }
+}
+
+struct MergeManifestManager {
+    target_size_bytes: u32,
+    min_count_to_merge: u32,
+    content: ManifestContentType,
+}
+
+impl MergeManifestManager {
+    pub fn new(
+        target_size_bytes: u32,
+        min_count_to_merge: u32,
+        content: ManifestContentType,
+    ) -> Self {
+        Self {
+            target_size_bytes,
+            min_count_to_merge,
+            content,
+        }
+    }
+
+    fn group_by_spec(&self, manifests: Vec<ManifestFile>) -> BTreeMap<i32, Vec<ManifestFile>> {
+        let mut grouped_manifests = BTreeMap::new();
+        for manifest in manifests {
+            grouped_manifests
+                .entry(manifest.partition_spec_id)
+                .or_insert_with(Vec::new)
+                .push(manifest);
+        }
+        grouped_manifests
+    }
+
+    async fn merge_bin(
+        &self,
+        snapshot_id: i64,
+        file_io: FileIO,
+        manifest_bin: Vec<ManifestFile>,
+        mut writer: ManifestWriter,
+    ) -> Result<ManifestFile> {
+        for manifest_file in manifest_bin {
+            let manifest_file = manifest_file.load_manifest(&file_io).await?;
+            for manifest_entry in manifest_file.entries() {
+                if manifest_entry.status() == ManifestStatus::Deleted
+                    && manifest_entry
+                        .snapshot_id()
+                        .is_some_and(|id| id == snapshot_id)
+                {
+                    //only files deleted by this snapshot should be added to the new manifest
+                    writer.add_delete_entry(manifest_entry.as_ref().clone())?;
+                } else if manifest_entry.status() == ManifestStatus::Added
+                    && manifest_entry
+                        .snapshot_id()
+                        .is_some_and(|id| id == snapshot_id)
+                {
+                    //added entries from this snapshot are still added, otherwise they should be existing
+                    writer.add_entry(manifest_entry.as_ref().clone())?;
+                } else if manifest_entry.status() != ManifestStatus::Deleted {
+                    // add all non-deleted files from the old manifest as existing files
+                    writer.add_existing_entry(manifest_entry.as_ref().clone())?;
+                }
+            }
+        }
+
+        writer.write_manifest_file().await
+    }
+
+    async fn merge_group<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        first_manifest: &ManifestFile,
+        group_manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let packer: ListPacker<ManifestFile> = ListPacker::new(self.target_size_bytes);
+        let manifest_bins =
+            packer.pack(group_manifests, |manifest| manifest.manifest_length as u32);
+
+        let manifest_merge_futures = manifest_bins
+            .into_iter()
+            .map(|manifest_bin| {
+                if manifest_bin.len() == 1 {
+                    Ok(Box::pin(async { Ok(manifest_bin) })
+                        as Pin<
+                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                        >)
+                }
+                //  if the bin has the first manifest (the new data files or an appended manifest file) then only
+                //  merge it if the number of manifests is above the minimum count. this is applied only to bins
+                //  with an in-memory manifest so that large manifests don't prevent merging older groups.
+                else if manifest_bin
+                    .iter()
+                    .any(|manifest| manifest == first_manifest)
+                    && manifest_bin.len() < self.min_count_to_merge as usize
+                {
+                    Ok(Box::pin(async { Ok(manifest_bin) })
+                        as Pin<
+                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                        >)
+                } else {
+                    let writer = snapshot_produce.new_manifest_writer(&self.content,snapshot_produce.tx.current_table.metadata().default_partition_spec_id())?;
+                    let snapshot_id = snapshot_produce.snapshot_id;
+                    let file_io = snapshot_produce.tx.current_table.file_io().clone();
+                    Ok((Box::pin(async move {
+                        Ok(vec![
+                            self.merge_bin(
+                                snapshot_id,
+                                file_io,
+                                manifest_bin,
+                                writer,
+                            )
+                            .await?,
+                        ])
+                    }))
+                        as Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>)
+                }
+            })
+            .collect::<Result<Vec<Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>>>>()?;
+
+        let merged_bins: Vec<Vec<ManifestFile>> =
+            futures::future::join_all(manifest_merge_futures.into_iter())
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+        Ok(merged_bins.into_iter().flatten().collect())
+    }
+
+    pub(crate) async fn merge_manifest<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        if manifests.is_empty() {
+            return Ok(manifests);
+        }
+
+        let first_manifest = manifests[0].clone();
+
+        let group_manifests = self.group_by_spec(manifests);
+
+        let mut merge_manifests = vec![];
+        for (_spec_id, manifests) in group_manifests.into_iter().rev() {
+            merge_manifests.extend(
+                self.merge_group(snapshot_produce, &first_manifest, manifests)
+                    .await?,
+            );
+        }
+
+        Ok(merge_manifests)
     }
 }
 
@@ -213,7 +498,7 @@ mod tests {
     async fn test_fast_append_action() {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
-        let mut action = tx.fast_append(None, vec![]).unwrap();
+        let mut action = tx.fast_append(None, None, vec![]).unwrap();
 
         // check add data file with incompatible partition value
         let data_file = DataFileBuilder::default()
@@ -246,11 +531,11 @@ mod tests {
         assert_eq!(
             vec![
                 TableRequirement::UuidMatch {
-                    uuid: tx.table.metadata().uuid()
+                    uuid: tx.current_table.metadata().uuid()
                 },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
-                    snapshot_id: tx.table.metadata().current_snapshot_id
+                    snapshot_id: tx.current_table.metadata().current_snapshot_id
                 }
             ],
             tx.requirements
@@ -304,7 +589,7 @@ mod tests {
             format!("{}/3.parquet", &fixture.table_location),
         ];
 
-        let fast_append_action = tx.fast_append(None, vec![]).unwrap();
+        let fast_append_action = tx.fast_append(None, None, vec![]).unwrap();
 
         // Attempt to add the existing Parquet files with fast append.
         let new_tx = fast_append_action

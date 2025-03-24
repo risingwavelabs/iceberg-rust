@@ -21,13 +21,13 @@ use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
 
+use super::Transaction;
 use crate::error::Result;
 use crate::spec::{
     ancestors_of, SnapshotReference, SnapshotRetention, MAIN_BRANCH, MAX_REF_AGE_MS,
     MAX_REF_AGE_MS_DEFAULT, MAX_SNAPSHOT_AGE_MS, MAX_SNAPSHOT_AGE_MS_DEFAULT,
     MIN_SNAPSHOTS_TO_KEEP, MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
 };
-use crate::transaction::Transaction;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// RemoveSnapshotAction is a transaction action for removing snapshot.
@@ -397,5 +397,120 @@ impl<'a> RemoveSnapshotAction<'a> {
         }
 
         ids_to_retain
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    use crate::io::FileIOBuilder;
+    use crate::spec::{TableMetadata, MAIN_BRANCH};
+    use crate::table::Table;
+    use crate::transaction::Transaction;
+    use crate::{TableIdent, TableRequirement};
+
+    fn make_v2_table_with_mutli_snapshot() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2ValidMultiSnapshot.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_remove_snapshot_action() {
+        let table = make_v2_table_with_mutli_snapshot();
+        let table_meta = table.metadata().clone();
+        assert_eq!(5, table_meta.snapshots().count());
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx.expire_snapshot().apply().await.unwrap();
+            assert_eq!(4, tx.updates.len());
+
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.current_table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx.expire_snapshot().retain_last(2).apply().await.unwrap();
+            assert_eq!(3, tx.updates.len());
+
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.current_table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .expire_snapshot()
+                .retain_last(100)
+                .expire_older_than(100)
+                .apply()
+                .await
+                .unwrap();
+            assert_eq!(0, tx.updates.len());
+            assert_eq!(
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: tx.current_table.metadata().uuid()
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: MAIN_BRANCH.to_string(),
+                        snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    }
+                ],
+                tx.requirements
+            );
+        }
+
+        {
+            // test remove main current snapshot
+            let tx = Transaction::new(&table);
+            let err = tx
+                .expire_snapshot()
+                .expire_snapshot_id(table.metadata().current_snapshot_id().unwrap())
+                .apply()
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                "DataInvalid => Cannot remove snapshot 3067729675574597004 with retained references: [\"main\"]",
+                err.to_string()
+            )
+        }
     }
 }

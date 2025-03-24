@@ -22,11 +22,10 @@ use std::ops::RangeFrom;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::io::OutputFile;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestEntry, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention, Struct,
-    StructType, Summary, MAIN_BRANCH,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
+    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
+    SnapshotReference, SnapshotRetention, Struct, StructType, Summary, MAIN_BRANCH,
 };
 use crate::transaction::Transaction;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
@@ -49,22 +48,31 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
 pub(crate) struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifeset(&self, manifests: Vec<ManifestFile>) -> Vec<ManifestFile> {
-        manifests
+    async fn process_manifest<'a>(
+        &self,
+        _snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
     }
 }
 
 pub(crate) trait ManifestProcess: Send + Sync {
-    fn process_manifeset(&self, manifests: Vec<ManifestFile>) -> Vec<ManifestFile>;
+    fn process_manifest<'a>(
+        &self,
+        snapshot_produce: &mut SnapshotProduceAction<'a>,
+        manifests: Vec<ManifestFile>,
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 pub(crate) struct SnapshotProduceAction<'a> {
-    pub tx: Transaction<'a>,
-    snapshot_id: i64,
+    pub(crate) tx: Transaction<'a>,
+    pub(crate) snapshot_id: i64,
     key_metadata: Vec<u8>,
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
-    pub added_data_files: Vec<DataFile>,
+    pub(crate) added_data_files: Vec<DataFile>,
+    pub(crate) added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -85,6 +93,7 @@ impl<'a> SnapshotProduceAction<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files: vec![],
+            added_delete_files: vec![],
             manifest_counter: (0..),
             key_metadata,
         })
@@ -129,43 +138,102 @@ impl<'a> SnapshotProduceAction<'a> {
         data_files: impl IntoIterator<Item = DataFile>,
     ) -> Result<&mut Self> {
         let data_files: Vec<DataFile> = data_files.into_iter().collect();
-        for data_file in &data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Only data content type is allowed for fast append",
-                ));
-            }
+        for data_file in data_files {
             Self::validate_partition_value(
                 data_file.partition(),
-                self.tx.table.metadata().default_partition_type(),
+                self.tx.current_table.metadata().default_partition_type(),
             )?;
+            if data_file.content_type() == DataContentType::Data {
+                self.added_data_files.push(data_file);
+            } else {
+                self.added_delete_files.push(data_file);
+            }
         }
-        self.added_data_files.extend(data_files);
         Ok(self)
     }
 
-    fn new_manifest_output(&mut self) -> Result<OutputFile> {
+    pub(crate) fn new_manifest_writer(
+        &mut self,
+        content_type: &ManifestContentType,
+        partition_spec_id: i32,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
-            self.tx.table.metadata().location(),
+            self.tx.current_table.metadata().location(),
             META_ROOT_PATH,
             self.commit_uuid,
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
         );
-        self.tx.table.file_io().new_output(new_manifest_path)
+        let output = self
+            .tx
+            .current_table
+            .file_io()
+            .new_output(new_manifest_path)?;
+        let partition_spec = self
+            .tx
+            .current_table
+            .metadata()
+            .partition_spec_by_id(partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Invalid partition spec id for new manifest writer",
+                )
+                .with_context("partition spec id", partition_spec_id.to_string())
+            })?
+            .as_ref()
+            .clone();
+        let builder = ManifestWriterBuilder::new(
+            output,
+            Some(self.snapshot_id),
+            self.key_metadata.clone(),
+            self.tx.current_table.metadata().current_schema().clone(),
+            partition_spec,
+        );
+        if self.tx.current_table.metadata().format_version() == FormatVersion::V1 {
+            Ok(builder.build_v1())
+        } else {
+            match content_type {
+                ManifestContentType::Data => Ok(builder.build_v2_data()),
+                ManifestContentType::Deletes => Ok(builder.build_v2_deletes()),
+            }
+        }
     }
 
     // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
+    async fn write_added_manifest(
+        &mut self,
+        added_data_files: Vec<DataFile>,
+    ) -> Result<ManifestFile> {
         let snapshot_id = self.snapshot_id;
+        let format_version = self.tx.current_table.metadata().format_version();
+        let content_type = {
+            let mut data_num = 0;
+            let mut delete_num = 0;
+            for f in &added_data_files {
+                match f.content_type() {
+                    DataContentType::Data => data_num += 1,
+                    DataContentType::PositionDeletes => delete_num += 1,
+                    DataContentType::EqualityDeletes => delete_num += 1,
+                }
+            }
+            if data_num == added_data_files.len() {
+                ManifestContentType::Data
+            } else if delete_num == added_data_files.len() {
+                ManifestContentType::Deletes
+            } else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "added DataFile for a ManifestFile should be same type (Data or Delete)",
+                ));
+            }
+        };
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
-            if self.tx.table.metadata().format_version() == FormatVersion::V1 {
+            if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
             } else {
                 // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
@@ -173,29 +241,70 @@ impl<'a> SnapshotProduceAction<'a> {
                 builder.build()
             }
         });
-        let mut writer = {
-            let builder = ManifestWriterBuilder::new(
-                self.new_manifest_output()?,
-                Some(self.snapshot_id),
-                self.key_metadata.clone(),
-                self.tx.table.metadata().current_schema().clone(),
-                self.tx
-                    .table
-                    .metadata()
-                    .default_partition_spec()
-                    .as_ref()
-                    .clone(),
-            );
-            if self.tx.table.metadata().format_version() == FormatVersion::V1 {
-                builder.build_v1()
-            } else {
-                builder.build_v2_data()
-            }
-        };
+        let mut writer = self.new_manifest_writer(
+            &content_type,
+            self.tx.current_table.metadata().default_partition_spec_id(),
+        )?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
         writer.write_manifest_file().await
+    }
+
+    async fn write_delete_manifest(
+        &mut self,
+        deleted_entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        if deleted_entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group deleted entries by spec_id
+        let mut partition_groups = HashMap::new();
+        for entry in deleted_entries {
+            partition_groups
+                .entry(entry.data_file().partition_spec_id)
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+
+        // Write a delete manifest per spec_id group
+        let mut deleted_manifests = Vec::new();
+        for (spec_id, entries) in partition_groups {
+            let mut data_file_writer: Option<ManifestWriter> = None;
+            let mut delete_file_writer: Option<ManifestWriter> = None;
+            for entry in entries {
+                match entry.content_type() {
+                    DataContentType::Data => {
+                        if data_file_writer.is_none() {
+                            data_file_writer = Some(
+                                self.new_manifest_writer(&ManifestContentType::Data, spec_id)?,
+                            );
+                        }
+                        data_file_writer.as_mut().unwrap().add_delete_entry(entry)?;
+                    }
+                    DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
+                        if delete_file_writer.is_none() {
+                            delete_file_writer = Some(
+                                self.new_manifest_writer(&ManifestContentType::Deletes, spec_id)?,
+                            );
+                        }
+                        delete_file_writer
+                            .as_mut()
+                            .unwrap()
+                            .add_delete_entry(entry)?;
+                    }
+                }
+            }
+            if let Some(writer) = data_file_writer {
+                deleted_manifests.push(writer.write_manifest_file().await?);
+            }
+            if let Some(writer) = delete_file_writer {
+                deleted_manifests.push(writer.write_manifest_file().await?);
+            }
+        }
+
+        Ok(deleted_manifests)
     }
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
@@ -203,15 +312,29 @@ impl<'a> SnapshotProduceAction<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
-        let added_manifest = self.write_added_manifest().await?;
-        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
-        // # TODO
-        // Support process delete entries.
+        let mut manifest_files = vec![];
+        let data_files = std::mem::take(&mut self.added_data_files);
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        if !data_files.is_empty() {
+            let added_manifest = self.write_added_manifest(data_files).await?;
+            manifest_files.push(added_manifest);
+        }
+        if !added_delete_files.is_empty() {
+            let added_delete_manifest = self.write_added_manifest(added_delete_files).await?;
+            manifest_files.push(added_delete_manifest);
+        }
 
-        let mut manifest_files = vec![added_manifest];
+        let delete_manifests = self
+            .write_delete_manifest(snapshot_produce_operation.delete_entries(self).await?)
+            .await?;
+        manifest_files.extend(delete_manifests);
+
+        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         manifest_files.extend(existing_manifests);
-        let manifest_files = manifest_process.process_manifeset(manifest_files);
-        Ok(manifest_files)
+
+        manifest_process
+            .process_manifest(self, manifest_files)
+            .await
     }
 
     // # TODO
@@ -226,7 +349,7 @@ impl<'a> SnapshotProduceAction<'a> {
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
         format!(
             "{}/{}/snap-{}-{}-{}.{}",
-            self.tx.table.metadata().location(),
+            self.tx.current_table.metadata().location(),
             META_ROOT_PATH,
             self.snapshot_id,
             attempt,
@@ -244,28 +367,28 @@ impl<'a> SnapshotProduceAction<'a> {
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
-        let next_seq_num = self.tx.table.metadata().next_sequence_number();
+        let next_seq_num = self.tx.current_table.metadata().next_sequence_number();
 
         let summary = self.summary(&snapshot_produce_operation);
 
         let manifest_list_path = self.generate_manifest_list_file_path(0);
 
-        let mut manifest_list_writer = match self.tx.table.metadata().format_version() {
+        let mut manifest_list_writer = match self.tx.current_table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
                 self.tx
-                    .table
+                    .current_table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.tx.table.metadata().current_snapshot_id(),
+                self.tx.current_table.metadata().current_snapshot_id(),
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
                 self.tx
-                    .table
+                    .current_table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.tx.table.metadata().current_snapshot_id(),
+                self.tx.current_table.metadata().current_snapshot_id(),
                 next_seq_num,
             ),
         };
@@ -276,34 +399,36 @@ impl<'a> SnapshotProduceAction<'a> {
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(self.tx.table.metadata().current_snapshot_id())
+            .with_parent_snapshot_id(self.tx.current_table.metadata().current_snapshot_id())
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
-            .with_schema_id(self.tx.table.metadata().current_schema_id())
+            .with_schema_id(self.tx.current_table.metadata().current_schema_id())
             .with_timestamp_ms(commit_ts)
             .build();
 
-        self.tx.append_updates(vec![
-            TableUpdate::AddSnapshot {
-                snapshot: new_snapshot,
-            },
-            TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    self.snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
-            },
-        ])?;
-        self.tx.append_requirements(vec![
-            TableRequirement::UuidMatch {
-                uuid: self.tx.table.metadata().uuid(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: self.tx.table.metadata().current_snapshot_id(),
-            },
-        ])?;
+        self.tx.apply(
+            vec![
+                TableUpdate::AddSnapshot {
+                    snapshot: new_snapshot.clone(),
+                },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: MAIN_BRANCH.to_string(),
+                    reference: SnapshotReference::new(
+                        self.snapshot_id,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ],
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: self.tx.current_table.metadata().uuid(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: MAIN_BRANCH.to_string(),
+                    snapshot_id: self.tx.current_table.metadata().current_snapshot_id(),
+                },
+            ],
+        )?;
         Ok(self.tx)
     }
 }

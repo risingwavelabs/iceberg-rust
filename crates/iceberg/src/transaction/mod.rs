@@ -18,13 +18,17 @@
 //! This module contains transaction api.
 
 mod append;
+mod remove_snapshots;
 mod snapshot;
 mod sort_order;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::mem::discriminant;
+use std::sync::Arc;
 
+use append::MergeAppendAction;
+use remove_snapshots::RemoveSnapshotAction;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -35,9 +39,20 @@ use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::TableUpdate::UpgradeFormatVersion;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
+/// Target size of manifest file when merging manifests.
+pub const MANIFEST_TARGET_SIZE_BYTES: &str = "commit.manifest.target-size-bytes";
+const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024; // 8 MB
+/// Minimum number of manifests to merge.
+pub const MANIFEST_MIN_MERGE_COUNT: &str = "commit.manifest.min-count-to-merge";
+const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
+/// Whether allow to merge manifests.
+pub const MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
+const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
+
 /// Table transaction.
 pub struct Transaction<'a> {
-    table: &'a Table,
+    base_table: &'a Table,
+    pub(crate) current_table: Table,
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
 }
@@ -46,38 +61,60 @@ impl<'a> Transaction<'a> {
     /// Creates a new transaction.
     pub fn new(table: &'a Table) -> Self {
         Self {
-            table,
+            base_table: table,
+            current_table: table.clone(),
             updates: vec![],
             requirements: vec![],
         }
     }
 
-    fn append_updates(&mut self, updates: Vec<TableUpdate>) -> Result<()> {
-        for update in &updates {
-            for up in &self.updates {
-                if discriminant(up) == discriminant(update) {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Cannot apply update with same type at same time: {:?}",
-                            update
-                        ),
-                    ));
-                }
-            }
+    fn update_table_metadata(&mut self, updates: &[TableUpdate]) -> Result<()> {
+        let mut metadata_builder = self.current_table.metadata().clone().into_builder(None);
+        for update in updates {
+            metadata_builder = update.clone().apply(metadata_builder)?;
         }
-        self.updates.extend(updates);
+
+        self.current_table
+            .with_metadata(Arc::new(metadata_builder.build()?.metadata));
+
         Ok(())
     }
 
-    fn append_requirements(&mut self, requirements: Vec<TableRequirement>) -> Result<()> {
-        self.requirements.extend(requirements);
+    pub(crate) fn apply(
+        &mut self,
+        updates: Vec<TableUpdate>,
+        requirements: Vec<TableRequirement>,
+    ) -> Result<()> {
+        for requirement in &requirements {
+            requirement.check(Some(self.current_table.metadata()))?;
+        }
+
+        self.update_table_metadata(&updates)?;
+
+        self.updates.extend(updates);
+
+        // For the requirements, it does not make sense to add a requirement more than once
+        // For example, you cannot assert that the current schema has two different IDs
+        for new_requirement in requirements {
+            if self
+                .requirements
+                .iter()
+                .map(discriminant)
+                .all(|d| d != discriminant(&new_requirement))
+            {
+                self.requirements.push(new_requirement);
+            }
+        }
+
+        // # TODO
+        // Support auto commit later.
+
         Ok(())
     }
 
     /// Sets table to a new version.
     pub fn upgrade_table_version(mut self, format_version: FormatVersion) -> Result<Self> {
-        let current_version = self.table.metadata().format_version();
+        let current_version = self.current_table.metadata().format_version();
         match current_version.cmp(&format_version) {
             Ordering::Greater => {
                 return Err(Error::new(
@@ -89,7 +126,7 @@ impl<'a> Transaction<'a> {
                 ));
             }
             Ordering::Less => {
-                self.append_updates(vec![UpgradeFormatVersion { format_version }])?;
+                self.apply(vec![UpgradeFormatVersion { format_version }], vec![])?;
             }
             Ordering::Equal => {
                 // Do nothing.
@@ -100,7 +137,7 @@ impl<'a> Transaction<'a> {
 
     /// Update table's property.
     pub fn set_properties(mut self, props: HashMap<String, String>) -> Result<Self> {
-        self.append_updates(vec![TableUpdate::SetProperties { updates: props }])?;
+        self.apply(vec![TableUpdate::SetProperties { updates: props }], vec![])?;
         Ok(self)
     }
 
@@ -116,7 +153,7 @@ impl<'a> Transaction<'a> {
         };
         let mut snapshot_id = generate_random_id();
         while self
-            .table
+            .current_table
             .metadata()
             .snapshots()
             .any(|s| s.snapshot_id() == snapshot_id)
@@ -129,11 +166,43 @@ impl<'a> Transaction<'a> {
     /// Creates a fast append action.
     pub fn fast_append(
         self,
+        snapshot_id: Option<i64>,
         commit_uuid: Option<Uuid>,
         key_metadata: Vec<u8>,
     ) -> Result<FastAppendAction<'a>> {
-        let snapshot_id = self.generate_unique_snapshot_id();
+        let snapshot_id = if let Some(snapshot_id) = snapshot_id {
+            if self
+                .current_table
+                .metadata()
+                .snapshots()
+                .any(|s| s.snapshot_id() == snapshot_id)
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot id {} already exists", snapshot_id),
+                ));
+            }
+            snapshot_id
+        } else {
+            self.generate_unique_snapshot_id()
+        };
         FastAppendAction::new(
+            self,
+            snapshot_id,
+            commit_uuid.unwrap_or_else(Uuid::now_v7),
+            key_metadata,
+            HashMap::new(),
+        )
+    }
+
+    /// Creates a merge append action.
+    pub fn merge_append(
+        self,
+        commit_uuid: Option<Uuid>,
+        key_metadata: Vec<u8>,
+    ) -> Result<MergeAppendAction<'a>> {
+        let snapshot_id = self.generate_unique_snapshot_id();
+        MergeAppendAction::new(
             self,
             snapshot_id,
             commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -150,16 +219,24 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Creates remove snapshot action.
+    pub fn expire_snapshot(self) -> RemoveSnapshotAction<'a> {
+        RemoveSnapshotAction::new(self)
+    }
+
     /// Remove properties in table.
     pub fn remove_properties(mut self, keys: Vec<String>) -> Result<Self> {
-        self.append_updates(vec![TableUpdate::RemoveProperties { removals: keys }])?;
+        self.apply(
+            vec![TableUpdate::RemoveProperties { removals: keys }],
+            vec![],
+        )?;
         Ok(self)
     }
 
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         let table_commit = TableCommit::builder()
-            .ident(self.table.identifier().clone())
+            .ident(self.base_table.identifier().clone())
             .updates(self.updates)
             .requirements(self.requirements)
             .build();
