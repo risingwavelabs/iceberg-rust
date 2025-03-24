@@ -502,6 +502,7 @@ mod tests {
 
         // check add data file with incompatible partition value
         let data_file = DataFileBuilder::default()
+            .partition_spec_id(0)
             .content(DataContentType::Data)
             .file_path("test/3.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
@@ -513,6 +514,7 @@ mod tests {
         assert!(action.add_data_files(vec![data_file.clone()]).is_err());
 
         let data_file = DataFileBuilder::default()
+            .partition_spec_id(0)
             .content(DataContentType::Data)
             .file_path("test/3.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
@@ -528,14 +530,15 @@ mod tests {
         assert!(
             matches!((&tx.updates[0],&tx.updates[1]), (TableUpdate::AddSnapshot { snapshot },TableUpdate::SetSnapshotRef { reference,ref_name }) if snapshot.snapshot_id() == reference.snapshot_id && ref_name == MAIN_BRANCH)
         );
+        // requriments is based on original table metadata
         assert_eq!(
             vec![
                 TableRequirement::UuidMatch {
-                    uuid: tx.current_table.metadata().uuid()
+                    uuid: table.metadata().uuid()
                 },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
-                    snapshot_id: tx.current_table.metadata().current_snapshot_id
+                    snapshot_id: table.metadata().current_snapshot_id()
                 }
             ],
             tx.requirements
