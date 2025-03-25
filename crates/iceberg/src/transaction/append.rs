@@ -25,9 +25,10 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    generate_unique_snapshot_id, DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::{Error, ErrorKind};
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
 pub struct FastAppendAction {
@@ -38,6 +39,7 @@ pub struct FastAppendAction {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
+    snapshot_id: Option<i64>,
 }
 
 impl FastAppendAction {
@@ -49,6 +51,7 @@ impl FastAppendAction {
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             added_delete_files: vec![],
+            snapshot_id: None,
         }
     }
 
@@ -90,11 +93,33 @@ impl FastAppendAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
+
+    /// Set snapshot id
+    pub fn set_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
 }
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        let snapshot_id = if let Some(snapshot_id) = self.snapshot_id {
+            if table
+                .metadata()
+                .snapshots()
+                .any(|s| s.snapshot_id() == snapshot_id)
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot id {} already exists", snapshot_id),
+                ));
+            }
+            snapshot_id
+        } else {
+            generate_unique_snapshot_id(table)
+        };
+
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -102,6 +127,7 @@ impl TransactionAction for FastAppendAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             self.added_delete_files.clone(),
+            snapshot_id,
         );
 
         // validate added files
