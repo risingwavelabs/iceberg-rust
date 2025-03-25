@@ -19,12 +19,12 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 
+use futures::channel::mpsc::{channel, Sender};
 use futures::StreamExt;
-use futures::channel::mpsc::{Sender, channel};
 use tokio::sync::Notify;
 
 use crate::runtime::spawn;
-use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
+use crate::scan::{DeleteFileContext, FileScanTask};
 use crate::spec::{DataContentType, DataFile, Struct};
 
 /// Index of delete files
@@ -85,7 +85,7 @@ impl DeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Vec<FileScanTaskDeleteFile> {
+    ) -> Vec<FileScanTask> {
         let notifier = {
             let guard = self.state.read().unwrap();
             match *guard {
@@ -132,10 +132,11 @@ impl PopulatedDeleteFileIndex {
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
             if partition.fields().is_empty() {
                 // TODO: confirm we're good to skip here if we encounter a pos del
-                if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
-                    global_deletes.push(arc_ctx);
-                    return;
-                }
+                // FIXME(Dylan): allow putting position delete to global deletes.
+                // if arc_ctx.manifest_entry.content_type() != DataContentType::PositionDeletes {
+                global_deletes.push(arc_ctx);
+                return;
+                // }
             }
 
             let destination_map = match arc_ctx.manifest_entry.content_type() {
@@ -164,7 +165,7 @@ impl PopulatedDeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Vec<FileScanTaskDeleteFile> {
+    ) -> Vec<FileScanTask> {
         let mut results = vec![];
 
         self.global_deletes
