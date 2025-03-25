@@ -3129,7 +3129,6 @@ version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
- "chrono",
  "ctor",
  "datafusion",
  "futures",
