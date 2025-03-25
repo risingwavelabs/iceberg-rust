@@ -19,14 +19,14 @@ use std::collections::HashMap;
 
 use arrow_array::{Int64Array, StringArray};
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::oneshot::{Receiver, channel};
+use tokio::sync::oneshot::{channel, Receiver};
 
 use super::delete_filter::DeleteFilter;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate;
 use crate::io::FileIO;
-use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
+use crate::scan::{ArrowRecordBatchStream, FileScanTask};
 use crate::spec::{DataContentType, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
@@ -129,7 +129,7 @@ impl CachingDeleteFileLoader {
     /// ```
     pub(crate) fn load_deletes(
         &self,
-        delete_file_entries: &[FileScanTaskDeleteFile],
+        delete_file_entries: &[FileScanTask],
         schema: SchemaRef,
     ) -> Receiver<Result<DeleteFilter>> {
         let (tx, rx) = channel();
@@ -195,30 +195,30 @@ impl CachingDeleteFileLoader {
     }
 
     async fn load_file_for_task(
-        task: &FileScanTaskDeleteFile,
+        task: &FileScanTask,
         basic_delete_file_loader: BasicDeleteFileLoader,
         del_filter: DeleteFilter,
         schema: SchemaRef,
     ) -> Result<DeleteFileContext> {
-        match task.file_type {
+        match task.data_file_content {
             DataContentType::PositionDeletes => Ok(DeleteFileContext::PosDels(
                 basic_delete_file_loader
-                    .parquet_to_batch_stream(&task.file_path)
+                    .parquet_to_batch_stream(task.data_file_path())
                     .await?,
             )),
 
             DataContentType::EqualityDeletes => {
-                let Some(notify) = del_filter.try_start_eq_del_load(&task.file_path) else {
+                let Some(notify) = del_filter.try_start_eq_del_load(task.data_file_path()) else {
                     return Ok(DeleteFileContext::ExistingEqDel);
                 };
 
                 let (sender, receiver) = channel();
-                del_filter.insert_equality_delete(&task.file_path, receiver);
+                del_filter.insert_equality_delete(task.data_file_path(), receiver);
 
                 Ok(DeleteFileContext::FreshEqDel {
                     batch_stream: BasicDeleteFileLoader::evolve_schema(
                         basic_delete_file_loader
-                            .parquet_to_batch_stream(&task.file_path)
+                            .parquet_to_batch_stream(task.data_file_path())
                             .await?,
                         schema,
                     )
