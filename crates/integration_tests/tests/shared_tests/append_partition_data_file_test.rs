@@ -96,7 +96,7 @@ async fn test_append_partition_data_file() {
         Some(Struct::from_iter([Some(Literal::Primitive(
             PrimitiveLiteral::Int(first_partition_id_value),
         ))])),
-        0
+        0,
     )
     .build()
     .await
@@ -170,7 +170,7 @@ async fn test_schema_incompatible_partition_type(
         Some(Struct::from_iter([Some(Literal::Primitive(
             PrimitiveLiteral::Boolean(true),
         ))])),
-        0
+        0,
     )
     .build()
     .await
@@ -210,7 +210,7 @@ async fn test_schema_incompatible_partition_fields(
                 first_partition_id_value,
             ))),
         ])),
-        0
+        0,
     )
     .build()
     .await
