@@ -44,6 +44,7 @@ use crate::{Error, ErrorKind, Result};
 /// | GCS                | `storage-gcs`     | `gs`, `gcs`                      | `gs://<bucket>/path/to/file`  |
 /// | OSS                | `storage-oss`     | `oss`                            | `oss://<bucket>/path/to/file` |
 /// | Azure Datalake     | `storage-azdls`   | `abfs`, `abfss`, `wasb`, `wasbs` | `abfs://<filesystem>@<account>.dfs.core.windows.net/path/to/file` or `wasb://<container>@<account>.blob.core.windows.net/path/to/file` |
+/// | AZBLOB             | `storage-azblob`  | `azblob`
 #[derive(Clone, Debug)]
 pub struct FileIO {
     builder: FileIOBuilder,
@@ -464,13 +465,13 @@ impl OutputFile {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{File, create_dir_all};
+    use std::fs::{create_dir_all, File};
     use std::io::Write;
     use std::path::Path;
 
     use bytes::Bytes;
-    use futures::AsyncReadExt;
     use futures::io::AllowStdIo;
+    use futures::AsyncReadExt;
     use tempfile::TempDir;
 
     use super::{FileIO, FileIOBuilder};
