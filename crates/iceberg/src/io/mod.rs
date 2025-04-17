@@ -22,8 +22,8 @@
 //! We provided a `FileIOBuilder` to build `FileIO` from scratch. For example:
 //!
 //! ```rust
-//! use iceberg::Result;
 //! use iceberg::io::{FileIOBuilder, S3_REGION};
+//! use iceberg::Result;
 //!
 //! # fn test() -> Result<()> {
 //! // Build a memory file io.
@@ -41,8 +41,8 @@
 //! Or you can pass a path to ask `FileIO` to infer schema for you:
 //!
 //! ```rust
-//! use iceberg::Result;
 //! use iceberg::io::{FileIO, S3_REGION};
+//! use iceberg::Result;
 //!
 //! # fn test() -> Result<()> {
 //! // Build a memory file io.
@@ -84,6 +84,8 @@ mod storage_memory;
 mod storage_oss;
 #[cfg(feature = "storage-s3")]
 mod storage_s3;
+#[cfg(feature = "storage-azblob")]
+mod storage_azblob;
 
 #[cfg(feature = "storage-azdls")]
 pub use storage_azdls::*;
@@ -97,6 +99,8 @@ use storage_memory::*;
 pub use storage_oss::*;
 #[cfg(feature = "storage-s3")]
 pub use storage_s3::*;
+#[cfg(feature = "storage-azblob")]
+pub use storage_azblob::*;
 
 pub(crate) fn is_truthy(value: &str) -> bool {
     ["true", "t", "1", "on"].contains(&value.to_lowercase().as_str())

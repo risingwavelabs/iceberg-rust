@@ -75,7 +75,7 @@ faststr = "0.2.31"
 fnv = "1.0.7"
 fs-err = "3.1.0"
 futures = "0.3"
-hive_metastore = "0.1"
+hive_metastore = "0.2"
 http = "1.2"
 iceberg = { version = "0.6.0", path = "./crates/iceberg" }
 iceberg-catalog-rest = { version = "0.6.0", path = "./crates/catalog/rest" }
