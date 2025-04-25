@@ -700,6 +700,7 @@ impl ManifestEntryContext {
             deletes,
             sequence_number: self.manifest_entry.sequence_number().unwrap_or(0),
             equality_ids: self.manifest_entry.data_file().equality_ids().to_vec(),
+            file_size_in_bytes: self.manifest_entry.data_file().file_size_in_bytes(),
         })
     }
 }
@@ -1066,6 +1067,9 @@ pub struct FileScanTask {
     pub sequence_number: i64,
     /// equality ids
     pub equality_ids: Vec<i32>,
+
+    /// The size of the file in bytes.
+    pub file_size_in_bytes: u64,
 }
 
 /// A task to scan part of file.
@@ -1116,6 +1120,7 @@ impl From<&DeleteFileContext> for FileScanTask {
             deletes: vec![],
             sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
             equality_ids: ctx.manifest_entry.data_file().equality_ids().to_vec(),
+            file_size_in_bytes: ctx.manifest_entry.data_file().file_size_in_bytes(),
         }
     }
 }
