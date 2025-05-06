@@ -260,7 +260,10 @@ mod tests {
     use std::io::BufReader;
 
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct, TableMetadata, MAIN_BRANCH};
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct,
+        TableMetadata, MAIN_BRANCH,
+    };
     use crate::table::Table;
     use crate::transaction::Transaction;
     use crate::{TableIdent, TableRequirement, TableUpdate};

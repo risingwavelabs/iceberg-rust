@@ -841,13 +841,11 @@ pub fn metadata_path(meta_data_location: &str, uuid: Uuid) -> String {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::hash::Hash;
-    use iceberg::spec::SnapshotReference;
-    use iceberg::spec::SnapshotRetention;
-    use iceberg::spec::MAIN_BRANCH;
 
     use iceberg::io::FileIOBuilder;
     use iceberg::spec::{
-        NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot, SortOrder, Type,
+        NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot, SnapshotReference,
+        SnapshotRetention, SortOrder, Type, MAIN_BRANCH,
     };
     use iceberg::table::Table;
     use iceberg::{
