@@ -32,13 +32,13 @@ use crate::{Error, ErrorKind};
 
 /// Target size of manifest file when merging manifests.
 pub const MANIFEST_TARGET_SIZE_BYTES: &str = "commit.manifest.target-size-bytes";
-const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024; // 8 MB
+pub const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024; // 8 MB
 /// Minimum number of manifests to merge.
 pub const MANIFEST_MIN_MERGE_COUNT: &str = "commit.manifest.min-count-to-merge";
-const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
+pub const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
 /// Whether allow to merge manifests.
 pub const MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
-const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
+pub const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
 pub struct FastAppendAction<'a> {
@@ -187,7 +187,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
 
     async fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProduceAction<'_>,
+        snapshot_produce: &mut SnapshotProduceAction<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce
             .tx
