@@ -37,7 +37,7 @@ use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
 use crate::client::{
-    HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
+    deserialize_catalog_response, deserialize_unexpected_catalog_error, HttpClient,
 };
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateTableRequest,
@@ -619,7 +619,7 @@ impl Catalog for RestCatalog {
             .config
             .unwrap_or_default()
             .into_iter()
-            .chain(self.user_config.props.clone().into_iter())
+            .chain(self.user_config.props.clone())
             .collect();
 
         let file_io = self
@@ -670,7 +670,7 @@ impl Catalog for RestCatalog {
             .config
             .unwrap_or_default()
             .into_iter()
-            .chain(self.user_config.props.clone().into_iter())
+            .chain(self.user_config.props.clone())
             .collect();
 
         let file_io = self
@@ -1600,12 +1600,10 @@ mod tests {
 
         let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build());
 
-        assert!(
-            catalog
-                .namespace_exists(&NamespaceIdent::new("ns1".to_string()))
-                .await
-                .unwrap()
-        );
+        assert!(catalog
+            .namespace_exists(&NamespaceIdent::new("ns1".to_string()))
+            .await
+            .unwrap());
 
         config_mock.assert_async().await;
         get_ns_mock.assert_async().await;
@@ -1922,15 +1920,13 @@ mod tests {
 
         let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build());
 
-        assert!(
-            catalog
-                .table_exists(&TableIdent::new(
-                    NamespaceIdent::new("ns1".to_string()),
-                    "table1".to_string(),
-                ))
-                .await
-                .unwrap()
-        );
+        assert!(catalog
+            .table_exists(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "table1".to_string(),
+            ))
+            .await
+            .unwrap());
 
         config_mock.assert_async().await;
         check_table_exists_mock.assert_async().await;
@@ -2147,13 +2143,11 @@ mod tests {
             .properties(HashMap::from([("owner".to_string(), "testx".to_string())]))
             .partition_spec(
                 UnboundPartitionSpec::builder()
-                    .add_partition_fields(vec![
-                        UnboundPartitionField::builder()
-                            .source_id(1)
-                            .transform(Transform::Truncate(3))
-                            .name("id".to_string())
-                            .build(),
-                    ])
+                    .add_partition_fields(vec![UnboundPartitionField::builder()
+                        .source_id(1)
+                        .transform(Transform::Truncate(3))
+                        .name("id".to_string())
+                        .build()])
                     .unwrap()
                     .build(),
             )
@@ -2298,13 +2292,11 @@ mod tests {
             .await;
 
         assert!(table_result.is_err());
-        assert!(
-            table_result
-                .err()
-                .unwrap()
-                .message()
-                .contains("already exists")
-        );
+        assert!(table_result
+            .err()
+            .unwrap()
+            .message()
+            .contains("already exists"));
 
         config_mock.assert_async().await;
         create_table_mock.assert_async().await;
@@ -2509,13 +2501,11 @@ mod tests {
             .await;
 
         assert!(table_result.is_err());
-        assert!(
-            table_result
-                .err()
-                .unwrap()
-                .message()
-                .contains("does not exist")
-        );
+        assert!(table_result
+            .err()
+            .unwrap()
+            .message()
+            .contains("does not exist"));
 
         config_mock.assert_async().await;
         update_table_mock.assert_async().await;
