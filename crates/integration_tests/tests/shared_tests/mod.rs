@@ -32,6 +32,7 @@ mod read_evolved_schema;
 mod read_positional_deletes;
 mod remove_snapshots_test;
 mod scan_all_type;
+mod rewrite_files_test;
 
 pub async fn random_ns() -> Namespace {
     let fixture = get_shared_containers();
