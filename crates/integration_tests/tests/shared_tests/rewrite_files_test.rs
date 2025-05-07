@@ -187,3 +187,180 @@ async fn test_rewrite_data_files() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0], batch);
 }
+
+#[tokio::test]
+async fn test_empty_rewrite() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalog::new(fixture.catalog_config.clone());
+    let ns = random_ns().await;
+    let schema = test_schema();
+
+    let table_creation = TableCreation::builder()
+        .name("t2".to_string())
+        .schema(schema.clone())
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
+    let tx = rewrite_action.apply().await.unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+
+    let batch_stream = table
+        .scan()
+        .select_all()
+        .build()
+        .unwrap()
+        .to_arrow()
+        .await
+        .unwrap();
+    let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+    assert!(batches.is_empty());
+}
+
+#[tokio::test]
+async fn test_multiple_file_rewrite() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalog::new(fixture.catalog_config.clone());
+    let ns = random_ns().await;
+    let schema = test_schema();
+
+    let table_creation = TableCreation::builder()
+        .name("t3".to_string())
+        .schema(schema.clone())
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "test".to_string(),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        table.file_io().clone(),
+        location_generator.clone(),
+        file_name_generator.clone(),
+    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
+    let mut data_file_writer = data_file_writer_builder.clone().build().await.unwrap();
+    let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
+    let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
+    let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![
+        Arc::new(col1) as ArrayRef,
+        Arc::new(col2) as ArrayRef,
+        Arc::new(col3) as ArrayRef,
+    ])
+    .unwrap();
+    data_file_writer.write(batch.clone()).await.unwrap();
+    let data_file1 = data_file_writer.close().await.unwrap();
+
+    let mut data_file_writer = data_file_writer_builder.clone().build().await.unwrap();
+    data_file_writer.write(batch.clone()).await.unwrap();
+    let data_file2 = data_file_writer.close().await.unwrap();
+
+    let tx = Transaction::new(&table);
+    let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
+    rewrite_action.add_data_files(data_file1.clone()).unwrap();
+    rewrite_action.add_data_files(data_file2.clone()).unwrap();
+    let tx = rewrite_action.apply().await.unwrap();
+    let table = tx.commit(&rest_catalog).await.unwrap();
+
+    let batch_stream = table
+        .scan()
+        .select_all()
+        .build()
+        .unwrap()
+        .to_arrow()
+        .await
+        .unwrap();
+    let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0], batch);
+    assert_eq!(batches[1], batch);
+}
+
+#[tokio::test]
+async fn test_rewrite_nonexistent_file() {
+    let fixture = get_shared_containers();
+    let rest_catalog = RestCatalog::new(fixture.catalog_config.clone());
+    let ns = random_ns().await;
+    let schema = test_schema();
+
+    let table_creation = TableCreation::builder()
+        .name("t4".to_string())
+        .schema(schema.clone())
+        .build();
+
+    let table = rest_catalog
+        .create_table(ns.name(), table_creation)
+        .await
+        .unwrap();
+
+    let schema: Arc<arrow_schema::Schema> = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "test".to_string(),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        table.file_io().clone(),
+        location_generator.clone(),
+        file_name_generator.clone(),
+    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
+
+    // Create a valid data file
+    let mut data_file_writer = data_file_writer_builder.build().await.unwrap();
+    let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
+    let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
+    let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![
+        Arc::new(col1) as ArrayRef,
+        Arc::new(col2) as ArrayRef,
+        Arc::new(col3) as ArrayRef,
+    ])
+    .unwrap();
+    data_file_writer.write(batch.clone()).await.unwrap();
+    let valid_data_file = data_file_writer.close().await.unwrap();
+
+    // Create a nonexistent data file (simulated by not writing it)
+    let nonexistent_data_file = valid_data_file.clone();
+
+    let tx = Transaction::new(&table);
+    let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
+
+    // Attempt to delete the nonexistent file
+    let result = rewrite_action.delete_files(nonexistent_data_file);
+
+    assert!(result.is_ok());
+}

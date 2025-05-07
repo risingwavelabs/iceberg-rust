@@ -35,7 +35,6 @@ use crate::spec::{
 };
 
 /// Transaction action for rewriting files.
-#[allow(dead_code)]
 pub struct RewriteFilesAction<'a> {
     snapshot_produce_action: SnapshotProduceAction<'a>,
     target_size_bytes: u32,
@@ -43,11 +42,9 @@ pub struct RewriteFilesAction<'a> {
     merge_enabled: bool,
 }
 
-#[allow(dead_code)]
 struct RewriteFilesOperation;
 
 impl<'a> RewriteFilesAction<'a> {
-    #[allow(dead_code)]
     pub fn new(
         tx: Transaction<'a>,
         snapshot_id: i64,

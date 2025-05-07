@@ -181,7 +181,6 @@ impl<'a> SnapshotProduceAction<'a> {
         &mut self,
         remove_data_files: impl IntoIterator<Item = DataFile>,
     ) -> Result<&mut Self> {
-        // let data_files: Vec<DataFile> = remove_data_files.into_iter().collect();
         for data_file in remove_data_files.into_iter() {
             Self::validate_partition_value(
                 data_file.partition(),
