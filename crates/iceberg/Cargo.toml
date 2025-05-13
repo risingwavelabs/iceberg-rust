@@ -39,7 +39,7 @@ storage-gcs = ["opendal/services-gcs"]
 storage-azblob = ["opendal/services-azblob"]
 
 async-std = ["dep:async-std"]
-tokio = ["dep:tokio"]
+tokio = []
 
 [dependencies]
 anyhow = { workspace = true }
