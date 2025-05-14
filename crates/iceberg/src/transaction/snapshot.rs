@@ -175,6 +175,28 @@ impl<'a> SnapshotProduceAction<'a> {
         Ok(self)
     }
 
+    pub fn delete_files(
+        &mut self,
+        remove_data_files: impl IntoIterator<Item = DataFile>,
+    ) -> Result<&mut Self> {
+        for data_file in remove_data_files.into_iter() {
+            Self::validate_partition_value(
+                data_file.partition(),
+                self.tx.current_table.metadata().default_partition_type(),
+            )?;
+            if data_file.content_type() == DataContentType::Data {
+                self.removed_data_file_paths
+                    .insert(data_file.file_path.clone());
+                self.removed_data_files.push(data_file);
+            } else {
+                self.removed_delete_file_paths
+                    .insert(data_file.file_path.clone());
+                self.removed_delete_files.push(data_file);
+            }
+        }
+        Ok(self)
+    }
+
     pub fn new_manifest_writer(
         &mut self,
         content_type: &ManifestContentType,
@@ -454,31 +476,6 @@ impl<'a> SnapshotProduceAction<'a> {
             ],
         )?;
         Ok(self.tx)
-    }
-
-    /// Add remove files to the snapshot.
-    #[allow(dead_code)]
-    pub fn delete_files(
-        &mut self,
-        remove_data_files: impl IntoIterator<Item = DataFile>,
-    ) -> Result<&mut Self> {
-        // let data_files: Vec<DataFile> = remove_data_files.into_iter().collect();
-        for data_file in remove_data_files.into_iter() {
-            Self::validate_partition_value(
-                data_file.partition(),
-                self.tx.current_table.metadata().default_partition_type(),
-            )?;
-            if data_file.content_type() == DataContentType::Data {
-                self.removed_data_file_paths
-                    .insert(data_file.file_path.clone());
-                self.removed_data_files.push(data_file);
-            } else {
-                self.removed_delete_file_paths
-                    .insert(data_file.file_path.clone());
-                self.removed_delete_files.push(data_file);
-            }
-        }
-        Ok(self)
     }
 }
 

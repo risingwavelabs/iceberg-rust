@@ -24,104 +24,17 @@ use super::snapshot::{
     DefaultManifestProcess, MergeManifestProcess, SnapshotProduceAction, SnapshotProduceOperation,
 };
 use super::{
-    MANIFEST_MERGE_ENABLED, MANIFEST_MERGE_ENABLED_DEFAULT, MANIFEST_MIN_MERGE_COUNT,
+    Transaction, MANIFEST_MERGE_ENABLED, MANIFEST_MERGE_ENABLED_DEFAULT, MANIFEST_MIN_MERGE_COUNT,
     MANIFEST_MIN_MERGE_COUNT_DEFAULT, MANIFEST_TARGET_SIZE_BYTES,
     MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
 };
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    NullOrder, Operation, SortDirection, SortField, SortOrder, Transform,
+    Operation,
 };
-use crate::transaction::Transaction;
-use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
-
-/// Transaction action for replacing sort order.
-pub struct ReplaceSortOrderAction<'a> {
-    pub tx: Transaction<'a>,
-    pub sort_fields: Vec<SortField>,
-}
-
-impl<'a> ReplaceSortOrderAction<'a> {
-    /// Adds a field for sorting in ascending order.
-    pub fn asc(self, name: &str, null_order: NullOrder) -> Result<Self> {
-        self.add_sort_field(name, SortDirection::Ascending, null_order)
-    }
-
-    /// Adds a field for sorting in descending order.
-    pub fn desc(self, name: &str, null_order: NullOrder) -> Result<Self> {
-        self.add_sort_field(name, SortDirection::Descending, null_order)
-    }
-
-    /// Finished building the action and apply it to the transaction.
-    pub fn apply(mut self) -> Result<Transaction<'a>> {
-        let unbound_sort_order = SortOrder::builder()
-            .with_fields(self.sort_fields)
-            .build_unbound()?;
-
-        let updates = vec![
-            TableUpdate::AddSortOrder {
-                sort_order: unbound_sort_order,
-            },
-            TableUpdate::SetDefaultSortOrder { sort_order_id: -1 },
-        ];
-
-        let requirements = vec![
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: self
-                    .tx
-                    .current_table
-                    .metadata()
-                    .current_schema()
-                    .schema_id(),
-            },
-            TableRequirement::DefaultSortOrderIdMatch {
-                default_sort_order_id: self
-                    .tx
-                    .current_table
-                    .metadata()
-                    .default_sort_order()
-                    .order_id,
-            },
-        ];
-
-        self.tx.apply(updates, requirements)?;
-        Ok(self.tx)
-    }
-
-    fn add_sort_field(
-        mut self,
-        name: &str,
-        sort_direction: SortDirection,
-        null_order: NullOrder,
-    ) -> Result<Self> {
-        let field_id = self
-            .tx
-            .current_table
-            .metadata()
-            .current_schema()
-            .field_id_by_name(name)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Cannot find field {} in table schema", name),
-                )
-            })?;
-
-        let sort_field = SortField::builder()
-            .source_id(field_id)
-            .transform(Transform::Identity)
-            .direction(sort_direction)
-            .null_order(null_order)
-            .build();
-
-        self.sort_fields.push(sort_field);
-        Ok(self)
-    }
-}
 
 /// Transaction action for rewriting files.
-#[allow(dead_code)]
 pub struct RewriteFilesAction<'a> {
     snapshot_produce_action: SnapshotProduceAction<'a>,
     target_size_bytes: u32,
@@ -129,11 +42,9 @@ pub struct RewriteFilesAction<'a> {
     merge_enabled: bool,
 }
 
-#[allow(dead_code)]
 struct RewriteFilesOperation;
 
 impl<'a> RewriteFilesAction<'a> {
-    #[allow(dead_code)]
     pub fn new(
         tx: Transaction<'a>,
         snapshot_id: i64,
@@ -179,6 +90,7 @@ impl<'a> RewriteFilesAction<'a> {
     }
 
     /// Add data files to the snapshot.
+
     pub fn add_data_files(
         &mut self,
         data_files: impl IntoIterator<Item = DataFile>,
@@ -356,41 +268,5 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         }
 
         Ok(existing_files)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::transaction::tests::make_v2_table;
-    use crate::transaction::Transaction;
-    use crate::{TableRequirement, TableUpdate};
-
-    #[test]
-    fn test_replace_sort_order() {
-        let table = make_v2_table();
-        let tx = Transaction::new(&table);
-        let tx = tx.replace_sort_order().apply().unwrap();
-
-        assert_eq!(
-            vec![
-                TableUpdate::AddSortOrder {
-                    sort_order: Default::default()
-                },
-                TableUpdate::SetDefaultSortOrder { sort_order_id: -1 }
-            ],
-            tx.updates
-        );
-
-        assert_eq!(
-            vec![
-                TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: 1
-                },
-                TableRequirement::DefaultSortOrderIdMatch {
-                    default_sort_order_id: 3
-                }
-            ],
-            tx.requirements
-        );
     }
 }
