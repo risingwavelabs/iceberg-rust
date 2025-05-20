@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use opendal::layers::RetryLayer;
+use opendal::layers::{RetryLayer, TimeoutLayer};
 #[cfg(feature = "storage-gcs")]
 use opendal::services::GcsConfig;
 #[cfg(feature = "storage-s3")]
@@ -160,7 +160,7 @@ impl Storage {
 
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
-        let operator = operator.layer(RetryLayer::new());
+        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
 
         Ok((operator, relative_path))
     }
