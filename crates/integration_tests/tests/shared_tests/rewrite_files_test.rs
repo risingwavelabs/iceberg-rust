@@ -165,11 +165,13 @@ async fn test_rewrite_data_files() {
 
     // commit result again
     let tx = Transaction::new(&table);
-    let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
-    rewrite_action
+    let rewrite_action = tx
+        .rewrite_files(None, vec![])
+        .unwrap()
         .add_data_files(data_file_rewrite.clone())
+        .unwrap()
+        .delete_files(data_file.clone())
         .unwrap();
-    rewrite_action.delete_files(data_file.clone()).unwrap();
 
     let tx = rewrite_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
@@ -279,9 +281,13 @@ async fn test_multiple_file_rewrite() {
     let data_file2 = data_file_writer.close().await.unwrap();
 
     let tx = Transaction::new(&table);
-    let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
-    rewrite_action.add_data_files(data_file1.clone()).unwrap();
-    rewrite_action.add_data_files(data_file2.clone()).unwrap();
+    let rewrite_action = tx
+        .rewrite_files(None, vec![])
+        .unwrap()
+        .add_data_files(data_file1.clone())
+        .unwrap()
+        .add_data_files(data_file2.clone())
+        .unwrap();
     let tx = rewrite_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
 
@@ -357,7 +363,7 @@ async fn test_rewrite_nonexistent_file() {
     let nonexistent_data_file = valid_data_file.clone();
 
     let tx = Transaction::new(&table);
-    let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
+    let rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
 
     // Attempt to delete the nonexistent file
     let result = rewrite_action.delete_files(nonexistent_data_file);
