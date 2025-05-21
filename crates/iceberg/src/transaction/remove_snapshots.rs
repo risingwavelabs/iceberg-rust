@@ -18,18 +18,22 @@
 //! Transaction action for removing snapshot.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
 use itertools::Itertools;
 
+use super::utils::ReachableFileCleanupStrategy;
 use crate::error::Result;
+use crate::io::FileIO;
 use crate::spec::{
-    SnapshotReference, SnapshotRetention, MAIN_BRANCH, MAX_REF_AGE_MS, MAX_REF_AGE_MS_DEFAULT,
-    MAX_SNAPSHOT_AGE_MS, MAX_SNAPSHOT_AGE_MS_DEFAULT, MIN_SNAPSHOTS_TO_KEEP,
-    MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+    SnapshotReference, SnapshotRetention, TableMetadataRef, MAIN_BRANCH, MAX_REF_AGE_MS,
+    MAX_REF_AGE_MS_DEFAULT, MAX_SNAPSHOT_AGE_MS, MAX_SNAPSHOT_AGE_MS_DEFAULT,
+    MIN_SNAPSHOTS_TO_KEEP, MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
 };
+use crate::table::Table;
 use crate::transaction::Transaction;
 use crate::utils::ancestors_of;
-use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
+use crate::{Catalog, Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// RemoveSnapshotAction is a transaction action for removing snapshot.
 pub struct RemoveSnapshotAction<'a> {
@@ -110,9 +114,12 @@ impl<'a> RemoveSnapshotAction<'a> {
     }
 
     /// Finished building the action and apply it to the transaction.
-    pub async fn apply(mut self) -> Result<Transaction<'a>> {
+    pub async fn apply(mut self) -> Result<RemoveSnapshotApplyResult<'a>> {
         if self.tx.current_table.metadata().refs.is_empty() {
-            return Ok(self.tx);
+            return Ok(RemoveSnapshotApplyResult {
+                tx: self.tx,
+                clear_expired_files: self.clear_expire_files,
+            });
         }
 
         let table_meta = self.tx.current_table.metadata().clone();
@@ -255,7 +262,10 @@ impl<'a> RemoveSnapshotAction<'a> {
             },
         ])?;
 
-        Ok(self.tx)
+        Ok(RemoveSnapshotApplyResult {
+            tx: self.tx,
+            clear_expired_files: self.clear_expire_files,
+        })
     }
 
     fn compute_retained_refs(
@@ -400,6 +410,47 @@ impl<'a> RemoveSnapshotAction<'a> {
         }
 
         ids_to_retain
+    }
+}
+
+pub struct RemoveSnapshotApplyResult<'a> {
+    tx: Transaction<'a>,
+    clear_expired_files: bool,
+}
+
+impl RemoveSnapshotApplyResult<'_> {
+    pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        let after_expiration = self.tx.current_table.metadata_ref();
+        let before_expiration = self.tx.base_table.metadata_ref();
+        let file_io = self.tx.current_table.file_io().clone();
+
+        let table = self.tx.commit(catalog).await?;
+
+        if self.clear_expired_files {
+            Self::clean_expired_files(file_io, &before_expiration, &after_expiration).await?;
+        }
+
+        Ok(table)
+    }
+
+    async fn clean_expired_files(
+        file_io: FileIO,
+        before_expiration: &TableMetadataRef,
+        after_expiration: &TableMetadataRef,
+    ) -> Result<()> {
+        let file_cleanup_strategy = ReachableFileCleanupStrategy::new(file_io);
+
+        file_cleanup_strategy
+            .clean_files(before_expiration, after_expiration)
+            .await
+    }
+}
+
+impl<'a> Deref for RemoveSnapshotApplyResult<'a> {
+    type Target = Transaction<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
     }
 }
 
