@@ -38,7 +38,7 @@ use crate::{Catalog, Error, ErrorKind, TableRequirement, TableUpdate};
 /// RemoveSnapshotAction is a transaction action for removing snapshot.
 pub struct RemoveSnapshotAction<'a> {
     tx: Transaction<'a>,
-    clear_expire_files: bool,
+    clear_expired_files: bool,
     ids_to_remove: HashSet<i64>,
     default_expired_older_than: i64,
     default_min_num_snapshots: i32,
@@ -73,7 +73,7 @@ impl<'a> RemoveSnapshotAction<'a> {
 
         Self {
             tx,
-            clear_expire_files: false,
+            clear_expired_files: false,
             ids_to_remove: HashSet::new(),
             default_expired_older_than: now - default_max_snapshot_age_ms,
             default_min_num_snapshots,
@@ -84,8 +84,8 @@ impl<'a> RemoveSnapshotAction<'a> {
     }
 
     /// Finished building the action and apply it to the transaction.
-    pub fn clear_expire_files(mut self, clear_expire_files: bool) -> Self {
-        self.clear_expire_files = clear_expire_files;
+    pub fn clear_expired_files(mut self, clear_expired_files: bool) -> Self {
+        self.clear_expired_files = clear_expired_files;
         self
     }
 
@@ -118,7 +118,7 @@ impl<'a> RemoveSnapshotAction<'a> {
         if self.tx.current_table.metadata().refs.is_empty() {
             return Ok(RemoveSnapshotApplyResult {
                 tx: self.tx,
-                clear_expired_files: self.clear_expire_files,
+                clear_expired_files: self.clear_expired_files,
             });
         }
 
@@ -264,7 +264,7 @@ impl<'a> RemoveSnapshotAction<'a> {
 
         Ok(RemoveSnapshotApplyResult {
             tx: self.tx,
-            clear_expired_files: self.clear_expire_files,
+            clear_expired_files: self.clear_expired_files,
         })
     }
 
