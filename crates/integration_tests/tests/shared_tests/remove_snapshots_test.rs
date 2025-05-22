@@ -297,22 +297,22 @@ async fn test_clean_expired_files() {
     let new_snapshots = t.metadata().snapshots().collect::<Vec<_>>();
     assert_eq!(5, new_snapshots.len());
 
-    for idx in 0..5 {
+    for data_file in data_files_vec.iter().take(5) {
         // check if the data file is deleted
         let result = t
             .file_io()
-            .new_input(data_files_vec[idx].file_path())
+            .new_input(data_file.file_path())
             .unwrap()
             .read()
             .await;
         assert!(result.is_err());
     }
 
-    for idx in 5..10 {
+    for data_file in data_files_vec.iter().take(10).skip(5) {
         // check if the data file is deleted
         let result = t
             .file_io()
-            .new_input(data_files_vec[idx].file_path())
+            .new_input(data_file.file_path())
             .unwrap()
             .read()
             .await;
