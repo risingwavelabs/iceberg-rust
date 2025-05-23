@@ -275,7 +275,7 @@ async fn test_clean_expired_files() {
     for data_file in &data_files_vec {
         let tx = Transaction::new(&t);
         let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
-        rewrite_action
+        rewrite_action = rewrite_action
             .delete_files(vec![data_file.clone()])
             .unwrap();
         let tx = rewrite_action.apply().await.unwrap();
@@ -329,7 +329,7 @@ async fn test_clean_expired_files() {
 
     let tx = Transaction::new(&t);
     let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
-    rewrite_action
+    rewrite_action = rewrite_action
         .add_data_files(vec![data_file.clone()])
         .unwrap();
     let tx = rewrite_action.apply().await.unwrap();
