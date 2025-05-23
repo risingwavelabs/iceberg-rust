@@ -18,11 +18,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt};
+use futures::TryStreamExt;
 
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{ManifestFile, Snapshot, TableMetadataRef};
+
+const DEFAULT_DELETE_CONCURRENCY_LIMIT: usize = 10;
 
 pub struct ReachableFileCleanupStrategy {
     file_io: FileIO,
@@ -54,6 +57,8 @@ impl ReachableFileCleanupStrategy {
 
         let deletion_candidates = {
             let mut deletion_candidates = HashSet::default();
+            // This part can also be parallelized if `load_manifest_list` is a bottleneck
+            // and if the underlying FileIO supports concurrent reads efficiently.
             for snapshot in expired_snapshots {
                 let manifest_list = snapshot
                     .load_manifest_list(&self.file_io, before_expiration)
@@ -80,22 +85,25 @@ impl ReachableFileCleanupStrategy {
                     .find_files_to_delete(&manifests_to_delete, &referenced_manifests)
                     .await?;
 
-                let delete_data_files_futures = files_to_delete
-                    .into_iter()
-                    .map(|file_path| self.file_io.delete(file_path));
-                try_join_all(delete_data_files_futures).await?;
+                stream::iter(files_to_delete)
+                    .map(|file_path| self.file_io.delete(file_path))
+                    .buffer_unordered(DEFAULT_DELETE_CONCURRENCY_LIMIT)
+                    .try_collect::<Vec<_>>()
+                    .await?;
 
-                let delete_manifest_files_futures = manifests_to_delete
-                    .into_iter()
-                    .map(|manifest_file| self.file_io.delete(manifest_file.manifest_path));
-                try_join_all(delete_manifest_files_futures).await?;
+                stream::iter(manifests_to_delete)
+                    .map(|manifest_file| self.file_io.delete(manifest_file.manifest_path))
+                    .buffer_unordered(DEFAULT_DELETE_CONCURRENCY_LIMIT)
+                    .try_collect::<Vec<_>>()
+                    .await?;
             }
         }
 
-        let delete_manifest_list_futures = manifest_lists_to_delete
-            .into_iter()
-            .map(|path| self.file_io.delete(path));
-        try_join_all(delete_manifest_list_futures).await?;
+        stream::iter(manifest_lists_to_delete)
+            .map(|path| self.file_io.delete(path))
+            .buffer_unordered(DEFAULT_DELETE_CONCURRENCY_LIMIT)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         Ok(())
     }
