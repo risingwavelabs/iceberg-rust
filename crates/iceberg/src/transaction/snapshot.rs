@@ -77,12 +77,14 @@ pub(crate) struct SnapshotProduceAction<'a> {
     snapshot_properties: HashMap<String, String>,
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
-    pub removed_data_files: Vec<DataFile>,
-    pub removed_delete_files: Vec<DataFile>,
+
+    removed_data_files: Vec<DataFile>,
+    removed_delete_files: Vec<DataFile>,
 
     // for filtering out files that are removed by action
     pub removed_data_file_paths: HashSet<String>,
     pub removed_delete_file_paths: HashSet<String>,
+
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).

@@ -204,12 +204,6 @@ impl TableMetadata {
         self.format_version
     }
 
-    /// Returns snapshot references.
-    #[inline]
-    pub fn snapshot_refs(&self) -> &HashMap<String, SnapshotReference> {
-        &self.refs
-    }
-
     /// Returns uuid of current table.
     #[inline]
     pub fn uuid(&self) -> Uuid {

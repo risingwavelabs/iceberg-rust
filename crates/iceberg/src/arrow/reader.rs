@@ -65,7 +65,7 @@ pub struct ArrowReaderBuilder {
 
 impl ArrowReaderBuilder {
     /// Create a new ArrowReaderBuilder
-    pub fn new(file_io: FileIO) -> Self {
+    pub(crate) fn new(file_io: FileIO) -> Self {
         let num_cpus = available_parallelism().get();
 
         ArrowReaderBuilder {
@@ -1523,7 +1523,6 @@ message schema {
                 deletes: vec![],
                 sequence_number: 0,
                 equality_ids: vec![],
-                file_size_in_bytes: 0,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
