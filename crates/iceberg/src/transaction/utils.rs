@@ -18,6 +18,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures::future::try_join_all;
+
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{ManifestFile, Snapshot, TableMetadataRef};
@@ -78,19 +80,22 @@ impl ReachableFileCleanupStrategy {
                     .find_files_to_delete(&manifests_to_delete, &referenced_manifests)
                     .await?;
 
-                for file in files_to_delete {
-                    self.file_io.delete(file).await?;
-                }
+                let delete_data_files_futures = files_to_delete
+                    .into_iter()
+                    .map(|file_path| self.file_io.delete(file_path));
+                try_join_all(delete_data_files_futures).await?;
 
-                for manifest_file in manifests_to_delete {
-                    self.file_io.delete(manifest_file.manifest_path).await?;
-                }
+                let delete_manifest_files_futures = manifests_to_delete
+                    .into_iter()
+                    .map(|manifest_file| self.file_io.delete(manifest_file.manifest_path));
+                try_join_all(delete_manifest_files_futures).await?;
             }
         }
 
-        for manifest_list_path in manifest_lists_to_delete {
-            self.file_io.delete(manifest_list_path).await?;
-        }
+        let delete_manifest_list_futures = manifest_lists_to_delete
+            .into_iter()
+            .map(|path| self.file_io.delete(path));
+        try_join_all(delete_manifest_list_futures).await?;
 
         Ok(())
     }
