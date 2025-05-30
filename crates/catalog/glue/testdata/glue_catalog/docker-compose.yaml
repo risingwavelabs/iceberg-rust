@@ -17,7 +17,7 @@
 
 services:
   minio:
-    image: minio/minio:RELEASE.2024-03-07T00-43-48Z
+    image: "quay.io/minio/minio:latest"
     expose:
       - 9000
       - 9001
