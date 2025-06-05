@@ -100,7 +100,10 @@ impl ReachableFileCleanupStrategy {
             }
         }
 
-        let manifest_lists_to_delete = manifest_lists_to_delete.iter().map(|path| self.file_io.delete(path)).collect_vec();
+        let manifest_lists_to_delete = manifest_lists_to_delete
+            .iter()
+            .map(|path| self.file_io.delete(path))
+            .collect_vec();
 
         stream::iter(manifest_lists_to_delete)
             .buffer_unordered(DEFAULT_DELETE_CONCURRENCY_LIMIT)
