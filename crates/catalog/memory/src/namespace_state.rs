@@ -295,4 +295,39 @@ impl NamespaceState {
             Some(metadata_location) => Ok(metadata_location),
         }
     }
+
+    pub fn update_table_location(
+        &mut self,
+        table_ident: &TableIdent,
+        new_metadata_location: String,
+    ) -> Result<()> {
+        let namespace_state = self.get_mut_namespace(&table_ident.namespace)?;
+        let namespace_name = table_ident.namespace.as_ref().last().unwrap();
+        let child_state = namespace_state
+            .namespaces
+            .get_mut(namespace_name)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Namespace '{}' does not exist", table_ident.namespace),
+                )
+            })?;
+
+        let table_name = table_ident.name();
+
+        if !child_state
+            .table_metadata_locations
+            .contains_key(table_name)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Table '{}' does not exist", table_ident),
+            ));
+        }
+
+        child_state
+            .table_metadata_locations
+            .insert(table_name.to_string(), new_metadata_location);
+        Ok(())
+    }
 }
