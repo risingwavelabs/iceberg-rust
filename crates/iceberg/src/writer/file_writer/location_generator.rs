@@ -209,13 +209,15 @@ pub(crate) mod test {
             "s3://data.db/table/data_2/part-00002-test.parquet"
         );
 
-        // test invalid data location
         table_metadata.properties.insert(
             WRITE_DATA_LOCATION.to_string(),
             // invalid table location
             "s3://data.db/data_3".to_string(),
         );
-        let location_generator = super::DefaultLocationGenerator::new(table_metadata.clone());
-        assert!(location_generator.is_err());
+        let location_generator =
+            super::DefaultLocationGenerator::new(table_metadata.clone()).unwrap();
+        let location =
+            location_generator.generate_location(&file_name_genertaor.generate_file_name());
+        assert_eq!(location, "s3://data.db/data_3/part-00003-test.parquet");
     }
 }
