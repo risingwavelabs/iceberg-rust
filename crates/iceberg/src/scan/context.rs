@@ -269,7 +269,6 @@ impl PlanContext {
         };
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
-        let mut filtered_mfcs = vec![];
         let mut filtered_deletes_mfcs = vec![];
         let mut filtered_data_mfcs = vec![];
 
@@ -325,13 +324,12 @@ impl PlanContext {
             }
         }
 
-        // Push delete first then data manifest files.
-        filtered_mfcs = filtered_deletes_mfcs
-            .into_iter()
-            .chain(filtered_data_mfcs.into_iter())
-            .collect();
-
-        Ok(Box::new(filtered_mfcs.into_iter()))
+        // Push deletes manifest first then data manifest files.
+        Ok(Box::new(
+            filtered_deletes_mfcs
+                .into_iter()
+                .chain(filtered_data_mfcs.into_iter()),
+        ))
     }
 
     fn create_manifest_file_context(
