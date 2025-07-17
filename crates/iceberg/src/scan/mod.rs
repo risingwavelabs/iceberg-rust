@@ -427,6 +427,8 @@ impl TableScan {
                 })
                 .await;
 
+            println!("finished concurrent manifest file loading");
+
             if let Err(error) = result {
                 let _ = channel_for_manifest_error.send(Err(error)).await;
             }
@@ -453,6 +455,8 @@ impl TableScan {
                     )
                     .await;
 
+                println!("finished concurrent delete manifest entry processing");
+
                 if let Err(error) = result {
                     let _ = channel_for_delete_manifest_entry_error
                         .send(Err(error))
@@ -478,6 +482,8 @@ impl TableScan {
                     },
                 )
                 .await;
+
+            println!("finished concurrent data manifest entry processing");
 
             if let Err(error) = result {
                 let _ = channel_for_data_manifest_entry_error.send(Err(error)).await;

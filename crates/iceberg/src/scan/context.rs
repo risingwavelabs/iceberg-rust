@@ -320,6 +320,8 @@ impl PlanContext {
             filtered_mfcs.push(Ok(mfc));
         }
 
+        println!("filtered_mfcs size = {}", filtered_mfcs.len());
+
         Ok(Box::new(filtered_mfcs.into_iter()))
     }
 
