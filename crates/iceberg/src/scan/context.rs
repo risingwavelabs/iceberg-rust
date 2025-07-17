@@ -86,7 +86,9 @@ impl ManifestFileContext {
         } = self;
         let filter_fn = filter_fn.unwrap_or_else(|| Arc::new(|_| true));
 
+        println!("before get_manifest: {:?}", manifest_file);
         let manifest = object_cache.get_manifest(&manifest_file).await?;
+        println!("after get_manifest: {:?}", manifest);
 
         for manifest_entry in manifest.entries().iter().filter(|e| filter_fn(e)) {
             let manifest_entry_context = ManifestEntryContext {
@@ -99,6 +101,8 @@ impl ManifestFileContext {
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
             };
+
+            println!("fetch_manifest_and_stream_manifest_entries: manifest_entry: {:?}", manifest_entry.data_file);
 
             sender
                 .send(manifest_entry_context)

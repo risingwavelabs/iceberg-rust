@@ -418,7 +418,7 @@ impl TableScan {
             .await?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
-
+        println!("before concurrent manifest file loading");
         // Concurrently load all [`Manifest`]s and stream their [`ManifestEntry`]s
         spawn(async move {
             let result = futures::stream::iter(manifest_file_contexts)
@@ -431,10 +431,12 @@ impl TableScan {
                 let _ = channel_for_manifest_error.send(Err(error)).await;
             }
         });
+        println!("after concurrent manifest file loading");
 
         if let Some((_, delete_file_tx)) = delete_file_idx_and_tx {
             let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
+            println!("before concurrent manifest entry processing");
             // Process the delete file [`ManifestEntry`] stream in parallel
             spawn(async move {
                 let result = manifest_entry_delete_ctx_rx
@@ -458,8 +460,10 @@ impl TableScan {
                 }
             })
             .await;
+            println!("after concurrent delete manifest entry processing");
         }
 
+        println!("before concurrent manifest entry processing");
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {
@@ -480,6 +484,7 @@ impl TableScan {
                 let _ = channel_for_data_manifest_entry_error.send(Err(error)).await;
             }
         });
+        println!("after concurrent manifest entry processing");
 
         return Ok(file_scan_task_rx.boxed());
     }
@@ -558,6 +563,8 @@ impl TableScan {
             }
         }
 
+        println!("Processing data manifest entry: {:?}", manifest_entry_context.manifest_entry);
+
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
@@ -600,6 +607,8 @@ impl TableScan {
                 return Ok(());
             }
         }
+
+        println!("Processing delete manifest entry: {:?}", manifest_entry_context.manifest_entry);
 
         delete_file_ctx_tx
             .send(DeleteFileContext {
