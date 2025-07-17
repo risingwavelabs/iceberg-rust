@@ -275,6 +275,9 @@ impl PlanContext {
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
 
+        let mut filtered_deletes_mfcs = vec![];
+        let mut filtered_data_mfcs = vec![];
+
         for manifest_file in &manifest_files {
             let (delete_file_idx, tx) = if manifest_file.content == ManifestContentType::Deletes {
                 let Some((delete_file_idx, tx)) = delete_file_idx_and_tx.as_ref() else {
@@ -317,8 +320,23 @@ impl PlanContext {
                 filter_fn.clone(),
             );
 
-            filtered_mfcs.push(Ok(mfc));
+            match manifest_file.content {
+                ManifestContentType::Deletes => {
+                    filtered_deletes_mfcs.push(Ok(mfc));
+                }
+                ManifestContentType::Data => {
+                    filtered_data_mfcs.push(Ok(mfc));
+                }
+            }
+
+            // filtered_mfcs.push(Ok(mfc));
         }
+
+        // Push delete first then data manifest files.
+        filtered_mfcs = filtered_deletes_mfcs
+            .into_iter()
+            .chain(filtered_data_mfcs.into_iter())
+            .collect();
 
         println!("filtered_mfcs size = {}", filtered_mfcs.len());
 
