@@ -59,8 +59,9 @@ impl DeleteFileIndex {
             let index = index.clone();
             let ready_notify = ready_notify.clone();
             async move {
+                println!("begin populating delete file index");
                 let delete_files = delete_file_stream.collect::<Vec<_>>().await;
-
+                println!("finished populating delete file index with {} delete files", delete_files.len());
                 let populated_delete_file_index = PopulatedDeleteFileIndex::new(delete_files);
 
                 index
@@ -88,7 +89,9 @@ impl DeleteFileIndex {
         match self.index.get() {
             Some(idx) => Ok(idx.get_deletes_for_data_file(data_file, seq_num)),
             None => {
+                println!("waiting for delete file index to be populated");
                 self.ready_notify.notified().await;
+                println!("delete file index is now populated");
                 Ok(self
                     .index
                     .get()
