@@ -436,7 +436,7 @@ impl TableScan {
         if let Some((_, delete_file_tx)) = delete_file_idx_and_tx {
             let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-            println!("before concurrent manifest entry processing");
+            println!("before concurrent delete manifest entry processing");
             // Process the delete file [`ManifestEntry`] stream in parallel
             spawn(async move {
                 let result = manifest_entry_delete_ctx_rx
@@ -458,12 +458,11 @@ impl TableScan {
                         .send(Err(error))
                         .await;
                 }
-            })
-            .await;
+            });
             println!("after concurrent delete manifest entry processing");
         }
 
-        println!("before concurrent manifest entry processing");
+        println!("before concurrent data manifest entry processing");
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {
@@ -484,7 +483,7 @@ impl TableScan {
                 let _ = channel_for_data_manifest_entry_error.send(Err(error)).await;
             }
         });
-        println!("after concurrent manifest entry processing");
+        println!("after concurrent data manifest entry processing");
 
         return Ok(file_scan_task_rx.boxed());
     }
