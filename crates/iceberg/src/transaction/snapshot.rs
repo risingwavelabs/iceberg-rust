@@ -469,16 +469,18 @@ impl<'a> SnapshotProduceAction<'a> {
             .with_timestamp_ms(commit_ts)
             .build();
 
+        let ref_name = self
+            .to_branch
+            .clone()
+            .unwrap_or_else(|| MAIN_BRANCH.to_string());
+
         self.tx.apply(
             vec![
                 TableUpdate::AddSnapshot {
                     snapshot: new_snapshot,
                 },
                 TableUpdate::SetSnapshotRef {
-                    ref_name: self
-                        .to_branch
-                        .clone()
-                        .unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                    ref_name: ref_name.clone(),
                     reference: SnapshotReference::new(
                         self.snapshot_id,
                         SnapshotRetention::branch(None, None, None),
@@ -490,7 +492,8 @@ impl<'a> SnapshotProduceAction<'a> {
                     uuid: self.tx.current_table.metadata().uuid(),
                 },
                 TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
+                    // r#ref: MAIN_BRANCH.to_string(),
+                    r#ref: ref_name,
                     snapshot_id: self.tx.current_table.metadata().current_snapshot_id(),
                 },
             ],
