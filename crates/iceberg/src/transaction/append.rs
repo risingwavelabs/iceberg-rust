@@ -49,6 +49,7 @@ impl<'a> FastAppendAction<'a> {
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
+        to_branch: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             snapshot_produce_action: SnapshotProduceAction::new(
@@ -57,6 +58,7 @@ impl<'a> FastAppendAction<'a> {
                 key_metadata,
                 commit_uuid,
                 snapshot_properties,
+                to_branch,
             )?,
             check_duplicate: true,
         })
@@ -226,6 +228,7 @@ impl<'a> MergeAppendAction<'a> {
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
+        to_branch: Option<String>,
     ) -> Result<Self> {
         let target_size_bytes: u32 = tx
             .current_table
@@ -255,6 +258,7 @@ impl<'a> MergeAppendAction<'a> {
                 key_metadata,
                 commit_uuid,
                 snapshot_properties,
+                to_branch,
             )?,
             target_size_bytes,
             min_count_to_merge,
@@ -301,7 +305,7 @@ mod tests {
     async fn test_fast_append_action() {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
-        let mut action = tx.fast_append(None, None, vec![]).unwrap();
+        let mut action = tx.fast_append(None, None, vec![], None).unwrap();
 
         // check add data file with incompatible partition value
         let data_file = DataFileBuilder::default()
@@ -396,7 +400,7 @@ mod tests {
             format!("{}/3.parquet", &fixture.table_location),
         ];
 
-        let fast_append_action = tx.fast_append(None, None, vec![]).unwrap();
+        let fast_append_action = tx.fast_append(None, None, vec![], None).unwrap();
 
         // Attempt to add the existing Parquet files with fast append.
         let new_tx = fast_append_action

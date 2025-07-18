@@ -54,6 +54,7 @@ impl<'a> RewriteFilesAction<'a> {
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
+        to_branch: Option<String>,
     ) -> Result<Self> {
         let target_size_bytes: u32 = tx
             .current_table
@@ -94,6 +95,7 @@ impl<'a> RewriteFilesAction<'a> {
             key_metadata,
             commit_uuid,
             snapshot_properties,
+            to_branch,
         )
         .unwrap();
 

@@ -91,6 +91,8 @@ pub(crate) struct SnapshotProduceAction<'a> {
     manifest_counter: RangeFrom<u64>,
 
     new_data_file_sequence_number: Option<i64>,
+
+    to_branch: Option<String>,
 }
 
 impl<'a> SnapshotProduceAction<'a> {
@@ -100,6 +102,7 @@ impl<'a> SnapshotProduceAction<'a> {
         key_metadata: Vec<u8>,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
+        to_branch: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             tx,
@@ -115,6 +118,7 @@ impl<'a> SnapshotProduceAction<'a> {
             manifest_counter: (0..),
             key_metadata,
             new_data_file_sequence_number: None,
+            to_branch,
         })
     }
 
@@ -471,7 +475,10 @@ impl<'a> SnapshotProduceAction<'a> {
                     snapshot: new_snapshot,
                 },
                 TableUpdate::SetSnapshotRef {
-                    ref_name: MAIN_BRANCH.to_string(),
+                    ref_name: self
+                        .to_branch
+                        .clone()
+                        .unwrap_or_else(|| MAIN_BRANCH.to_string()),
                     reference: SnapshotReference::new(
                         self.snapshot_id,
                         SnapshotRetention::branch(None, None, None),

@@ -175,6 +175,7 @@ impl<'a> Transaction<'a> {
         snapshot_id: Option<i64>,
         commit_uuid: Option<Uuid>,
         key_metadata: Vec<u8>,
+        to_branch: Option<String>,
     ) -> Result<FastAppendAction<'a>> {
         let snapshot_id = if let Some(snapshot_id) = snapshot_id {
             if self
@@ -198,6 +199,7 @@ impl<'a> Transaction<'a> {
             commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata,
             HashMap::new(),
+            to_branch,
         )
     }
 
@@ -206,6 +208,7 @@ impl<'a> Transaction<'a> {
         self,
         commit_uuid: Option<Uuid>,
         key_metadata: Vec<u8>,
+        to_branch: Option<String>,
     ) -> Result<MergeAppendAction<'a>> {
         let snapshot_id = self.generate_unique_snapshot_id();
         MergeAppendAction::new(
@@ -214,6 +217,7 @@ impl<'a> Transaction<'a> {
             commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata,
             HashMap::new(),
+            to_branch,
         )
     }
 
@@ -235,6 +239,7 @@ impl<'a> Transaction<'a> {
         self,
         commit_uuid: Option<Uuid>,
         key_metadata: Vec<u8>,
+        to_branch: Option<String>,
     ) -> Result<RewriteFilesAction<'a>> {
         let snapshot_id = self.generate_unique_snapshot_id();
         RewriteFilesAction::new(
@@ -243,6 +248,7 @@ impl<'a> Transaction<'a> {
             commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata,
             HashMap::new(),
+            to_branch,
         )
     }
 

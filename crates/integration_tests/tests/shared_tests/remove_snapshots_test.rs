@@ -115,7 +115,7 @@ async fn test_expire_snapshots_by_count() {
 
     for _ in 0..10 {
         let tx = Transaction::new(&table);
-        let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
+        let mut append_action = tx.fast_append(None, None, vec![], None).unwrap();
         append_action.add_data_files(data_file.clone()).unwrap();
         let tx = append_action.apply().await.unwrap();
         table = tx.commit(&rest_catalog).await.unwrap();
@@ -212,7 +212,7 @@ async fn test_clean_expired_files() {
         .await;
         data_files_vec.push(data_file.clone());
         let tx = Transaction::new(&table);
-        let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
+        let mut append_action = tx.fast_append(None, None, vec![], None).unwrap();
         append_action.add_data_files(vec![data_file]).unwrap();
         let tx = append_action.apply().await.unwrap();
         table = tx.commit(&rest_catalog).await.unwrap();
@@ -274,7 +274,7 @@ async fn test_clean_expired_files() {
     // remove the data files by RewriteAction
     for data_file in &data_files_vec {
         let tx = Transaction::new(&t);
-        let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
+        let mut rewrite_action = tx.rewrite_files(None, vec![], None).unwrap();
         rewrite_action = rewrite_action
             .delete_files(vec![data_file.clone()])
             .unwrap();
@@ -328,7 +328,7 @@ async fn test_clean_expired_files() {
     .await;
 
     let tx = Transaction::new(&t);
-    let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
+    let mut rewrite_action = tx.rewrite_files(None, vec![], None).unwrap();
     rewrite_action = rewrite_action
         .add_data_files(vec![data_file.clone()])
         .unwrap();
