@@ -105,7 +105,7 @@ impl<'a> RewriteFilesAction<'a> {
                 .tx
                 .base_table
                 .metadata()
-                .current_snapshot()
+                .snapshot_for_ref(snapshot_produce_action.target_branch())
             {
                 snapshot_produce_action
                     .set_new_data_file_sequence_number(snapshot.sequence_number());
@@ -198,7 +198,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             .tx
             .current_table
             .metadata()
-            .current_snapshot();
+            .snapshot_for_ref(snapshot_produce.target_branch());
 
         if let Some(snapshot) = snapshot {
             let gen_manifest_entry = |old_entry: &Arc<ManifestEntry>| {
@@ -260,7 +260,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             .tx
             .current_table
             .metadata()
-            .current_snapshot()
+            .snapshot_for_ref(snapshot_produce.target_branch())
         else {
             return Ok(vec![]);
         };
