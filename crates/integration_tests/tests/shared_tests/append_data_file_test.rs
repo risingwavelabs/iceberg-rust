@@ -215,7 +215,7 @@ async fn test_append_data_file_to_branch() {
     // Verify main branch has the data
     assert!(table.metadata().current_snapshot().is_some());
     let main_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
-    
+
     // Verify main branch ref points to the snapshot using snapshot_for_ref
     let main_snapshot = table.metadata().snapshot_for_ref("main").unwrap();
     assert_eq!(main_snapshot.snapshot_id(), main_snapshot_id);
@@ -223,7 +223,9 @@ async fn test_append_data_file_to_branch() {
     // Test 2: Append to a custom branch
     let branch_name = "test-branch";
     let tx = Transaction::new(&table);
-    let mut append_action = tx.fast_append(None, None, vec![]).unwrap()
+    let mut append_action = tx
+        .fast_append(None, None, vec![])
+        .unwrap()
         .with_to_branch(branch_name.to_string());
     append_action.add_data_files(data_file.clone()).unwrap();
     let tx = append_action.apply().await.unwrap();
@@ -232,14 +234,16 @@ async fn test_append_data_file_to_branch() {
     // Verify the custom branch was created and points to a new snapshot
     let branch_snapshot = table.metadata().snapshot_for_ref(branch_name).unwrap();
     assert_ne!(branch_snapshot.snapshot_id(), main_snapshot_id);
-    
+
     // Verify the main branch is unchanged
     let main_snapshot_after = table.metadata().snapshot_for_ref("main").unwrap();
     assert_eq!(main_snapshot_after.snapshot_id(), main_snapshot_id);
 
     // Test 3: Append to the same custom branch again
     let tx = Transaction::new(&table);
-    let mut append_action = tx.fast_append(None, None, vec![]).unwrap()
+    let mut append_action = tx
+        .fast_append(None, None, vec![])
+        .unwrap()
         .with_to_branch(branch_name.to_string());
     append_action.add_data_files(data_file.clone()).unwrap();
     let tx = append_action.apply().await.unwrap();
@@ -247,7 +251,10 @@ async fn test_append_data_file_to_branch() {
 
     // Verify the custom branch now points to a newer snapshot
     let branch_snapshot_final = table.metadata().snapshot_for_ref(branch_name).unwrap();
-    assert_ne!(branch_snapshot_final.snapshot_id(), branch_snapshot.snapshot_id());
+    assert_ne!(
+        branch_snapshot_final.snapshot_id(),
+        branch_snapshot.snapshot_id()
+    );
     assert_ne!(branch_snapshot_final.snapshot_id(), main_snapshot_id);
 
     // Verify we have 3 snapshots total (1 main + 2 branch)
@@ -256,16 +263,24 @@ async fn test_append_data_file_to_branch() {
     // Test 4: Test merge append to branch
     let another_branch = "merge-branch";
     let tx = Transaction::new(&table);
-    let mut merge_append_action = tx.merge_append(None, vec![]).unwrap()
-        .with_to_branch(another_branch.to_string()).unwrap();
-    merge_append_action.add_data_files(data_file.clone()).unwrap();
+    let mut merge_append_action = tx
+        .merge_append(None, vec![])
+        .unwrap()
+        .with_to_branch(another_branch.to_string())
+        .unwrap();
+    merge_append_action
+        .add_data_files(data_file.clone())
+        .unwrap();
     let tx = merge_append_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
 
     // Verify the merge branch was created
     let merge_branch_snapshot = table.metadata().snapshot_for_ref(another_branch).unwrap();
     assert_ne!(merge_branch_snapshot.snapshot_id(), main_snapshot_id);
-    assert_ne!(merge_branch_snapshot.snapshot_id(), branch_snapshot_final.snapshot_id());
+    assert_ne!(
+        merge_branch_snapshot.snapshot_id(),
+        branch_snapshot_final.snapshot_id()
+    );
 
     // Verify we now have 4 snapshots total
     assert_eq!(table.metadata().snapshots().count(), 4);
@@ -274,13 +289,22 @@ async fn test_append_data_file_to_branch() {
     assert!(table.metadata().snapshot_for_ref("main").is_some());
     assert!(table.metadata().snapshot_for_ref(branch_name).is_some());
     assert!(table.metadata().snapshot_for_ref(another_branch).is_some());
-    
+
     // Verify each branch points to different snapshots
     let final_main_snapshot = table.metadata().snapshot_for_ref("main").unwrap();
     let final_branch_snapshot = table.metadata().snapshot_for_ref(branch_name).unwrap();
     let final_merge_snapshot = table.metadata().snapshot_for_ref(another_branch).unwrap();
-    
-    assert_ne!(final_main_snapshot.snapshot_id(), final_branch_snapshot.snapshot_id());
-    assert_ne!(final_main_snapshot.snapshot_id(), final_merge_snapshot.snapshot_id());
-    assert_ne!(final_branch_snapshot.snapshot_id(), final_merge_snapshot.snapshot_id());
+
+    assert_ne!(
+        final_main_snapshot.snapshot_id(),
+        final_branch_snapshot.snapshot_id()
+    );
+    assert_ne!(
+        final_main_snapshot.snapshot_id(),
+        final_merge_snapshot.snapshot_id()
+    );
+    assert_ne!(
+        final_branch_snapshot.snapshot_id(),
+        final_merge_snapshot.snapshot_id()
+    );
 }
