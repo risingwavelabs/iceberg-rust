@@ -43,9 +43,12 @@ pub struct RewriteFilesAction<'a> {
     target_size_bytes: u32,
     min_count_to_merge: u32,
     merge_enabled: bool,
+    pub operation: Operation,
 }
 
-struct RewriteFilesOperation;
+struct RewriteFilesOperation {
+    pub operation: Operation,
+}
 
 impl<'a> RewriteFilesAction<'a> {
     pub fn new(
@@ -114,6 +117,7 @@ impl<'a> RewriteFilesAction<'a> {
             target_size_bytes,
             min_count_to_merge,
             merge_enabled,
+            operation: Operation::Replace,
         })
     }
 
@@ -147,11 +151,21 @@ impl<'a> RewriteFilesAction<'a> {
             let process =
                 MergeManifestProcess::new(self.target_size_bytes, self.min_count_to_merge);
             self.snapshot_produce_action
-                .apply(RewriteFilesOperation, process)
+                .apply(
+                    RewriteFilesOperation {
+                        operation: self.operation,
+                    },
+                    process,
+                )
                 .await
         } else {
             self.snapshot_produce_action
-                .apply(RewriteFilesOperation, DefaultManifestProcess)
+                .apply(
+                    RewriteFilesOperation {
+                        operation: self.operation,
+                    },
+                    DefaultManifestProcess,
+                )
                 .await
         }
     }
@@ -162,11 +176,17 @@ impl<'a> RewriteFilesAction<'a> {
 
         Ok(self)
     }
+
+    pub fn with_operation(mut self, operation: Operation) -> Self {
+        self.operation = operation;
+
+        self
+    }
 }
 
 impl SnapshotProduceOperation for RewriteFilesOperation {
     fn operation(&self) -> Operation {
-        Operation::Replace
+        self.operation.clone()
     }
 
     async fn delete_entries(
