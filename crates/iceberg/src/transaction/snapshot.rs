@@ -92,7 +92,7 @@ pub(crate) struct SnapshotProduceAction<'a> {
 
     new_data_file_sequence_number: Option<i64>,
 
-    to_branch: Option<String>,
+    target_branch: String,
 }
 
 impl<'a> SnapshotProduceAction<'a> {
@@ -102,7 +102,6 @@ impl<'a> SnapshotProduceAction<'a> {
         key_metadata: Vec<u8>,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
-        to_branch: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             tx,
@@ -118,7 +117,7 @@ impl<'a> SnapshotProduceAction<'a> {
             manifest_counter: (0..),
             key_metadata,
             new_data_file_sequence_number: None,
-            to_branch,
+            target_branch: MAIN_BRANCH.to_string(),
         })
     }
 
@@ -377,7 +376,6 @@ impl<'a> SnapshotProduceAction<'a> {
             let added_manifest = self
                 .write_added_manifest(data_files, self.new_data_file_sequence_number)
                 .await?;
-            println!("DEBUG-COW added_manifest: {:?}", added_manifest);
             manifest_files.push(added_manifest);
         }
 
@@ -385,10 +383,6 @@ impl<'a> SnapshotProduceAction<'a> {
             let added_delete_manifest = self
                 .write_added_manifest(added_delete_files, self.new_data_file_sequence_number)
                 .await?;
-            println!(
-                "DEBUG-COW added_delete_manifest: {:?}",
-                added_delete_manifest
-            );
             manifest_files.push(added_delete_manifest);
         }
 
@@ -398,7 +392,6 @@ impl<'a> SnapshotProduceAction<'a> {
         manifest_files.extend(delete_manifests);
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
-        println!("DEBUG-COW existing_manifests: {:?}", existing_manifests);
 
         manifest_files.extend(existing_manifests);
         manifest_process
@@ -437,30 +430,21 @@ impl<'a> SnapshotProduceAction<'a> {
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
 
-        println!("DEBUG-COW new_manifests: {:?}", new_manifests);
-
         let next_seq_num = self.tx.current_table.metadata().next_sequence_number();
 
         let summary = self.summary(&snapshot_produce_operation);
 
         let manifest_list_path = self.generate_manifest_list_file_path(0);
 
-        let ref_name = self
-            .to_branch
-            .clone()
-            .unwrap_or_else(|| MAIN_BRANCH.to_string());
+        let parent_snapshot = self
+            .tx
+            .current_table
+            .metadata()
+            .snapshot_for_ref(&self.target_branch);
 
-        let current_snapshot_id = match self.to_branch {
-            Some(_) => self
-                .tx
-                .current_table
-                .metadata()
-                .snapshot_for_ref(&ref_name)
-                .map(|r| r.snapshot_id())
-                .or(None),
-
-            None => self.tx.current_table.metadata().current_snapshot_id(),
-        };
+        let parent_snapshot_id = parent_snapshot
+            .map(|s| Some(s.snapshot_id()))
+            .unwrap_or(None);
 
         let mut manifest_list_writer = match self.tx.current_table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
@@ -469,7 +453,7 @@ impl<'a> SnapshotProduceAction<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                current_snapshot_id,
+                parent_snapshot_id,
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
                 self.tx
@@ -477,7 +461,7 @@ impl<'a> SnapshotProduceAction<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                current_snapshot_id,
+                parent_snapshot_id,
                 next_seq_num,
             ),
         };
@@ -488,17 +472,12 @@ impl<'a> SnapshotProduceAction<'a> {
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(current_snapshot_id)
+            .with_parent_snapshot_id(parent_snapshot_id)
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.tx.current_table.metadata().current_schema_id())
             .with_timestamp_ms(commit_ts)
             .build();
-
-        let ref_name = self
-            .to_branch
-            .clone()
-            .unwrap_or_else(|| MAIN_BRANCH.to_string());
 
         self.tx.apply(
             vec![
@@ -506,7 +485,7 @@ impl<'a> SnapshotProduceAction<'a> {
                     snapshot: new_snapshot,
                 },
                 TableUpdate::SetSnapshotRef {
-                    ref_name: ref_name.clone(),
+                    ref_name: self.target_branch.clone(),
                     reference: SnapshotReference::new(
                         self.snapshot_id,
                         SnapshotRetention::branch(None, None, None),
@@ -518,9 +497,8 @@ impl<'a> SnapshotProduceAction<'a> {
                     uuid: self.tx.current_table.metadata().uuid(),
                 },
                 TableRequirement::RefSnapshotIdMatch {
-                    // r#ref: MAIN_BRANCH.to_string(),
-                    r#ref: ref_name,
-                    snapshot_id: current_snapshot_id,
+                    r#ref: self.target_branch.clone(),
+                    snapshot_id: parent_snapshot_id,
                 },
             ],
         )?;
@@ -529,6 +507,10 @@ impl<'a> SnapshotProduceAction<'a> {
 
     pub fn set_new_data_file_sequence_number(&mut self, new_data_file_sequence_number: i64) {
         self.new_data_file_sequence_number = Some(new_data_file_sequence_number);
+    }
+
+    pub fn set_target_branch(&mut self, target_branch: String) {
+        self.target_branch = target_branch;
     }
 }
 
@@ -556,15 +538,6 @@ impl ManifestProcess for MergeManifestProcess {
             .into_iter()
             .partition(|manifest| matches!(manifest.content, ManifestContentType::Data));
 
-        println!(
-            "DEBUG-COW unmerge_data_manifest: {:?}",
-            unmerge_data_manifest
-        );
-        println!(
-            "DEBUG-COW unmerge_delete_manifest: {:?}",
-            unmerge_delete_manifest
-        );
-
         let mut data_manifest = {
             let manifest_merge_manager = MergeManifestManager::new(
                 self.target_size_bytes,
@@ -575,8 +548,6 @@ impl ManifestProcess for MergeManifestProcess {
                 .merge_manifest(snapshot_produce, unmerge_data_manifest)
                 .await?
         };
-
-        println!("DEBUG-COW data_manifest: {:?}", data_manifest);
 
         data_manifest.extend(unmerge_delete_manifest);
         Ok(data_manifest)

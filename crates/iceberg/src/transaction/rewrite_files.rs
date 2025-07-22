@@ -54,7 +54,6 @@ impl<'a> RewriteFilesAction<'a> {
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
-        to_branch: Option<String>,
     ) -> Result<Self> {
         let target_size_bytes: u32 = tx
             .current_table
@@ -95,7 +94,6 @@ impl<'a> RewriteFilesAction<'a> {
             key_metadata,
             commit_uuid,
             snapshot_properties,
-            to_branch,
         )
         .unwrap();
 
@@ -120,7 +118,6 @@ impl<'a> RewriteFilesAction<'a> {
     }
 
     /// Add data files to the snapshot.
-
     pub fn add_data_files(
         mut self,
         data_files: impl IntoIterator<Item = DataFile>,
@@ -136,6 +133,11 @@ impl<'a> RewriteFilesAction<'a> {
     ) -> Result<Self> {
         self.snapshot_produce_action
             .delete_files(remove_data_files)?;
+        Ok(self)
+    }
+
+    pub fn with_to_branch(mut self, to_branch: String) -> Result<Self> {
+        self.snapshot_produce_action.set_target_branch(to_branch);
         Ok(self)
     }
 

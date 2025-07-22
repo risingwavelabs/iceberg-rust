@@ -121,7 +121,7 @@ async fn test_append_data_file() {
     for _ in 0..3 {
         let data_file = write_new_data_file(&table).await;
         let tx = Transaction::new(&table);
-        let mut append_action = tx.fast_append(None, None, vec![], None).unwrap();
+        let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(data_file.clone()).unwrap();
         let tx = append_action.apply().await.unwrap();
         table = tx.commit(&rest_catalog).await.unwrap()
@@ -169,7 +169,7 @@ async fn test_append_data_file() {
     // append data file with merge append, 4 data file will be merged to two manifest
     let data_file = write_new_data_file(&table).await;
     let tx = Transaction::new(&table);
-    let mut merge_append_action = tx.merge_append(None, vec![], None).unwrap();
+    let mut merge_append_action = tx.merge_append(None, vec![]).unwrap();
     merge_append_action
         .add_data_files(data_file.clone())
         .unwrap();

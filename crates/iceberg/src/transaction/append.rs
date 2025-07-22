@@ -49,7 +49,6 @@ impl<'a> FastAppendAction<'a> {
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
-        to_branch: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             snapshot_produce_action: SnapshotProduceAction::new(
@@ -58,7 +57,6 @@ impl<'a> FastAppendAction<'a> {
                 key_metadata,
                 commit_uuid,
                 snapshot_properties,
-                to_branch,
             )?,
             check_duplicate: true,
         })
@@ -67,6 +65,11 @@ impl<'a> FastAppendAction<'a> {
     /// Set whether to check duplicate files
     pub fn with_check_duplicate(mut self, v: bool) -> Self {
         self.check_duplicate = v;
+        self
+    }
+
+    pub fn with_to_branch(mut self, to_branch: String) -> Self {
+        self.snapshot_produce_action.set_target_branch(to_branch);
         self
     }
 
@@ -228,7 +231,6 @@ impl<'a> MergeAppendAction<'a> {
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
-        to_branch: Option<String>,
     ) -> Result<Self> {
         let target_size_bytes: u32 = tx
             .current_table
@@ -258,12 +260,16 @@ impl<'a> MergeAppendAction<'a> {
                 key_metadata,
                 commit_uuid,
                 snapshot_properties,
-                to_branch,
             )?,
             target_size_bytes,
             min_count_to_merge,
             merge_enabled,
         })
+    }
+
+    pub fn with_to_branch(mut self, to_branch: String) -> Result<MergeAppendAction<'a>> {
+        self.snapshot_produce_action.set_target_branch(to_branch);
+        Ok(self)
     }
 
     /// Add data files to the snapshot.
@@ -305,7 +311,7 @@ mod tests {
     async fn test_fast_append_action() {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
-        let mut action = tx.fast_append(None, None, vec![], None).unwrap();
+        let mut action = tx.fast_append(None, None, vec![]).unwrap();
 
         // check add data file with incompatible partition value
         let data_file = DataFileBuilder::default()
@@ -389,6 +395,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fast_append_with_branch() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        // Test creating new branch
+        let branch_name = "test_branch";
+        let mut action = tx
+            .fast_append(None, None, vec![])
+            .unwrap()
+            .with_to_branch(branch_name.to_string());
+
+        let data_file = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/3.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        action.add_data_files(vec![data_file.clone()]).unwrap();
+        let tx = action.apply().await.unwrap();
+
+        // Check branch reference was created
+        assert!(
+            matches!(&tx.updates[1], TableUpdate::SetSnapshotRef { ref_name, .. }
+                if ref_name == branch_name)
+        );
+
+        // Test updating existing branch
+        let tx2 = Transaction::new(&table);
+        let mut action2 = tx2
+            .fast_append(None, None, vec![])
+            .unwrap()
+            .with_to_branch(branch_name.to_string());
+        action2.add_data_files(vec![data_file.clone()]).unwrap();
+        let tx2 = action2.apply().await.unwrap();
+
+        // Check requirements contain branch validation
+        assert!(tx2.requirements.iter().any(
+            |r| matches!(r, TableRequirement::RefSnapshotIdMatch { r#ref, .. }
+                if r#ref == branch_name)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_branch_operations() {
+        let table = make_v2_minimal_table();
+
+        // Test creating new branch
+        let branch_name = "test_branch";
+        let tx = Transaction::new(&table);
+        let mut action = tx
+            .fast_append(None, None, vec![])
+            .unwrap()
+            .with_to_branch(branch_name.to_string());
+
+        let data_file = DataFileBuilder::default()
+            .partition_spec_id(0)
+            .content(DataContentType::Data)
+            .file_path("test/3.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        action.add_data_files(vec![data_file.clone()]).unwrap();
+        let tx = action.apply().await.unwrap();
+
+        // Verify branch was created
+        assert!(matches!(
+            &tx.updates[1],
+            TableUpdate::SetSnapshotRef { ref_name, .. } if ref_name == branch_name
+        ));
+
+        // Verify requirements
+        assert!(tx.requirements.iter().any(
+            |r| matches!(r, TableRequirement::RefSnapshotIdMatch { r#ref, .. }
+                if r#ref == branch_name)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_add_existing_parquet_files_to_unpartitioned_table() {
         let mut fixture = TableTestFixture::new_unpartitioned();
         fixture.setup_unpartitioned_manifest_files().await;
@@ -400,7 +494,7 @@ mod tests {
             format!("{}/3.parquet", &fixture.table_location),
         ];
 
-        let fast_append_action = tx.fast_append(None, None, vec![], None).unwrap();
+        let fast_append_action = tx.fast_append(None, None, vec![]).unwrap();
 
         // Attempt to add the existing Parquet files with fast append.
         let new_tx = fast_append_action

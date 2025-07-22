@@ -114,7 +114,7 @@ async fn test_rewrite_data_files() {
 
     // commit result
     let tx = Transaction::new(&table);
-    let mut append_action = tx.fast_append(None, None, vec![], None).unwrap();
+    let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
     append_action.add_data_files(data_file.clone()).unwrap();
     let tx = append_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
@@ -134,7 +134,7 @@ async fn test_rewrite_data_files() {
 
     // commit result again
     let tx = Transaction::new(&table);
-    let mut append_action = tx.fast_append(None, None, vec![], None).unwrap();
+    let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
     append_action.add_data_files(data_file.clone()).unwrap();
     let tx = append_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
@@ -168,7 +168,7 @@ async fn test_rewrite_data_files() {
     // commit result again
     let tx = Transaction::new(&table);
     let rewrite_action = tx
-        .rewrite_files(None, vec![], None)
+        .rewrite_files(None, vec![])
         .unwrap()
         .add_data_files(data_file_rewrite.clone())
         .unwrap()
@@ -210,7 +210,7 @@ async fn test_empty_rewrite() {
         .unwrap();
 
     let tx = Transaction::new(&table);
-    let rewrite_action = tx.rewrite_files(None, vec![], None).unwrap();
+    let rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
     let tx = rewrite_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
 
@@ -284,7 +284,7 @@ async fn test_multiple_file_rewrite() {
 
     let tx = Transaction::new(&table);
     let rewrite_action = tx
-        .rewrite_files(None, vec![], None)
+        .rewrite_files(None, vec![])
         .unwrap()
         .add_data_files(data_file1.clone())
         .unwrap()
@@ -365,7 +365,7 @@ async fn test_rewrite_nonexistent_file() {
     let nonexistent_data_file = valid_data_file.clone();
 
     let tx = Transaction::new(&table);
-    let rewrite_action = tx.rewrite_files(None, vec![], None).unwrap();
+    let rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
 
     // Attempt to delete the nonexistent file
     let result = rewrite_action.delete_files(nonexistent_data_file);
@@ -433,7 +433,7 @@ async fn test_sequence_number_in_manifest_entry() {
 
     let tx = Transaction::new(&table);
     let rewrite_action = tx
-        .rewrite_files(None, vec![], None)
+        .rewrite_files(None, vec![])
         .unwrap()
         .add_data_files(data_file1.clone())
         .unwrap()
@@ -535,7 +535,7 @@ async fn test_partition_spec_id_in_manifest() {
         .await;
         data_files_vec.push(data_file.clone());
         let tx = Transaction::new(&table);
-        let mut append_action = tx.fast_append(None, None, vec![], None).unwrap();
+        let mut append_action = tx.fast_append(None, None, vec![]).unwrap();
         append_action.add_data_files(vec![data_file]).unwrap();
         let tx = append_action.apply().await.unwrap();
         table = tx.commit(&rest_catalog).await.unwrap();
@@ -547,7 +547,7 @@ async fn test_partition_spec_id_in_manifest() {
     // remove the data files by RewriteAction
     for data_file in &data_files_vec {
         let tx = Transaction::new(&table);
-        let mut rewrite_action = tx.rewrite_files(None, vec![], None).unwrap();
+        let mut rewrite_action = tx.rewrite_files(None, vec![]).unwrap();
         rewrite_action = rewrite_action
             .delete_files(vec![data_file.clone()])
             .unwrap();
