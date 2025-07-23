@@ -195,6 +195,11 @@ impl<'a> OverwriteFilesAction<'a> {
 
         Ok(self)
     }
+
+    pub fn with_to_branch(mut self, to_branch: String) -> Self {
+        self.snapshot_produce_action.set_target_branch(to_branch);
+        self
+    }
 }
 
 impl SnapshotProduceOperation for OverwriteFilesOperation {
