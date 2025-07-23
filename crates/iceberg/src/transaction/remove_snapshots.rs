@@ -46,8 +46,6 @@ pub struct RemoveSnapshotAction<'a> {
     clear_expired_meta_data: bool,
 
     now: i64,
-
-    target_branch: String,
 }
 
 impl<'a> RemoveSnapshotAction<'a> {
@@ -82,7 +80,6 @@ impl<'a> RemoveSnapshotAction<'a> {
             default_max_ref_age_ms,
             now,
             clear_expired_meta_data: false,
-            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -113,11 +110,6 @@ impl<'a> RemoveSnapshotAction<'a> {
     /// Finished building the action and apply it to the transaction.
     pub fn clear_expired_meta_data(mut self, clear_expired_meta_data: bool) -> Self {
         self.clear_expired_meta_data = clear_expired_meta_data;
-        self
-    }
-
-    pub fn with_to_branch(mut self, branch: &str) -> Self {
-        self.target_branch = branch.to_string();
         self
     }
 
@@ -260,25 +252,9 @@ impl<'a> RemoveSnapshotAction<'a> {
             )?;
         }
 
-        let current_snapshot = self
-            .tx
-            .current_table
-            .metadata()
-            .snapshot_for_ref(&self.target_branch);
-
-        let current_snapshot_id = current_snapshot
-            .map(|snapshot| Some(snapshot.snapshot_id()))
-            .unwrap_or(None);
-
-        self.tx.apply(vec![], vec![
-            TableRequirement::UuidMatch {
-                uuid: self.tx.current_table.metadata().uuid(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: self.target_branch.clone(),
-                snapshot_id: current_snapshot_id,
-            },
-        ])?;
+        self.tx.apply(vec![], vec![TableRequirement::UuidMatch {
+            uuid: self.tx.current_table.metadata().uuid(),
+        }])?;
 
         Ok(RemoveSnapshotApplyResult {
             tx: self.tx,
@@ -513,15 +489,9 @@ mod tests {
             assert_eq!(4, tx.updates.len());
 
             assert_eq!(
-                vec![
-                    TableRequirement::UuidMatch {
-                        uuid: tx.current_table.metadata().uuid()
-                    },
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: MAIN_BRANCH.to_string(),
-                        snapshot_id: tx.current_table.metadata().current_snapshot_id
-                    }
-                ],
+                vec![TableRequirement::UuidMatch {
+                    uuid: tx.current_table.metadata().uuid()
+                },],
                 tx.requirements
             );
         }
