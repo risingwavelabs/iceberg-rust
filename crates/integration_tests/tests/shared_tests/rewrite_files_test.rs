@@ -440,7 +440,7 @@ async fn test_sequence_number_in_manifest_entry() {
         .add_data_files(data_file2.clone())
         .unwrap();
     // Set sequence number to 12345
-    let rewrite_action = rewrite_action.new_data_file_sequence_number(12345).unwrap();
+    let rewrite_action = rewrite_action.with_starting_sequence_number(12345).unwrap();
     let tx = rewrite_action.apply().await.unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
 
