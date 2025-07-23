@@ -80,18 +80,7 @@ impl<'a> RewriteFilesAction<'a> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
 
-        // If the compaction should use the sequence number of the snapshot at compaction start time for
-        // new data files, instead of using the sequence number of the newly produced snapshot.
-        // This avoids commit conflicts with updates that add newer equality deletes at a higher sequence number.
-        let use_starting_sequence_number = tx
-            .current_table
-            .metadata()
-            .properties()
-            .get(USE_STARTING_SEQUENCE_NUMBER)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(USE_STARTING_SEQUENCE_NUMBER_DEFAULT);
-
-        let mut snapshot_produce_action = SnapshotProduceAction::new(
+        let snapshot_produce_action = SnapshotProduceAction::new(
             tx,
             snapshot_id,
             key_metadata,
@@ -99,18 +88,6 @@ impl<'a> RewriteFilesAction<'a> {
             snapshot_properties,
         )
         .unwrap();
-
-        if use_starting_sequence_number {
-            if let Some(snapshot) = snapshot_produce_action
-                .tx
-                .base_table
-                .metadata()
-                .snapshot_for_ref(snapshot_produce_action.target_branch())
-            {
-                snapshot_produce_action
-                    .set_new_data_file_sequence_number(snapshot.sequence_number());
-            }
-        }
 
         Ok(Self {
             snapshot_produce_action,
@@ -140,9 +117,9 @@ impl<'a> RewriteFilesAction<'a> {
         Ok(self)
     }
 
-    pub fn with_to_branch(mut self, to_branch: String) -> Result<Self> {
+    pub fn with_to_branch(mut self, to_branch: String) -> Self {
         self.snapshot_produce_action.set_target_branch(to_branch);
-        Ok(self)
+        self
     }
 
     /// Finished building the action and apply it to the transaction.
@@ -170,9 +147,66 @@ impl<'a> RewriteFilesAction<'a> {
         }
     }
 
-    pub fn new_data_file_sequence_number(mut self, seq: i64) -> Result<Self> {
+    pub fn with_starting_sequence_number(mut self, seq: i64) -> Result<Self> {
+        // If the compaction should use the sequence number of the snapshot at compaction start time for
+        // new data files, instead of using the sequence number of the newly produced snapshot.
+        // This avoids commit conflicts with updates that add newer equality deletes at a higher sequence number.
+        let use_starting_sequence_number = self
+            .snapshot_produce_action
+            .tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(USE_STARTING_SEQUENCE_NUMBER)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(USE_STARTING_SEQUENCE_NUMBER_DEFAULT);
+
+        if !use_starting_sequence_number {
+            return Err(crate::error::Error::new(
+                crate::ErrorKind::Unexpected,
+                "Cannot set data file sequence number when use-starting-sequence-number is false"
+                    .to_string(),
+            ));
+        }
+
         self.snapshot_produce_action
             .set_new_data_file_sequence_number(seq);
+
+        Ok(self)
+    }
+
+    pub fn with_starting_sequence_number_from_branch(mut self, branch: &str) -> Result<Self> {
+        // If the compaction should use the sequence number of the snapshot at compaction start time for
+        // new data files, instead of using the sequence number of the newly produced snapshot.
+        // This avoids commit conflicts with updates that add newer equality deletes at a higher sequence number.
+        let use_starting_sequence_number = self
+            .snapshot_produce_action
+            .tx
+            .current_table
+            .metadata()
+            .properties()
+            .get(USE_STARTING_SEQUENCE_NUMBER)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(USE_STARTING_SEQUENCE_NUMBER_DEFAULT);
+
+        if !use_starting_sequence_number {
+            return Err(crate::error::Error::new(
+                crate::ErrorKind::Unexpected,
+                "Cannot set data file sequence number when use-starting-sequence-number is false"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(snapshot) = self
+            .snapshot_produce_action
+            .tx
+            .current_table
+            .metadata()
+            .snapshot_for_ref(branch)
+        {
+            self.snapshot_produce_action
+                .set_new_data_file_sequence_number(snapshot.sequence_number());
+        }
 
         Ok(self)
     }
