@@ -454,7 +454,7 @@ mod tests {
     use std::io::BufReader;
 
     use crate::io::FileIOBuilder;
-    use crate::spec::{TableMetadata, MAIN_BRANCH};
+    use crate::spec::TableMetadata;
     use crate::table::Table;
     use crate::transaction::Transaction;
     use crate::{TableIdent, TableRequirement};
