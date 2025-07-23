@@ -18,6 +18,7 @@
 //! This module contains transaction api.
 
 mod append;
+mod overwrite_files;
 mod remove_snapshots;
 mod rewrite_files;
 mod snapshot;
@@ -29,6 +30,7 @@ use std::collections::HashMap;
 use std::mem::discriminant;
 use std::sync::Arc;
 
+use overwrite_files::OverwriteFilesAction;
 use remove_snapshots::RemoveSnapshotAction;
 use rewrite_files::RewriteFilesAction;
 use uuid::Uuid;
@@ -253,6 +255,23 @@ impl<'a> Transaction<'a> {
             vec![],
         )?;
         Ok(self)
+    }
+
+    /// Creates an overwrite files action.
+    pub fn overwrite_files(
+        self,
+        commit_uuid: Option<Uuid>,
+        key_metadata: Vec<u8>,
+        snapshot_properties: HashMap<String, String>,
+    ) -> Result<OverwriteFilesAction<'a>> {
+        let snapshot_id = self.generate_unique_snapshot_id();
+        OverwriteFilesAction::new(
+            self,
+            snapshot_id,
+            commit_uuid.unwrap_or_else(Uuid::now_v7),
+            key_metadata,
+            snapshot_properties,
+        )
     }
 
     /// Commit transaction.
