@@ -502,15 +502,9 @@ mod tests {
             assert_eq!(3, tx.updates.len());
 
             assert_eq!(
-                vec![
-                    TableRequirement::UuidMatch {
-                        uuid: tx.current_table.metadata().uuid()
-                    },
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: MAIN_BRANCH.to_string(),
-                        snapshot_id: tx.current_table.metadata().current_snapshot_id
-                    }
-                ],
+                vec![TableRequirement::UuidMatch {
+                    uuid: tx.current_table.metadata().uuid()
+                },],
                 tx.requirements
             );
         }
@@ -526,15 +520,9 @@ mod tests {
                 .unwrap();
             assert_eq!(0, tx.updates.len());
             assert_eq!(
-                vec![
-                    TableRequirement::UuidMatch {
-                        uuid: tx.current_table.metadata().uuid()
-                    },
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: MAIN_BRANCH.to_string(),
-                        snapshot_id: tx.current_table.metadata().current_snapshot_id
-                    }
-                ],
+                vec![TableRequirement::UuidMatch {
+                    uuid: tx.current_table.metadata().uuid()
+                },],
                 tx.requirements
             );
         }
