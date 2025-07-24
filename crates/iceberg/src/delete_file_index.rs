@@ -109,8 +109,8 @@ impl PopulatedDeleteFileIndex {
     /// 3. Otherwise, the delete file is added to one of two hash maps based on its content type.
 
     fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
-        let mut eq_deletes_by_partition= HashMap::default();
-        let mut pos_deletes_by_partition= HashMap::default();
+        let mut eq_deletes_by_partition = HashMap::default();
+        let mut pos_deletes_by_partition = HashMap::default();
 
         let mut global_deletes: Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)> = vec![];
 
@@ -138,9 +138,11 @@ impl PopulatedDeleteFileIndex {
 
             destination_map
                 .entry(partition.clone())
-                .and_modify(|entry: &mut Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>| {
-                    entry.push((arc_ctx.clone(), file_scan_task.clone()));
-                })
+                .and_modify(
+                    |entry: &mut Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>| {
+                        entry.push((arc_ctx.clone(), file_scan_task.clone()));
+                    },
+                )
                 .or_insert(vec![(arc_ctx.clone(), file_scan_task)]);
         });
 
