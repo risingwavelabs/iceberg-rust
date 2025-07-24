@@ -138,7 +138,7 @@ impl PopulatedDeleteFileIndex {
 
             destination_map
                 .entry(partition.clone())
-                .and_modify(|entry| {
+                .and_modify(|entry: &mut Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>| {
                     entry.push((arc_ctx.clone(), file_scan_task.clone()));
                 })
                 .or_insert(vec![(arc_ctx.clone(), file_scan_task)]);
