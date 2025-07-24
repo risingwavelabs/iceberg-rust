@@ -34,12 +34,14 @@ pub(crate) struct DeleteFileIndex {
     ready_notify: Arc<Notify>,
 }
 
+type DeleteFileContextAndTask = (Arc<DeleteFileContext>, Arc<FileScanTask>);
+
 #[derive(Debug)]
 struct PopulatedDeleteFileIndex {
     #[allow(dead_code)]
-    global_deletes: Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>,
-    eq_deletes_by_partition: HashMap<Struct, Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>>,
-    pos_deletes_by_partition: HashMap<Struct, Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>>,
+    global_deletes: Vec<DeleteFileContextAndTask>,
+    eq_deletes_by_partition: HashMap<Struct, Vec<DeleteFileContextAndTask>>,
+    pos_deletes_by_partition: HashMap<Struct, Vec<DeleteFileContextAndTask>>,
     // TODO: do we need this?
     // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
 
@@ -138,11 +140,9 @@ impl PopulatedDeleteFileIndex {
 
             destination_map
                 .entry(partition.clone())
-                .and_modify(
-                    |entry: &mut Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)>| {
-                        entry.push((arc_ctx.clone(), file_scan_task.clone()));
-                    },
-                )
+                .and_modify(|entry: &mut Vec<DeleteFileContextAndTask>| {
+                    entry.push((arc_ctx.clone(), file_scan_task.clone()));
+                })
                 .or_insert(vec![(arc_ctx.clone(), file_scan_task)]);
         });
 
