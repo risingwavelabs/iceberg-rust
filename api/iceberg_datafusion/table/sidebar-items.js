@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["metadata_table","table_provider_factory"],"struct":["IcebergTableProvider"]};

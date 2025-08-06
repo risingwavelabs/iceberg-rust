@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"struct":["FastAppendAction","ReplaceSortOrderAction","Transaction"]};
+window.SIDEBAR_ITEMS = {"struct":["ActionCommit","Transaction"],"trait":["ApplyTransactionAction"]};
