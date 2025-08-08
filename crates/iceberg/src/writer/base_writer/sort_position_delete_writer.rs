@@ -23,11 +23,11 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use once_cell::sync::Lazy;
 
+use crate::Result;
 use crate::arrow::schema_to_arrow_schema;
 use crate::spec::{DataFile, NestedField, PrimitiveType, Schema, SchemaRef, Struct, Type};
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-use crate::Result;
 
 /// Builder for `MemoryPositionDeleteWriter`.
 #[derive(Clone)]
@@ -177,16 +177,16 @@ mod test {
     use tempfile::TempDir;
 
     use super::POSITION_DELETE_SCHEMA;
+    use crate::Result;
     use crate::io::FileIOBuilder;
     use crate::spec::{DataContentType, DataFileFormat, Struct};
     use crate::writer::base_writer::sort_position_delete_writer::{
         PositionDeleteInput, SortPositionDeleteWriterBuilder,
     };
-    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
-    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
     use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
+    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-    use crate::Result;
 
     #[tokio::test]
     async fn test_position_delete_writer() -> Result<()> {
