@@ -30,6 +30,8 @@ use crate::spec::{
     Operation, Snapshot, SnapshotReference, SnapshotRetention, Struct, StructType, Summary,
     MAIN_BRANCH,
 };
+#[allow(unused_imports)]
+use crate::transaction::manifest_filter::ManifestFilterManager;
 use crate::transaction::Transaction;
 use crate::utils::bin::ListPacker;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
@@ -210,14 +212,14 @@ impl<'a> SnapshotProduceAction<'a> {
         content_type: &ManifestContentType,
         partition_spec_id: i32,
     ) -> Result<ManifestWriter> {
-        let new_manifest_path = format!(
-            "{}/{}/{}-m{}.{}",
+        let new_manifest_path = new_manifest_path(
             self.tx.current_table.metadata().location(),
             META_ROOT_PATH,
             self.commit_uuid,
             self.manifest_counter.next().unwrap(),
-            DataFileFormat::Avro
+            DataFileFormat::Avro,
         );
+
         let output = self
             .tx
             .current_table
@@ -368,6 +370,16 @@ impl<'a> SnapshotProduceAction<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
+        self.manifest_file_with_filter(snapshot_produce_operation, manifest_process, None)
+            .await
+    }
+
+    async fn manifest_file_with_filter<OP: SnapshotProduceOperation, MP: ManifestProcess>(
+        &mut self,
+        snapshot_produce_operation: &OP,
+        manifest_process: &MP,
+        mut filter_manager: Option<ManifestFilterManager>,
+    ) -> Result<Vec<ManifestFile>> {
         let mut manifest_files = vec![];
         let data_files = std::mem::take(&mut self.added_data_files);
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
@@ -393,7 +405,19 @@ impl<'a> SnapshotProduceAction<'a> {
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
-        manifest_files.extend(existing_manifests);
+        // Apply filter if provided
+        let filtered_existing_manifests = if let Some(ref mut filter) = filter_manager {
+            filter
+                .filter_manifests(
+                    self.tx.current_table.metadata().current_schema(),
+                    existing_manifests,
+                )
+                .await?
+        } else {
+            existing_manifests
+        };
+
+        manifest_files.extend(filtered_existing_manifests);
         manifest_process
             .process_manifest(self, manifest_files)
             .await
@@ -705,4 +729,17 @@ impl MergeManifestManager {
 
         Ok(merge_manifests)
     }
+}
+
+pub(crate) fn new_manifest_path(
+    metadata_location: &str,
+    meta_root_path: &str,
+    commit_uuid: Uuid,
+    manifest_counter: u64,
+    format: DataFileFormat,
+) -> String {
+    format!(
+        "{}/{}/{}-m{}.{}",
+        metadata_location, meta_root_path, commit_uuid, manifest_counter, format
+    )
 }
