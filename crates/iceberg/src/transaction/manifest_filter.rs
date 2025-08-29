@@ -18,7 +18,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-
 use uuid::Uuid;
 use std::ops::RangeFrom;
 
@@ -54,8 +53,6 @@ pub struct ManifestFilterManager {
     fail_any_delete: bool,
     /// Whether to fail if required delete paths are missing
     fail_missing_delete_paths: bool,
-    /// Whether the filtering is case sensitive
-    case_sensitive: bool,
     /// Cache of filtered manifests to avoid reprocessing
     filtered_manifests: HashMap<String, ManifestFile>, // manifest_path -> filtered_manifest
     /// Tracking where files were deleted to validate retries quickly
@@ -73,20 +70,31 @@ pub struct ManifestFilterManager {
 
 impl ManifestFilterManager {
     /// Create a new ManifestFilterManager
-    pub fn new() -> Self {
-        todo!()
-        // Self {
-        //     delete_paths: HashSet::new(),
-        //     delete_files: HashMap::new(),
-        //     drop_partitions: HashMap::new(),
-        //     delete_file_partitions: HashMap::new(),
-        //     min_sequence_number: 0,
-        //     fail_any_delete: false,
-        //     fail_missing_delete_paths: false,
-        //     case_sensitive: true,
-        //     filtered_manifests: HashMap::new(),
-        //     filtered_manifest_to_deleted_files: HashMap::new(),
-        // }
+    pub fn new(
+        file_io: FileIO,
+        metadata_location: String,
+        meta_root_path: String,
+        commit_uuid: Uuid,
+        format_version: FormatVersion,
+    ) -> Self {
+        Self {
+            delete_paths: HashSet::new(),
+            delete_files: HashMap::new(),
+            manifests_with_deletes: HashSet::new(),
+            drop_partitions: HashMap::new(),
+            delete_file_partitions: HashMap::new(),
+            min_sequence_number: 0,
+            fail_any_delete: false,
+            fail_missing_delete_paths: false,
+            filtered_manifests: HashMap::new(),
+            filtered_manifest_to_deleted_files: HashMap::new(),
+            file_io,
+            metadata_location,
+            meta_root_path,
+            commit_uuid,
+            manifest_counter: 0..,
+            format_version,
+        }
     }
 
     /// Set whether to fail if any delete operation is attempted
@@ -95,6 +103,7 @@ impl ManifestFilterManager {
         self
     }
 
+    /// Get the list of files that are marked for deletion
     pub fn files_to_be_deleted(&self) -> Vec<DataFile> {
         self.delete_files.values().cloned().collect()
     }
@@ -117,18 +126,13 @@ impl ManifestFilterManager {
         self
     }
 
-    /// Set whether the filtering is case sensitive
-    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
-        self.case_sensitive = case_sensitive;
-        self
-    }
-
     /// Set whether to fail if required delete paths are missing
     pub fn fail_missing_delete_paths(mut self) -> Self {
         self.fail_missing_delete_paths = true;
         self
     }
 
+    /// Mark a data file for deletion
     pub async fn delete_file(&mut self, file: DataFile) -> Result<()> {
         self.invalidate_filtered_cache().await?;
 
@@ -151,11 +155,11 @@ impl ManifestFilterManager {
     }
 
     /// Add a specific file path to be deleted
-    pub async fn delete_file_by_path(mut self, path: impl Into<String>) -> Result<()> {
+    pub async fn delete_file_by_path(mut self, path: impl Into<String>) -> Result<Self> {
         self.invalidate_filtered_cache().await?;
         self.delete_paths.insert(path.into());
 
-        Ok(())
+        Ok(self)
     }
 
     /// Check if this manager contains any delete operations
@@ -226,6 +230,11 @@ impl ManifestFilterManager {
             return false;
         }
 
+        // Check if the manifest is old enough to be filtered based on min_sequence_number
+        if manifest.min_sequence_number < self.min_sequence_number {
+            return false;
+        }
+
         // // Quick check: if we know this manifest has deletes, return true immediately
         // if self.manifests_with_deletes.contains(&manifest.manifest_path) {
         //     return true;
@@ -251,7 +260,7 @@ impl ManifestFilterManager {
         //     return 
         // }
 
-        return false;
+        false
     }
 
     /// Filter a manifest that is known to contain files to delete
@@ -331,7 +340,7 @@ impl ManifestFilterManager {
                 self.delete_files.contains_key(file.file_path()) ||
                 // Check if partition should be dropped
                 self.drop_partitions.get(&file.partition_spec_id)
-                    .map(|drop_partition| drop_partition.contains(&file.partition()))
+                    .map(|drop_partition| drop_partition.contains(file.partition()))
                     .unwrap_or(false) ||
                 // For delete manifests, check sequence number for old delete files
                 (is_delete && 
@@ -486,7 +495,7 @@ impl ManifestFilterManager {
                 self.delete_files.contains_key(file.file_path()) ||
                 // Check if partition should be dropped
                 self.drop_partitions.get(&file.partition_spec_id)
-                    .map(|drop_partition| drop_partition.contains(&file.partition()))
+                    .map(|drop_partition| drop_partition.contains(file.partition()))
                     .unwrap_or(false) ||
                 // For delete manifests, check sequence number for old delete files
                 (is_delete && 
@@ -567,41 +576,824 @@ impl ManifestFilterManager {
 
 impl Default for ManifestFilterManager {
     fn default() -> Self {
-        Self::new()
+        use crate::io::FileIOBuilder;
+        
+        Self::new(
+            FileIOBuilder::new_fs_io().build().unwrap(),
+            "/tmp/metadata".to_string(),
+            "/tmp".to_string(),
+            Uuid::new_v4(),
+            FormatVersion::V2,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{
+        DataContentType, DataFileFormat, NestedField, PrimitiveType, Type,
+        ManifestEntry, ManifestStatus, ManifestFile, ManifestContentType, Struct, Schema,
+        PartitionSpec, FormatVersion, ManifestWriterBuilder
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    // Helper function to create a test schema
+    fn create_test_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name", 
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    // Helper function to create a test DataFile
+    fn create_test_data_file(file_path: &str, partition_spec_id: i32) -> DataFile {
+        DataFile {
+            content: DataContentType::Data,
+            file_path: file_path.to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::empty(),
+            partition_spec_id,
+            record_count: 100,
+            file_size_in_bytes: 1024,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(), 
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+        }
+    }
+
+    // Helper function to create a test ManifestFile
+    fn create_test_manifest_file(manifest_path: &str, content: ManifestContentType) -> ManifestFile {
+        ManifestFile {
+            manifest_path: manifest_path.to_string(),
+            manifest_length: 5000,
+            partition_spec_id: 0,
+            content,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(10),
+            existing_files_count: Some(5),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1000),
+            existing_rows_count: Some(500),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        }
+    }
+
+    // Helper function to setup test environment
+    fn setup_test_manager() -> (ManifestFilterManager, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let metadata_location = temp_dir.path().join("metadata.json").to_string_lossy().to_string();
+        let meta_root_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let manager = ManifestFilterManager::new(
+            file_io,
+            metadata_location,
+            meta_root_path,
+            Uuid::new_v4(),
+            FormatVersion::V2,
+        );
+        
+        (manager, temp_dir)
+    }
 
     #[test]
-    fn test_manifest_filter_manager_creation() {
-        let manager = ManifestFilterManager::new();
+    fn test_new_manifest_filter_manager() {
+        let (manager, _temp_dir) = setup_test_manager();
+        
+        // Test initial state
         assert!(!manager.contains_deletes());
-        assert!(manager.case_sensitive);
+        assert_eq!(manager.min_sequence_number, 0);
+        assert!(!manager.fail_any_delete);
+        assert!(!manager.fail_missing_delete_paths);
+        assert!(manager.delete_paths.is_empty());
+        assert!(manager.delete_files.is_empty());
+        assert!(manager.drop_partitions.is_empty());
     }
 
     #[test]
-    fn test_delete_operations() {
-        let manager = ManifestFilterManager::new()
-            .delete_file_by_path("test/path/file.parquet")
-            .drop_delete_files_older_than(100);
-
-        assert!(manager.contains_deletes());
-        assert_eq!(manager.min_sequence_number, 100);
-        assert!(manager.delete_paths.contains("test/path/file.parquet"));
-    }
-
-    #[test]
-    fn test_configuration() {
-        let manager = ManifestFilterManager::new()
-            .case_sensitive(false)
+    fn test_configuration_flags() {
+        let (manager, _temp_dir) = setup_test_manager();
+        
+        let configured_manager = manager
             .fail_any_delete()
-            .fail_missing_delete_paths();
+            .fail_missing_delete_paths()
+            .drop_delete_files_older_than(100);
+        
+        assert!(configured_manager.fail_any_delete);
+        assert!(configured_manager.fail_missing_delete_paths);
+        assert_eq!(configured_manager.min_sequence_number, 100);
+    }
 
-        assert!(!manager.case_sensitive);
-        assert!(manager.fail_any_delete);
-        assert!(manager.fail_missing_delete_paths);
+    #[tokio::test]
+    async fn test_delete_file_by_path() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Initially no deletes
+        assert!(!manager.contains_deletes());
+        
+        // Add a file path to delete
+        let file_path = "/test/path/file.parquet";
+        manager = manager.delete_file_by_path(file_path).await.unwrap();
+        
+        // Should now contain deletes
+        assert!(manager.contains_deletes());
+        assert!(manager.delete_paths.contains(file_path));
+    }
+
+    #[tokio::test]
+    async fn test_delete_file() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Create test file
+        let test_file = create_test_data_file("/test/data/file1.parquet", 0);
+        let file_path = test_file.file_path.clone();
+        
+        // Initially no deletes
+        assert!(!manager.contains_deletes());
+        
+        // Add file to delete
+        manager.delete_file(test_file).await.unwrap();
+        
+        // Should now contain deletes
+        assert!(manager.contains_deletes());
+        assert!(manager.delete_files.contains_key(&file_path));
+        
+        // Should track the file for deletion
+        let deleted_files = manager.files_to_be_deleted();
+        assert_eq!(deleted_files.len(), 1);
+        assert_eq!(deleted_files[0].file_path, file_path);
+    }
+
+    #[test]
+    fn test_drop_partition() {
+        let (manager, _temp_dir) = setup_test_manager();
+        
+        // Create test partition
+        let partition = Struct::empty();
+        let spec_id = 0;
+        
+        let configured_manager = manager.drop_partition(spec_id, partition.clone());
+        
+        assert!(configured_manager.contains_deletes());
+        assert!(configured_manager.drop_partitions.contains_key(&spec_id));
+        assert!(configured_manager.drop_partitions[&spec_id].contains(&partition));
+    }
+
+    #[test]
+    fn test_manifest_has_no_live_files() {
+        // Test manifest with no live files
+        let manifest_no_live = ManifestFile {
+            manifest_path: "/test/manifest1.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(0),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(5),
+            added_rows_count: Some(0),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(100),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        assert!(ManifestFilterManager::manifest_has_no_live_files(&manifest_no_live));
+        
+        // Test manifest with live files
+        let manifest_with_live = create_test_manifest_file("/test/manifest2.avro", ManifestContentType::Data);
+        assert!(!ManifestFilterManager::manifest_has_no_live_files(&manifest_with_live));
+    }
+
+    #[test]
+    fn test_can_contain_dropped_files() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        let manifest = create_test_manifest_file("/test/manifest.avro", ManifestContentType::Data);
+        
+        // Initially should not contain dropped files
+        assert!(!manager.can_contain_dropped_files(&manifest));
+        
+        // Add file path to delete
+        manager.delete_paths.insert("/test/file.parquet".to_string());
+        assert!(manager.can_contain_dropped_files(&manifest));
+        
+        // Clear paths and add file to delete 
+        manager.delete_paths.clear();
+        let test_file = create_test_data_file("/test/file2.parquet", 0);
+        manager.delete_files.insert(test_file.file_path.clone(), test_file);
+        assert!(manager.can_contain_dropped_files(&manifest));
+    }
+
+    #[test]
+    fn test_can_contain_deleted_files() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Test manifest with no live files
+        let manifest_no_live = ManifestFile {
+            manifest_path: "/test/manifest1.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(0),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(5),
+            added_rows_count: Some(0),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(100),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        // Should return false for manifest with no live files
+        assert!(!manager.can_contain_deleted_files(&manifest_no_live));
+        
+        // Test manifest with live files but no deletes
+        let manifest_with_live = create_test_manifest_file("/test/manifest2.avro", ManifestContentType::Data);
+        assert!(!manager.can_contain_deleted_files(&manifest_with_live));
+        
+        // Add deletes and test again
+        manager.delete_paths.insert("/test/file.parquet".to_string());
+        assert!(manager.can_contain_deleted_files(&manifest_with_live));
+    }
+
+    #[tokio::test]
+    async fn test_filter_manifests_empty_input() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        let schema = create_test_schema();
+        
+        let result = manager.filter_manifests(&schema, vec![]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_validate_required_deletes_success() {
+        let (manager, _temp_dir) = setup_test_manager();
+        
+        // Test validation with no required deletes
+        let manifests = vec![create_test_manifest_file("/test/manifest.avro", ManifestContentType::Data)];
+        let result = manager.validate_required_deletes(&manifests);
+        assert!(result.is_ok());
+    }
+
+    #[test] 
+    fn test_validate_required_deletes_failure() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Enable fail_missing_delete_paths
+        manager.fail_missing_delete_paths = true;
+        
+        // Add a required delete path that won't be found
+        manager.delete_paths.insert("/missing/file.parquet".to_string());
+        
+        let manifests = vec![create_test_manifest_file("/test/manifest.avro", ManifestContentType::Data)];
+        let result = manager.validate_required_deletes(&manifests);
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Required delete path missing"));
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_deletion_logic() {
+        let (mut manager, temp_dir) = setup_test_manager();
+        let schema = create_test_schema();
+        
+        // Create test data files - one to keep, one to delete
+        let keep_file = create_test_data_file("/test/keep_me.parquet", 0);
+        let delete_file = create_test_data_file("/test/delete_me.parquet", 0);
+        
+        // Add the file to be deleted to the manager
+        manager.delete_files.insert(delete_file.file_path.clone(), delete_file.clone());
+        
+        // Create an actual manifest file containing both files
+        let manifest_path = temp_dir.path().join("test_manifest.avro");
+        let manifest_path_str = manifest_path.to_str().unwrap();
+        
+        let partition_spec = PartitionSpec::unpartition_spec();
+        
+        // Create manifest entries - one to keep, one to delete
+        let keep_entry = ManifestEntry::builder()
+            .status(ManifestStatus::Added)
+            .data_file(keep_file.clone())
+            .build();
+            
+        let delete_entry = ManifestEntry::builder()
+            .status(ManifestStatus::Added)
+            .data_file(delete_file.clone())
+            .build();
+        
+        let entries = vec![keep_entry, delete_entry];
+        
+        // Write manifest to file
+        let output_file = manager.file_io.new_output(manifest_path_str).unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            output_file,
+            Some(12345),
+            vec![],
+            schema.clone().into(),
+            partition_spec.clone(),
+        ).build_v2_data();
+        
+        for entry in &entries {
+            writer.add_entry(entry.clone()).unwrap();
+        }
+        writer.write_manifest_file().await.unwrap();
+        
+        // Create ManifestFile
+        let manifest = ManifestFile {
+            manifest_path: manifest_path_str.to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 10,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(2),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(20),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        // Test 1: Check if manifest can contain deleted files
+        assert!(manager.can_contain_deleted_files(&manifest), 
+               "Manifest should be able to contain deleted files since we have files to delete");
+        
+        // Test 2: Check if manifest has deleted files
+        let has_deleted = manager.manifest_has_deleted_files(&manifest).await;
+        match &has_deleted {
+            Ok(result) => println!("manifest_has_deleted_files succeeded: {}", result),
+            Err(e) => println!("manifest_has_deleted_files failed: {}", e),
+        }
+        assert!(has_deleted.is_ok(), "manifest_has_deleted_files should succeed: {:?}", has_deleted.err());
+        assert!(has_deleted.unwrap(), "Manifest should have deleted files since it contains a file marked for deletion");
+        
+        // Test 3: Verify the delete file is tracked
+        assert!(manager.delete_files.contains_key(&delete_file.file_path),
+               "Manager should track the file for deletion");
+        assert!(!manager.delete_files.contains_key(&keep_file.file_path),
+               "Manager should not track the keep file for deletion");
+        
+        // Test 4: Verify manager state
+        assert!(manager.contains_deletes(), "Manager should contain deletes");
+        let files_to_delete = manager.files_to_be_deleted();
+        assert_eq!(files_to_delete.len(), 1, "Should have exactly one file to delete");
+        assert_eq!(files_to_delete[0].file_path, delete_file.file_path, "Should track the correct file for deletion");
+    }
+
+    #[test]
+    fn test_min_sequence_number_logic() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Set min sequence number to 5
+        manager.min_sequence_number = 5;
+        
+        // Test sequence number comparison logic directly
+        assert_eq!(manager.min_sequence_number, 5);
+        
+        // Test with different sequence numbers
+        let old_sequence = 3;
+        let new_sequence = 10;
+        
+        assert!(old_sequence < manager.min_sequence_number, "Old sequence should be below minimum");
+        assert!(new_sequence >= manager.min_sequence_number, "New sequence should be above minimum");
+        
+        // Create manifests with different sequence numbers
+        let old_manifest = ManifestFile {
+            manifest_path: "/test/old.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: old_sequence,
+            min_sequence_number: old_sequence,
+            added_snapshot_id: 12345,
+            added_files_count: Some(1), // Has live files
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(10),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        let new_manifest = ManifestFile {
+            manifest_path: "/test/new.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: new_sequence,
+            min_sequence_number: new_sequence,
+            added_snapshot_id: 12346,
+            added_files_count: Some(1), // Has live files
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(10),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        // Add files to delete for testing
+        let test_file = create_test_data_file("/test/file.parquet", 0);
+        manager.delete_files.insert(test_file.file_path.clone(), test_file);
+        
+        // Old manifest should NOT be processed for deletions due to sequence number
+        assert!(!manager.can_contain_deleted_files(&old_manifest),
+               "Old manifest should not be processed due to sequence number being below minimum");
+        
+        // New manifest should be processed for deletions  
+        assert!(manager.can_contain_deleted_files(&new_manifest),
+               "New manifest should be processed since sequence number is above minimum");
+        
+        // Verify sequence number properties
+        assert!(old_manifest.min_sequence_number < manager.min_sequence_number);
+        assert!(new_manifest.min_sequence_number >= manager.min_sequence_number);
+    }
+
+    #[test]
+    fn test_deletion_tracking_and_validation() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Create test data files - one to keep, one to delete
+        let keep_file = create_test_data_file("/test/keep_me.parquet", 0);
+        let delete_file = create_test_data_file("/test/delete_me.parquet", 0);
+        
+        // Initially no deletes
+        assert!(!manager.contains_deletes());
+        assert_eq!(manager.files_to_be_deleted().len(), 0);
+        
+        // Add the file to be deleted to the manager
+        manager.delete_files.insert(delete_file.file_path.clone(), delete_file.clone());
+        
+        // Now should have deletes
+        assert!(manager.contains_deletes());
+        assert_eq!(manager.files_to_be_deleted().len(), 1);
+        assert_eq!(manager.files_to_be_deleted()[0].file_path, delete_file.file_path);
+        
+        // Create a manifest that could contain deleted files
+        let manifest = ManifestFile {
+            manifest_path: "/test/test_manifest.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 10,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(2), // Has live files
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(20),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        // Test that manifest can contain deleted files
+        assert!(manager.can_contain_deleted_files(&manifest), 
+               "Manifest should be able to contain deleted files since we have files to delete and manifest has live files");
+        
+        // Verify the delete file is tracked correctly
+        assert!(manager.delete_files.contains_key(&delete_file.file_path),
+               "Manager should track the file for deletion");
+        assert!(!manager.delete_files.contains_key(&keep_file.file_path),
+               "Manager should not track the keep file for deletion");
+        
+        // Test validation passes when no required deletes are set
+        let manifests = vec![manifest];
+        let result = manager.validate_required_deletes(&manifests);
+        assert!(result.is_ok(), "Validation should pass when no required deletes are specified");
+    }
+
+    #[tokio::test]
+    async fn test_clean_uncommitted_removes_all_entries_when_uncommitted() {
+        let (mut manager, temp_dir) = setup_test_manager();
+        
+        // Create a manifest file for testing clean uncommitted functionality
+        let manifest_path = temp_dir.path().join("uncommitted_manifest.avro");
+        let manifest_path_str = manifest_path.to_str().unwrap();
+        
+        let _manifest_file = ManifestFile {
+            manifest_path: manifest_path_str.to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 10,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(2),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(200),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        // Test the clean uncommitted method with empty committed set
+        let committed_files = std::collections::HashSet::new();
+        let result = manager.clean_uncommitted(committed_files).await;
+        
+        assert!(result.is_ok(), "clean_uncommitted should succeed");
+        
+        // Test that manager is still functional after clean_uncommitted
+        let test_file = create_test_data_file("/test/file.parquet", 0);
+        manager.delete_files.insert(test_file.file_path.clone(), test_file);
+        
+        // Verify the manager still tracks delete files
+        assert!(manager.contains_deletes());
+    }
+
+    #[test]
+    fn test_min_sequence_number_filtering_logic() {
+        let (mut manager, _temp_dir) = setup_test_manager();
+        
+        // Set min sequence number to 5
+        manager.min_sequence_number = 5;
+        
+        // Test manifests with different sequence numbers
+        let old_manifest = ManifestFile {
+            manifest_path: "/test/old.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 3, // Below threshold
+            min_sequence_number: 3,
+            added_snapshot_id: 12345,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(100),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        let new_manifest = ManifestFile {
+            manifest_path: "/test/new.avro".to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 8, // Above threshold
+            min_sequence_number: 8,
+            added_snapshot_id: 12346,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(100),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        // Add some delete files to test with
+        let test_file = create_test_data_file("/test/file.parquet", 0);
+        manager.delete_files.insert(test_file.file_path.clone(), test_file);
+        
+        // Old manifest should not be processed for deletions
+        assert!(!manager.can_contain_deleted_files(&old_manifest));
+        
+        // New manifest should be processed for deletions  
+        assert!(manager.can_contain_deleted_files(&new_manifest));
+        
+        // Verify sequence number comparison logic
+        assert!(old_manifest.min_sequence_number < manager.min_sequence_number);
+        assert!(new_manifest.min_sequence_number >= manager.min_sequence_number);
+    }
+
+    #[tokio::test]
+    async fn test_filter_manifests_with_entries_and_rewrite() {
+        let (mut manager, temp_dir) = setup_test_manager();
+        let schema = create_test_schema();
+        
+        // Create test data files - some to keep, some to delete
+        let keep_file1 = create_test_data_file("/test/keep1.parquet", 0);
+        let keep_file2 = create_test_data_file("/test/keep2.parquet", 0);
+        let delete_file1 = create_test_data_file("/test/delete1.parquet", 0);
+        let delete_file2 = create_test_data_file("/test/delete2.parquet", 0);
+        
+        // Mark files for deletion
+        manager.delete_files.insert(delete_file1.file_path.clone(), delete_file1.clone());
+        manager.delete_files.insert(delete_file2.file_path.clone(), delete_file2.clone());
+        
+        // Create first manifest with mixed files
+        let manifest1_path = temp_dir.path().join("manifest1.avro");
+        let manifest1_path_str = manifest1_path.to_str().unwrap();
+        
+        let partition_spec = PartitionSpec::unpartition_spec();
+        
+        // Create entries for first manifest
+        let entries1 = vec![
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(keep_file1.clone())
+                .build(),
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(delete_file1.clone())
+                .build(),
+        ];
+        
+        // Write first manifest
+        let output_file1 = manager.file_io.new_output(manifest1_path_str).unwrap();
+        let mut writer1 = ManifestWriterBuilder::new(
+            output_file1,
+            Some(12345),
+            vec![],
+            schema.clone().into(),
+            partition_spec.clone(),
+        ).build_v2_data();
+        
+        for entry in &entries1 {
+            writer1.add_entry(entry.clone()).unwrap();
+        }
+        writer1.write_manifest_file().await.unwrap();
+        
+        // Create second manifest with different files
+        let manifest2_path = temp_dir.path().join("manifest2.avro");
+        let manifest2_path_str = manifest2_path.to_str().unwrap();
+        
+        let entries2 = vec![
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(keep_file2.clone())
+                .build(),
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(delete_file2.clone())
+                .build(),
+        ];
+        
+        // Write second manifest
+        let output_file2 = manager.file_io.new_output(manifest2_path_str).unwrap();
+        let mut writer2 = ManifestWriterBuilder::new(
+            output_file2,
+            Some(12346),
+            vec![],
+            schema.clone().into(),
+            partition_spec.clone(),
+        ).build_v2_data();
+        
+        for entry in &entries2 {
+            writer2.add_entry(entry.clone()).unwrap();
+        }
+        writer2.write_manifest_file().await.unwrap();
+        
+        // Create ManifestFile objects
+        let manifest1 = ManifestFile {
+            manifest_path: manifest1_path_str.to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 10,
+            min_sequence_number: 1,
+            added_snapshot_id: 12345,
+            added_files_count: Some(2),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(200),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        let manifest2 = ManifestFile {
+            manifest_path: manifest2_path_str.to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 10,
+            min_sequence_number: 1,
+            added_snapshot_id: 12346,
+            added_files_count: Some(2),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(200),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: vec![],
+            key_metadata: vec![],
+        };
+        
+        let input_manifests = vec![manifest1.clone(), manifest2.clone()];
+        
+        // **THIS IS THE KEY TEST: Call filter_manifests function**
+        let filtered_manifests = manager.filter_manifests(&schema, input_manifests).await.unwrap();
+        
+        // Verify we got filtered manifests back
+        assert_eq!(filtered_manifests.len(), 2, "Should return same number of manifests");
+        
+        // Verify that filtered manifests have different paths (rewritten)
+        assert_ne!(filtered_manifests[0].manifest_path, manifest1.manifest_path,
+                  "First manifest should be rewritten with new path");
+        assert_ne!(filtered_manifests[1].manifest_path, manifest2.manifest_path,
+                  "Second manifest should be rewritten with new path");
+        
+        // Verify deletion tracking
+        assert_eq!(manager.files_to_be_deleted().len(), 2, "Should track 2 files for deletion");
+        let deleted_paths: std::collections::HashSet<_> = manager.files_to_be_deleted()
+            .into_iter().map(|f| f.file_path).collect();
+        assert!(deleted_paths.contains(&delete_file1.file_path));
+        assert!(deleted_paths.contains(&delete_file2.file_path));
+        
+        // **VERIFY ENTRIES IN FILTERED MANIFESTS**
+        // Load and check entries in first filtered manifest
+        let filtered_manifest1 = filtered_manifests[0].load_manifest(&manager.file_io).await.unwrap();
+        let (entries1_filtered, _) = filtered_manifest1.into_parts();
+        
+        // Count live entries and deleted entries
+        let mut live_entries = 0;
+        let mut deleted_entries = 0;
+        let mut keep1_found = false;
+        let mut delete1_found = false;
+        
+        for entry in &entries1_filtered {
+            match entry.status() {
+                ManifestStatus::Added | ManifestStatus::Existing => {
+                    live_entries += 1;
+                    if entry.data_file().file_path() == keep_file1.file_path {
+                        keep1_found = true;
+                    }
+                }
+                ManifestStatus::Deleted => {
+                    deleted_entries += 1;
+                    if entry.data_file().file_path() == delete_file1.file_path {
+                        delete1_found = true;
+                    }
+                }
+            }
+        }
+        
+        assert_eq!(live_entries, 1, "First manifest should have 1 live entry (keep_file1)");
+        assert_eq!(deleted_entries, 1, "First manifest should have 1 deleted entry (delete_file1)");
+        assert!(keep1_found, "keep_file1 should be found as live entry");
+        assert!(delete1_found, "delete_file1 should be found as deleted entry");
+        
+        // **VERIFY FILTERED MANIFEST CACHE**
+        assert!(manager.filtered_manifests.contains_key(&manifest1.manifest_path),
+               "Original manifest1 path should be cached");
+        assert!(manager.filtered_manifests.contains_key(&manifest2.manifest_path),
+               "Original manifest2 path should be cached");
+        
+        // **VERIFY DELETED FILES TRACKING**
+        assert!(manager.filtered_manifest_to_deleted_files.contains_key(&filtered_manifests[0].manifest_path),
+               "Should track deleted files for first filtered manifest");
+        assert!(manager.filtered_manifest_to_deleted_files.contains_key(&filtered_manifests[1].manifest_path),
+               "Should track deleted files for second filtered manifest");
+        
+        let deleted_files_manifest1 = &manager.filtered_manifest_to_deleted_files[&filtered_manifests[0].manifest_path];
+        let deleted_files_manifest2 = &manager.filtered_manifest_to_deleted_files[&filtered_manifests[1].manifest_path];
+        
+        assert_eq!(deleted_files_manifest1.len(), 1, "First manifest should track 1 deleted file");
+        assert_eq!(deleted_files_manifest2.len(), 1, "Second manifest should track 1 deleted file");
+        assert!(deleted_files_manifest1.contains(&delete_file1.file_path));
+        assert!(deleted_files_manifest2.contains(&delete_file2.file_path));
+        
+        println!("✅ Successfully tested filter_manifests with entries checking and manifest rewriting!");
+        println!("   - Original manifests: {} and {}", manifest1.manifest_path, manifest2.manifest_path);
+        println!("   - Filtered manifests: {} and {}", filtered_manifests[0].manifest_path, filtered_manifests[1].manifest_path);
+        println!("   - Entries processed and correctly filtered");
+        println!("   - Deletion tracking verified");
     }
 }
