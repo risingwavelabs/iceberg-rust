@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
@@ -25,7 +24,7 @@ use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{
     DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestStatus, ManifestWriter, 
-    ManifestWriterBuilder, PartitionSpec, Schema, Struct
+    ManifestWriterBuilder, PartitionSpec, Schema
 };
 use crate::transaction::snapshot::new_manifest_path;
 use crate::{Error, ErrorKind};
@@ -113,11 +112,6 @@ pub struct ManifestFilterManager {
 
     manifests_with_deletes: HashSet<String>,
 
-    /// Partitions to drop completely
-    drop_partitions: HashMap<i32, HashSet<Struct>>, // (spec_id, partition)
-
-    delete_file_partitions: HashMap<i32, HashSet<Struct>>, // (spec_id, partition)
-
     /// Minimum sequence number for removing old delete files
     min_sequence_number: i64,
     /// Whether to fail if any delete operation is attempted
@@ -140,8 +134,6 @@ impl ManifestFilterManager {
             delete_paths: HashSet::new(),
             delete_files: HashMap::new(),
             manifests_with_deletes: HashSet::new(),
-            drop_partitions: HashMap::new(),
-            delete_file_partitions: HashMap::new(),
             min_sequence_number: 0,
             fail_any_delete: false,
             fail_missing_delete_paths: false,
@@ -183,12 +175,6 @@ impl ManifestFilterManager {
         self.delete_files.values().cloned().collect()
     }
 
-    /// Add a partition to drop from the table during the delete phase
-    pub fn drop_partition(mut self, spec_id: i32, partition: Struct) -> Self {
-        self.drop_partitions.entry(spec_id).or_default().insert(partition);
-        self
-    }
-
     /// Set the sequence number used to remove old delete files
     /// Delete files with a sequence number older than the given value will be removed
     pub fn drop_delete_files_older_than(mut self, sequence_number: i64) -> Self {
@@ -213,18 +199,8 @@ impl ManifestFilterManager {
 
         // Todo: check all deletes references in manifests?
         let file_path = file.file_path.clone();
-        let partition = file.partition.clone();
-        let partition_spec_id = file.partition_spec_id;
-
+        
         self.delete_files.insert(file_path, file);
-        match self.delete_file_partitions.entry(partition_spec_id) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().insert(partition);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(HashSet::from([partition]));
-            }
-        }
 
         Ok(())
     }
@@ -241,7 +217,6 @@ impl ManifestFilterManager {
     pub fn contains_deletes(&self) -> bool {
         !self.delete_paths.is_empty()
             || !self.delete_files.is_empty()
-            || !self.drop_partitions.is_empty()
     }
 
     /// Filter a list of manifest files
@@ -305,27 +280,13 @@ impl ManifestFilterManager {
             return false;
         }
 
-        // Check various conditions that might indicate deletable files
-        self.can_contain_dropped_files(manifest) || self.can_contain_dropped_partitions(manifest)
+        // Check if we have file-based deletes
+        self.can_contain_dropped_files(manifest)
     }
 
     fn can_contain_dropped_files(&self, _manifest: &ManifestFile) -> bool {
         // Simple check - if we have file-based deletes, any manifest might contain them
-        if !self.delete_paths.is_empty() || !self.delete_files.is_empty() {
-            return true;
-        }
-
-        false
-    }
-
-    fn can_contain_dropped_partitions(&self, _manifest: &ManifestFile) -> bool {
-        // TODO: Check if manifest's partition range can overlap with dropped partitions
-        // For now, conservatively return true if we have partitions to drop
-        // if(!self.drop_partitions.is_empty()) {
-        //     return 
-        // }
-
-        false
+        !self.delete_paths.is_empty() || !self.delete_files.is_empty()
     }
 
     /// Filter a manifest that is known to contain files to delete
@@ -374,10 +335,6 @@ impl ManifestFilterManager {
                 self.delete_paths.contains(file.file_path()) ||
                 // Check if file is in delete files collection
                 self.delete_files.contains_key(file.file_path()) ||
-                // Check if partition should be dropped
-                self.drop_partitions.get(&file.partition_spec_id)
-                    .map(|drop_partition| drop_partition.contains(file.partition()))
-                    .unwrap_or(false) ||
                 // For delete manifests, check sequence number for old delete files
                 (is_delete && 
                  entry.sequence_number().unwrap_or(0) > 0 &&
@@ -529,10 +486,6 @@ impl ManifestFilterManager {
                 self.delete_paths.contains(file.file_path()) ||
                 // Check if file is in delete files collection
                 self.delete_files.contains_key(file.file_path()) ||
-                // Check if partition should be dropped
-                self.drop_partitions.get(&file.partition_spec_id)
-                    .map(|drop_partition| drop_partition.contains(file.partition()))
-                    .unwrap_or(false) ||
                 // For delete manifests, check sequence number for old delete files
                 (is_delete && 
                  entry.status() != ManifestStatus::Deleted && // entry.isLive() in Java
@@ -738,7 +691,6 @@ mod tests {
         assert!(!manager.fail_missing_delete_paths);
         assert!(manager.delete_paths.is_empty());
         assert!(manager.delete_files.is_empty());
-        assert!(manager.drop_partitions.is_empty());
     }
 
     #[test]
@@ -793,21 +745,6 @@ mod tests {
         let deleted_files = manager.files_to_be_deleted();
         assert_eq!(deleted_files.len(), 1);
         assert_eq!(deleted_files[0].file_path, file_path);
-    }
-
-    #[test]
-    fn test_drop_partition() {
-        let (manager, _temp_dir) = setup_test_manager();
-        
-        // Create test partition
-        let partition = Struct::empty();
-        let spec_id = 0;
-        
-        let configured_manager = manager.drop_partition(spec_id, partition.clone());
-        
-        assert!(configured_manager.contains_deletes());
-        assert!(configured_manager.drop_partitions.contains_key(&spec_id));
-        assert!(configured_manager.drop_partitions[&spec_id].contains(&partition));
     }
 
     #[test]
