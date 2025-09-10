@@ -66,6 +66,7 @@ pub struct ManifestFilterManager {
     commit_uuid: Uuid,
     manifest_counter: RangeFrom<u64>,
     format_version: FormatVersion,
+    snapshot_id: i64,
 }
 
 impl ManifestFilterManager {
@@ -76,6 +77,7 @@ impl ManifestFilterManager {
         meta_root_path: String,
         commit_uuid: Uuid,
         format_version: FormatVersion,
+        snapshot_id: i64,
     ) -> Self {
         Self {
             delete_paths: HashSet::new(),
@@ -94,6 +96,7 @@ impl ManifestFilterManager {
             commit_uuid,
             manifest_counter: 0..,
             format_version,
+            snapshot_id,
         }
     }
 
@@ -230,16 +233,6 @@ impl ManifestFilterManager {
             return false;
         }
 
-        // Check if the manifest is old enough to be filtered based on min_sequence_number
-        if manifest.min_sequence_number < self.min_sequence_number {
-            return false;
-        }
-
-        // // Quick check: if we know this manifest has deletes, return true immediately
-        // if self.manifests_with_deletes.contains(&manifest.manifest_path) {
-        //     return true;
-        // }
-
         // Check various conditions that might indicate deletable files
         self.can_contain_dropped_files(manifest) || self.can_contain_dropped_partitions(manifest)
     }
@@ -301,17 +294,12 @@ impl ManifestFilterManager {
         // Create the manifest writer
         let writer_builder = ManifestWriterBuilder::new(
             output,
-            Some(manifest.added_snapshot_id),  // Use the original snapshot ID
+            Some(self.snapshot_id),
             Vec::new(), // key_metadata - empty for now
             table_schema.clone().into(), // Convert to Arc<Schema>
             partition_spec,
         );
-        
-        // let mut writer = if manifest.content == ManifestContentType::Data {
-        //     writer_builder.build_v2_data()
-        // } else {
-        //     writer_builder.build_v2_deletes()
-        // };
+    
 
         let mut writer = match self.format_version {
             FormatVersion::V2 => {
@@ -584,6 +572,7 @@ impl Default for ManifestFilterManager {
             "/tmp".to_string(),
             Uuid::new_v4(),
             FormatVersion::V2,
+            1,
         )
     }
 }
@@ -679,6 +668,7 @@ mod tests {
             meta_root_path,
             Uuid::new_v4(),
             FormatVersion::V2,
+            1,
         );
         
         (manager, temp_dir)
@@ -1034,15 +1024,15 @@ mod tests {
         let test_file = create_test_data_file("/test/file.parquet", 0);
         manager.delete_files.insert(test_file.file_path.clone(), test_file);
         
-        // Old manifest should NOT be processed for deletions due to sequence number
-        assert!(!manager.can_contain_deleted_files(&old_manifest),
-               "Old manifest should not be processed due to sequence number being below minimum");
+        // Both manifests should be able to contain deleted files since they have live files and we have files to delete
+        assert!(manager.can_contain_deleted_files(&old_manifest),
+               "Old manifest should be able to contain deleted files since it has live files");
         
         // New manifest should be processed for deletions  
         assert!(manager.can_contain_deleted_files(&new_manifest),
-               "New manifest should be processed since sequence number is above minimum");
+               "New manifest should be processed since it has live files");
         
-        // Verify sequence number properties
+        // Verify sequence number properties - these are still valid for min_sequence_number logic
         assert!(old_manifest.min_sequence_number < manager.min_sequence_number);
         assert!(new_manifest.min_sequence_number >= manager.min_sequence_number);
     }
@@ -1190,13 +1180,15 @@ mod tests {
         let test_file = create_test_data_file("/test/file.parquet", 0);
         manager.delete_files.insert(test_file.file_path.clone(), test_file);
         
-        // Old manifest should not be processed for deletions
-        assert!(!manager.can_contain_deleted_files(&old_manifest));
+        // Both manifests should be able to contain deleted files since they have live files and we have files to delete
+        assert!(manager.can_contain_deleted_files(&old_manifest), 
+               "Old manifest should be able to contain deleted files since it has live files");
         
         // New manifest should be processed for deletions  
-        assert!(manager.can_contain_deleted_files(&new_manifest));
+        assert!(manager.can_contain_deleted_files(&new_manifest),
+               "New manifest should be able to contain deleted files since it has live files");
         
-        // Verify sequence number comparison logic
+        // Verify sequence number comparison logic - this is still valid for min_sequence_number usage elsewhere
         assert!(old_manifest.min_sequence_number < manager.min_sequence_number);
         assert!(new_manifest.min_sequence_number >= manager.min_sequence_number);
     }
