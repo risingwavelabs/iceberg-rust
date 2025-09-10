@@ -16,9 +16,9 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use uuid::Uuid;
-use std::ops::RangeFrom;
 
 use crate::error::Result;
 use crate::io::FileIO;
@@ -34,7 +34,7 @@ pub struct ManifestWriterContext {
     metadata_location: String,
     meta_root_path: String,
     commit_uuid: Uuid,
-    manifest_counter: RangeFrom<u64>,
+    manifest_counter: Arc<AtomicU64>,
     format_version: FormatVersion,
     snapshot_id: i64,
     file_io: FileIO,
@@ -46,6 +46,7 @@ impl ManifestWriterContext {
         metadata_location: String,
         meta_root_path: String,
         commit_uuid: Uuid,
+        manifest_counter: Arc<AtomicU64>,
         format_version: FormatVersion,
         snapshot_id: i64,
         file_io: FileIO,
@@ -54,7 +55,7 @@ impl ManifestWriterContext {
             metadata_location,
             meta_root_path,
             commit_uuid,
-            manifest_counter: 0..,
+            manifest_counter,
             format_version,
             snapshot_id,
             file_io,
@@ -72,7 +73,7 @@ impl ManifestWriterContext {
             &self.metadata_location,
             &self.meta_root_path,
             self.commit_uuid,
-            self.manifest_counter.next().unwrap(),
+            self.manifest_counter.fetch_add(1, Ordering::SeqCst),
             crate::spec::DataFileFormat::Avro,
         );
         
@@ -151,11 +152,13 @@ impl ManifestFilterManager {
         snapshot_id: i64,
         commit_uuid: Uuid,
         format_version: FormatVersion,
+        manifest_counter: Arc<AtomicU64>,
     ) -> Self {
         let writer_context = ManifestWriterContext::new(
             metadata_location,
             "metadata".to_string(), // META_ROOT_PATH equivalent
             commit_uuid,
+            manifest_counter,
             format_version,
             snapshot_id,
             file_io.clone(),
@@ -177,14 +180,13 @@ impl ManifestFilterManager {
 
     /// Set the sequence number used to remove old delete files
     /// Delete files with a sequence number older than the given value will be removed
-    pub fn drop_delete_files_older_than(mut self, sequence_number: i64) -> Self {
+    pub fn drop_delete_files_older_than(&mut self, sequence_number: i64) {
         assert!(
             sequence_number >= 0,
             "Invalid minimum data sequence number: {}",
             sequence_number
         );
         self.min_sequence_number = sequence_number;
-        self
     }
 
     /// Set whether to fail if required delete paths are missing
@@ -194,9 +196,7 @@ impl ManifestFilterManager {
     }
 
     /// Mark a data file for deletion
-    pub async fn delete_file(&mut self, file: DataFile) -> Result<()> {
-        self.invalidate_filtered_cache().await?;
-
+    pub fn delete_file(&mut self, file: DataFile) -> Result<()> {
         // Todo: check all deletes references in manifests?
         let file_path = file.file_path.clone();
         
@@ -206,8 +206,7 @@ impl ManifestFilterManager {
     }
 
     /// Add a specific file path to be deleted
-    pub async fn delete_file_by_path(mut self, path: impl Into<String>) -> Result<Self> {
-        self.invalidate_filtered_cache().await?;
+    pub fn delete_file_by_path(mut self, path: impl Into<String>) -> Result<Self> {
         self.delete_paths.insert(path.into());
 
         Ok(self)
@@ -451,12 +450,6 @@ impl ManifestFilterManager {
         deleted_files
     }
 
-    /// Invalidate the filtered manifest cache
-    async fn invalidate_filtered_cache(&mut self) -> Result<()>{
-        // Clean uncommitted filtered manifests (equivalent to Java's cleanUncommitted(SnapshotProducer.EMPTY_SET))
-        self.clean_uncommitted(HashSet::new()).await
-    }
-
     fn manifest_has_no_live_files(manifest: &ManifestFile) -> bool {
         !manifest.has_added_files() && !manifest.has_existing_files()
     }
@@ -531,36 +524,6 @@ impl ManifestFilterManager {
         
         Ok(false)
     }
-
-    /// Deletes filtered manifests that were created by this class, but are not in the committed
-    /// manifest set.
-    ///
-    /// @param committed the set of manifest file paths that were committed
-    async fn clean_uncommitted(&mut self, committed: HashSet<String>) -> Result<()> {
-        // Iterate over a copy of entries to avoid concurrent modification
-        // In Rust, we'll collect the entries first, then process them
-        let filter_entries: Vec<(String, ManifestFile)> = self
-            .filtered_manifests
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        for (original_manifest_path, filtered_manifest) in filter_entries {
-            // Check if the filtered manifest is in the committed list
-            if !committed.contains(&filtered_manifest.manifest_path) {
-                // Only delete if the filtered copy was created (i.e., paths are different)
-                if original_manifest_path.eq_ignore_ascii_case(&filtered_manifest.manifest_path) {
-                    // Delete the filtered manifest file
-                    self.file_io.delete(&filtered_manifest.manifest_path).await?;
-                }
-
-                // Remove the entry from the cache
-                self.filtered_manifests.remove(original_manifest_path.as_str());
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for ManifestFilterManager {
@@ -572,6 +535,7 @@ impl Default for ManifestFilterManager {
             "/tmp/metadata".to_string(),
             "/tmp".to_string(),
             Uuid::new_v4(),
+            Arc::new(AtomicU64::new(0)),
             FormatVersion::V2,
             1,
             file_io.clone(),
@@ -670,6 +634,7 @@ mod tests {
             metadata_location,
             meta_root_path,
             Uuid::new_v4(),
+            Arc::new(AtomicU64::new(0)),
             FormatVersion::V2,
             1,
             file_io.clone(),
@@ -697,18 +662,18 @@ mod tests {
     fn test_configuration_flags() {
         let (manager, _temp_dir) = setup_test_manager();
         
-        let configured_manager = manager
+        let mut configured_manager = manager
             .fail_any_delete()
-            .fail_missing_delete_paths()
-            .drop_delete_files_older_than(100);
+            .fail_missing_delete_paths();
+        configured_manager.drop_delete_files_older_than(100);
         
         assert!(configured_manager.fail_any_delete);
         assert!(configured_manager.fail_missing_delete_paths);
         assert_eq!(configured_manager.min_sequence_number, 100);
     }
 
-    #[tokio::test]
-    async fn test_delete_file_by_path() {
+    #[test]
+    fn test_delete_file_by_path() {
         let (mut manager, _temp_dir) = setup_test_manager();
         
         // Initially no deletes
@@ -716,15 +681,15 @@ mod tests {
         
         // Add a file path to delete
         let file_path = "/test/path/file.parquet";
-        manager = manager.delete_file_by_path(file_path).await.unwrap();
+        manager = manager.delete_file_by_path(file_path).unwrap();
         
         // Should now contain deletes
         assert!(manager.contains_deletes());
         assert!(manager.delete_paths.contains(file_path));
     }
 
-    #[tokio::test]
-    async fn test_delete_file() {
+    #[test]
+    fn test_delete_file() {
         let (mut manager, _temp_dir) = setup_test_manager();
         
         // Create test file
@@ -735,7 +700,7 @@ mod tests {
         assert!(!manager.contains_deletes());
         
         // Add file to delete
-        manager.delete_file(test_file).await.unwrap();
+        manager.delete_file(test_file).unwrap();
         
         // Should now contain deletes
         assert!(manager.contains_deletes());
@@ -1080,46 +1045,6 @@ mod tests {
         let manifests = vec![manifest];
         let result = manager.validate_required_deletes(&manifests);
         assert!(result.is_ok(), "Validation should pass when no required deletes are specified");
-    }
-
-    #[tokio::test]
-    async fn test_clean_uncommitted_removes_all_entries_when_uncommitted() {
-        let (mut manager, temp_dir) = setup_test_manager();
-        
-        // Create a manifest file for testing clean uncommitted functionality
-        let manifest_path = temp_dir.path().join("uncommitted_manifest.avro");
-        let manifest_path_str = manifest_path.to_str().unwrap();
-        
-        let _manifest_file = ManifestFile {
-            manifest_path: manifest_path_str.to_string(),
-            manifest_length: 1000,
-            partition_spec_id: 0,
-            content: ManifestContentType::Data,
-            sequence_number: 10,
-            min_sequence_number: 1,
-            added_snapshot_id: 12345,
-            added_files_count: Some(2),
-            existing_files_count: Some(0),
-            deleted_files_count: Some(0),
-            added_rows_count: Some(200),
-            existing_rows_count: Some(0),
-            deleted_rows_count: Some(0),
-            partitions: vec![],
-            key_metadata: vec![],
-        };
-        
-        // Test the clean uncommitted method with empty committed set
-        let committed_files = std::collections::HashSet::new();
-        let result = manager.clean_uncommitted(committed_files).await;
-        
-        assert!(result.is_ok(), "clean_uncommitted should succeed");
-        
-        // Test that manager is still functional after clean_uncommitted
-        let test_file = create_test_data_file("/test/file.parquet", 0);
-        manager.delete_files.insert(test_file.file_path.clone(), test_file);
-        
-        // Verify the manager still tracks delete files
-        assert!(manager.contains_deletes());
     }
 
     #[test]

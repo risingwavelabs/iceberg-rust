@@ -17,8 +17,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::ops::RangeFrom;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
     ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
     Operation, Snapshot, SnapshotReference, SnapshotRetention, Struct, StructType, Summary,
-    MAIN_BRANCH,
+    MAIN_BRANCH, UNASSIGNED_SEQUENCE_NUMBER,
 };
 #[allow(unused_imports)]
 use crate::transaction::manifest_filter::ManifestFilterManager;
@@ -89,12 +90,16 @@ pub(crate) struct SnapshotProduceAction<'a> {
 
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
-    // Note: This counter is limited to the range of (0..u64::MAX).
-    manifest_counter: RangeFrom<u64>,
+    // This counter is shared with ManifestWriterContext to avoid naming conflicts.
+    manifest_counter: Arc<AtomicU64>,
 
     new_data_file_sequence_number: Option<i64>,
 
     target_branch: String,
+
+    filter_manager: ManifestFilterManager,
+
+    delete_filter_manager: ManifestFilterManager,
 }
 
 impl<'a> SnapshotProduceAction<'a> {
@@ -105,6 +110,34 @@ impl<'a> SnapshotProduceAction<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
     ) -> Result<Self> {
+        let manifest_counter = Arc::new(AtomicU64::new(0));
+
+        let filter_manager = ManifestFilterManager::new(
+            tx.current_table.file_io().clone(),
+            ManifestWriterContext::new(
+                tx.current_table.metadata().location().to_string(),
+                META_ROOT_PATH.to_string(),
+                commit_uuid,
+                manifest_counter.clone(),
+                tx.current_table.metadata().format_version(),
+                snapshot_id,
+                tx.current_table.file_io().clone(),
+            ),
+        );
+
+        let delete_filter_manager = ManifestFilterManager::new(
+            tx.current_table.file_io().clone(),
+            ManifestWriterContext::new(
+                tx.current_table.metadata().location().to_string(),
+                META_ROOT_PATH.to_string(),
+                commit_uuid,
+                manifest_counter.clone(),
+                tx.current_table.metadata().format_version(),
+                snapshot_id,
+                tx.current_table.file_io().clone(),
+            ),
+        );
+
         Ok(Self {
             tx,
             snapshot_id,
@@ -116,10 +149,12 @@ impl<'a> SnapshotProduceAction<'a> {
             removed_delete_files: vec![],
             removed_data_file_paths: HashSet::new(),
             removed_delete_file_paths: HashSet::new(),
-            manifest_counter: (0..),
+            manifest_counter,
             key_metadata,
             new_data_file_sequence_number: None,
             target_branch: MAIN_BRANCH.to_string(),
+            filter_manager,
+            delete_filter_manager,
         })
     }
 
@@ -197,11 +232,13 @@ impl<'a> SnapshotProduceAction<'a> {
             if data_file.content_type() == DataContentType::Data {
                 self.removed_data_file_paths
                     .insert(data_file.file_path.clone());
-                self.removed_data_files.push(data_file);
+                self.removed_data_files.push(data_file.clone());
+                self.filter_manager.delete_file(data_file)?;
             } else {
                 self.removed_delete_file_paths
                     .insert(data_file.file_path.clone());
-                self.removed_delete_files.push(data_file);
+                self.removed_delete_files.push(data_file.clone());
+                self.delete_filter_manager.delete_file(data_file)?;
             }
         }
         Ok(self)
@@ -216,7 +253,7 @@ impl<'a> SnapshotProduceAction<'a> {
             self.tx.current_table.metadata().location(),
             META_ROOT_PATH,
             self.commit_uuid,
-            self.manifest_counter.next().unwrap(),
+            self.manifest_counter.fetch_add(1, Ordering::SeqCst),
             DataFileFormat::Avro,
         );
 
@@ -370,32 +407,6 @@ impl<'a> SnapshotProduceAction<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
-        let filter_manager = ManifestFilterManager::new(
-            self.tx.current_table.file_io().clone(),
-            ManifestWriterContext::new(
-                self.tx.current_table.metadata().location().to_string(),
-                META_ROOT_PATH.to_string(),
-                self.commit_uuid,
-                self.tx.current_table.metadata().format_version(),
-                self.snapshot_id,
-                self.tx.current_table.file_io().clone(),
-            ),
-        );
-
-        self.manifest_file_with_filter(
-            snapshot_produce_operation,
-            manifest_process,
-            Some(filter_manager),
-        )
-        .await
-    }
-
-    async fn manifest_file_with_filter<OP: SnapshotProduceOperation, MP: ManifestProcess>(
-        &mut self,
-        snapshot_produce_operation: &OP,
-        manifest_process: &MP,
-        mut filter_manager: Option<ManifestFilterManager>,
-    ) -> Result<Vec<ManifestFile>> {
         let mut manifest_files = vec![];
         let data_files = std::mem::take(&mut self.added_data_files);
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
@@ -421,19 +432,78 @@ impl<'a> SnapshotProduceAction<'a> {
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
-        // Apply filter if provided
-        let filtered_existing_manifests = if let Some(ref mut filter) = filter_manager {
-            filter
-                .filter_manifests(
-                    self.tx.current_table.metadata().current_schema(),
-                    existing_manifests,
-                )
-                .await?
+        let branch_snapshot_ref = self
+            .tx
+            .current_table
+            .metadata()
+            .snapshot_for_ref(&self.target_branch);
+
+        let schema_id = if let Some(branch_snapshot_ref) = branch_snapshot_ref {
+            branch_snapshot_ref
+                .schema_id()
+                .unwrap_or(self.tx.current_table.metadata().current_schema_id())
         } else {
-            existing_manifests
+            self.tx.current_table.metadata().current_schema_id()
         };
 
-        manifest_files.extend(filtered_existing_manifests);
+        let schema = self
+            .tx
+            .current_table
+            .metadata()
+            .schema_by_id(schema_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Invalid schema id for existing manifest filtering",
+                )
+                .with_context("schema id", schema_id.to_string())
+            })?
+            .as_ref()
+            .clone();
+
+        let last_seq = self.tx.current_table.metadata().last_sequence_number();
+
+        // data
+        let existing_data_manifests: Vec<ManifestFile> = existing_manifests
+            .iter()
+            .filter(|m| matches!(m.content, ManifestContentType::Data))
+            .cloned()
+            .collect();
+
+        let filtered_data_manifests = self
+            .filter_manager
+            .filter_manifests(&schema, existing_data_manifests)
+            .await?;
+
+        let min_data_seq = filtered_data_manifests
+            .iter()
+            .map(|m| m.min_sequence_number)
+            .filter(|seq| *seq != UNASSIGNED_SEQUENCE_NUMBER)
+            .reduce(std::cmp::min)
+            .map(|min_seq| std::cmp::min(min_seq, last_seq))
+            .unwrap_or(last_seq);
+
+        manifest_files.extend(filtered_data_manifests);
+
+        self.delete_filter_manager
+            .drop_delete_files_older_than(min_data_seq);
+
+        let existing_delete_manifests: Vec<ManifestFile> = existing_manifests
+            .iter()
+            .filter(|m| matches!(m.content, ManifestContentType::Deletes))
+            .cloned()
+            .collect();
+
+        let filtered_delete_manifests: Vec<ManifestFile> = self
+            .delete_filter_manager
+            .filter_manifests(&schema, existing_delete_manifests)
+            .await?;
+        manifest_files.extend(filtered_delete_manifests);
+
+        manifest_files.retain(|m| {
+            m.has_added_files() || m.has_existing_files() || m.added_snapshot_id == self.snapshot_id
+        });
+
         manifest_process
             .process_manifest(self, manifest_files)
             .await
