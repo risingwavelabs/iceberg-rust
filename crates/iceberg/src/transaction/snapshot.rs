@@ -32,7 +32,7 @@ use crate::spec::{
 };
 #[allow(unused_imports)]
 use crate::transaction::manifest_filter::ManifestFilterManager;
-use crate::transaction::Transaction;
+use crate::transaction::{ManifestWriterContext, Transaction};
 use crate::utils::bin::ListPacker;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
@@ -370,8 +370,24 @@ impl<'a> SnapshotProduceAction<'a> {
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
-        self.manifest_file_with_filter(snapshot_produce_operation, manifest_process, None)
-            .await
+        let filter_manager = ManifestFilterManager::new(
+            self.tx.current_table.file_io().clone(),
+            ManifestWriterContext::new(
+                self.tx.current_table.metadata().location().to_string(),
+                META_ROOT_PATH.to_string(),
+                self.commit_uuid,
+                self.tx.current_table.metadata().format_version(),
+                self.snapshot_id,
+                self.tx.current_table.file_io().clone(),
+            ),
+        );
+
+        self.manifest_file_with_filter(
+            snapshot_produce_operation,
+            manifest_process,
+            Some(filter_manager),
+        )
+        .await
     }
 
     async fn manifest_file_with_filter<OP: SnapshotProduceOperation, MP: ManifestProcess>(

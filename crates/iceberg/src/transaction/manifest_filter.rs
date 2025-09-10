@@ -24,10 +24,81 @@ use std::ops::RangeFrom;
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{
-    DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestStatus, ManifestWriterBuilder, Schema, Struct
+    DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestStatus, ManifestWriter, 
+    ManifestWriterBuilder, PartitionSpec, Schema, Struct
 };
 use crate::transaction::snapshot::new_manifest_path;
 use crate::{Error, ErrorKind};
+
+/// Context for creating manifest writers, similar to SnapshotProduceAction's approach
+pub struct ManifestWriterContext {
+    metadata_location: String,
+    meta_root_path: String,
+    commit_uuid: Uuid,
+    manifest_counter: RangeFrom<u64>,
+    format_version: FormatVersion,
+    snapshot_id: i64,
+    file_io: FileIO,
+}
+
+impl ManifestWriterContext {
+    /// Create a new ManifestWriterContext
+    pub fn new(
+        metadata_location: String,
+        meta_root_path: String,
+        commit_uuid: Uuid,
+        format_version: FormatVersion,
+        snapshot_id: i64,
+        file_io: FileIO,
+    ) -> Self {
+        Self {
+            metadata_location,
+            meta_root_path,
+            commit_uuid,
+            manifest_counter: 0..,
+            format_version,
+            snapshot_id,
+            file_io,
+        }
+    }
+
+    /// Create a new manifest writer, similar to SnapshotProduceAction::new_manifest_writer
+    pub fn new_manifest_writer(
+        &mut self,
+        content_type: ManifestContentType,
+        table_schema: &Schema,
+        partition_spec: &PartitionSpec,
+    ) -> Result<ManifestWriter> {
+        let new_manifest_path = new_manifest_path(
+            &self.metadata_location,
+            &self.meta_root_path,
+            self.commit_uuid,
+            self.manifest_counter.next().unwrap(),
+            crate::spec::DataFileFormat::Avro,
+        );
+        
+        let output = self.file_io.new_output(&new_manifest_path)?;
+        let builder = ManifestWriterBuilder::new(
+            output,
+            Some(self.snapshot_id),
+            Vec::new(), // key_metadata - empty for now
+            table_schema.clone().into(),
+            partition_spec.clone(),
+        );
+
+        let writer = match self.format_version {
+            FormatVersion::V2 => {
+                match content_type {
+                    ManifestContentType::Data => builder.build_v2_data(),
+                    ManifestContentType::Deletes => builder.build_v2_deletes(),
+                }
+            }
+            FormatVersion::V1 => builder.build_v1(),
+        };
+        
+        Ok(writer)
+    }
+}
 
 /// A manager for filtering manifest files and their entries, similar to Java's ManifestFilterManager.
 /// This class is responsible for:
@@ -59,26 +130,12 @@ pub struct ManifestFilterManager {
     filtered_manifest_to_deleted_files: HashMap<String, Vec<String>>, // manifest_path -> deleted_files
 
     file_io: FileIO,
-
-    // for manifest writer
-    metadata_location: String,
-    meta_root_path: String,
-    commit_uuid: Uuid,
-    manifest_counter: RangeFrom<u64>,
-    format_version: FormatVersion,
-    snapshot_id: i64,
+    writer_context: ManifestWriterContext,
 }
 
 impl ManifestFilterManager {
-    /// Create a new ManifestFilterManager
-    pub fn new(
-        file_io: FileIO,
-        metadata_location: String,
-        meta_root_path: String,
-        commit_uuid: Uuid,
-        format_version: FormatVersion,
-        snapshot_id: i64,
-    ) -> Self {
+    /// Create a new ManifestFilterManager with simplified parameters
+    pub fn new(file_io: FileIO, writer_context: ManifestWriterContext) -> Self {
         Self {
             delete_paths: HashSet::new(),
             delete_files: HashMap::new(),
@@ -91,13 +148,28 @@ impl ManifestFilterManager {
             filtered_manifests: HashMap::new(),
             filtered_manifest_to_deleted_files: HashMap::new(),
             file_io,
+            writer_context,
+        }
+    }
+
+    /// Create from SnapshotProduceAction context (convenience method)
+    pub fn from_snapshot_context(
+        file_io: FileIO,
+        metadata_location: String,
+        snapshot_id: i64,
+        commit_uuid: Uuid,
+        format_version: FormatVersion,
+    ) -> Self {
+        let writer_context = ManifestWriterContext::new(
             metadata_location,
-            meta_root_path,
+            "metadata".to_string(), // META_ROOT_PATH equivalent
             commit_uuid,
-            manifest_counter: 0..,
             format_version,
             snapshot_id,
-        }
+            file_io.clone(),
+        );
+        
+        Self::new(file_io, writer_context)
     }
 
     /// Set whether to fail if any delete operation is attempted
@@ -277,39 +349,15 @@ impl ManifestFilterManager {
         let mut deleted_files = HashMap::new();
         // let mut duplicate_delete_count = 0;
         
-        // Create a new output path for the filtered manifest
-        let filtered_manifest_path = new_manifest_path(
-            &self.metadata_location,
-            &self.meta_root_path,
-            self.commit_uuid,
-            self.manifest_counter.next().unwrap(),
-            crate::spec::DataFileFormat::Avro,
-        );
-        let output = self.file_io.new_output(&filtered_manifest_path)?;
-        
-        // Create a minimal partition spec for now. In a real implementation, 
-        // this would come from the table metadata using the partition_spec_id
+        // Create an output path for the filtered manifest using writer context
         let partition_spec = manifest_meta_data.partition_spec.clone();
 
-        // Create the manifest writer
-        let writer_builder = ManifestWriterBuilder::new(
-            output,
-            Some(self.snapshot_id),
-            Vec::new(), // key_metadata - empty for now
-            table_schema.clone().into(), // Convert to Arc<Schema>
-            partition_spec,
-        );
-    
-
-        let mut writer = match self.format_version {
-            FormatVersion::V2 => {
-                match manifest.content {
-                    ManifestContentType::Data => writer_builder.build_v2_data(),
-                    ManifestContentType::Deletes => writer_builder.build_v2_deletes(),
-                }
-            }
-            FormatVersion::V1 => writer_builder.build_v1(),
-        };
+        // Create the manifest writer using the writer context
+        let mut writer = self.writer_context.new_manifest_writer(
+            manifest.content,
+            table_schema,
+            &partition_spec,
+        )?;
         
         // Process each live entry in the manifest (following Java logic)
         for entry in &entries{
@@ -566,14 +614,17 @@ impl Default for ManifestFilterManager {
     fn default() -> Self {
         use crate::io::FileIOBuilder;
         
-        Self::new(
-            FileIOBuilder::new_fs_io().build().unwrap(),
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let writer_context = ManifestWriterContext::new(
             "/tmp/metadata".to_string(),
             "/tmp".to_string(),
             Uuid::new_v4(),
             FormatVersion::V2,
             1,
-        )
+            file_io.clone(),
+        );
+        
+        Self::new(file_io, writer_context)
     }
 }
 
@@ -662,14 +713,16 @@ mod tests {
         let metadata_location = temp_dir.path().join("metadata.json").to_string_lossy().to_string();
         let meta_root_path = temp_dir.path().to_string_lossy().to_string();
         
-        let manager = ManifestFilterManager::new(
-            file_io,
+        let writer_context = ManifestWriterContext::new(
             metadata_location,
             meta_root_path,
             Uuid::new_v4(),
             FormatVersion::V2,
             1,
+            file_io.clone(),
         );
+        
+        let manager = ManifestFilterManager::new(file_io, writer_context);
         
         (manager, temp_dir)
     }
@@ -1381,11 +1434,5 @@ mod tests {
         assert_eq!(deleted_files_manifest2.len(), 1, "Second manifest should track 1 deleted file");
         assert!(deleted_files_manifest1.contains(&delete_file1.file_path));
         assert!(deleted_files_manifest2.contains(&delete_file2.file_path));
-        
-        println!("✅ Successfully tested filter_manifests with entries checking and manifest rewriting!");
-        println!("   - Original manifests: {} and {}", manifest1.manifest_path, manifest2.manifest_path);
-        println!("   - Filtered manifests: {} and {}", filtered_manifests[0].manifest_path, filtered_manifests[1].manifest_path);
-        println!("   - Entries processed and correctly filtered");
-        println!("   - Deletion tracking verified");
     }
 }
