@@ -90,10 +90,11 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
         added_delete_files: Vec<DataFile>,
+        snapshot_id: i64,
     ) -> Self {
         Self {
             table,
-            snapshot_id: Self::generate_unique_snapshot_id(table),
+            snapshot_id,
             commit_uuid,
             key_metadata,
             snapshot_properties,
@@ -159,28 +160,6 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         Ok(())
-    }
-
-    fn generate_unique_snapshot_id(table: &Table) -> i64 {
-        let generate_random_id = || -> i64 {
-            let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
-            let snapshot_id = (lhs ^ rhs) as i64;
-            if snapshot_id < 0 {
-                -snapshot_id
-            } else {
-                snapshot_id
-            }
-        };
-        let mut snapshot_id = generate_random_id();
-
-        while table
-            .metadata()
-            .snapshots()
-            .any(|s| s.snapshot_id() == snapshot_id)
-        {
-            snapshot_id = generate_random_id();
-        }
-        snapshot_id
     }
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
@@ -473,4 +452,26 @@ impl<'a> SnapshotProducer<'a> {
 
         Ok(ActionCommit::new(updates, requirements))
     }
+}
+
+pub fn generate_unique_snapshot_id(table: &Table) -> i64 {
+    let generate_random_id = || -> i64 {
+        let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
+        let snapshot_id = (lhs ^ rhs) as i64;
+        if snapshot_id < 0 {
+            -snapshot_id
+        } else {
+            snapshot_id
+        }
+    };
+    let mut snapshot_id = generate_random_id();
+
+    while table
+        .metadata()
+        .snapshots()
+        .any(|s| s.snapshot_id() == snapshot_id)
+    {
+        snapshot_id = generate_random_id();
+    }
+    snapshot_id
 }
