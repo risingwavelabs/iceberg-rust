@@ -120,6 +120,7 @@ fn set_table_creation(location: impl ToString, name: impl ToString) -> Result<Ta
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_rename_table() -> Result<()> {
     let catalog = get_catalog().await;
     let creation: TableCreation = set_table_creation("s3a://warehouse/hive", "my_table")?;
@@ -140,6 +141,7 @@ async fn test_rename_table() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_table_exists() -> Result<()> {
     let catalog = get_catalog().await;
     let creation = set_table_creation("s3a://warehouse/hive", "my_table")?;
@@ -156,6 +158,7 @@ async fn test_table_exists() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_drop_table() -> Result<()> {
     let catalog = get_catalog().await;
     let creation = set_table_creation("s3a://warehouse/hive", "my_table")?;
@@ -174,6 +177,7 @@ async fn test_drop_table() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_load_table() -> Result<()> {
     let catalog = get_catalog().await;
     let creation = set_table_creation("s3a://warehouse/hive", "my_table")?;
@@ -197,6 +201,7 @@ async fn test_load_table() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_create_table() -> Result<()> {
     let catalog = get_catalog().await;
     let creation = set_table_creation("s3a://warehouse/hive", "my_table")?;
@@ -220,6 +225,7 @@ async fn test_create_table() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_list_tables() -> Result<()> {
     let catalog = get_catalog().await;
     let ns = Namespace::new(NamespaceIdent::new("test_list_tables".into()));
@@ -241,6 +247,7 @@ async fn test_list_tables() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_list_namespace() -> Result<()> {
     let catalog = get_catalog().await;
 
@@ -257,6 +264,7 @@ async fn test_list_namespace() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_create_namespace() -> Result<()> {
     let catalog = get_catalog().await;
 
@@ -287,6 +295,7 @@ async fn test_create_namespace() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_get_default_namespace() -> Result<()> {
     let catalog = get_catalog().await;
 
@@ -314,6 +323,7 @@ async fn test_get_default_namespace() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_namespace_exists() -> Result<()> {
     let catalog = get_catalog().await;
 
@@ -330,6 +340,7 @@ async fn test_namespace_exists() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_update_namespace() -> Result<()> {
     let catalog = get_catalog().await;
 
@@ -350,6 +361,7 @@ async fn test_update_namespace() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "temporarily skipped: HMS unstable"]
 async fn test_drop_namespace() -> Result<()> {
     let catalog = get_catalog().await;
 
