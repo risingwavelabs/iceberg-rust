@@ -72,6 +72,8 @@ mod storage;
 pub use file_io::*;
 pub(crate) mod object_cache;
 
+#[cfg(feature = "storage-azblob")]
+mod storage_azblob;
 #[cfg(feature = "storage-azdls")]
 mod storage_azdls;
 #[cfg(feature = "storage-fs")]
@@ -85,17 +87,14 @@ mod storage_oss;
 #[cfg(feature = "storage-s3")]
 mod storage_s3;
 
+#[cfg(feature = "storage-azblob")]
+pub use storage_azblob::*;
 #[cfg(feature = "storage-azdls")]
 pub use storage_azdls::*;
 #[cfg(feature = "storage-fs")]
 use storage_fs::*;
 #[cfg(feature = "storage-gcs")]
 pub use storage_gcs::*;
-
-#[cfg(feature = "storage-azblob")]
-mod storage_azblob;
-#[cfg(feature = "storage-azblob")]
-pub use storage_azblob::*;
 #[cfg(feature = "storage-memory")]
 use storage_memory::*;
 #[cfg(feature = "storage-oss")]

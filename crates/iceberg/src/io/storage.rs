@@ -24,6 +24,8 @@ use opendal::services::AzblobConfig;
 use opendal::services::AzdlsConfig;
 #[cfg(feature = "storage-gcs")]
 use opendal::services::GcsConfig;
+#[cfg(feature = "storage-oss")]
+use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
 use opendal::{Operator, Scheme};
@@ -48,6 +50,8 @@ pub(crate) enum Storage {
         configured_scheme: String,
         config: Arc<S3Config>,
     },
+    #[cfg(feature = "storage-oss")]
+    Oss { config: Arc<OssConfig> },
     #[cfg(feature = "storage-gcs")]
     Gcs { config: Arc<GcsConfig> },
     #[cfg(feature = "storage-azblob")]
@@ -98,6 +102,10 @@ impl Storage {
                     configured_scheme: scheme,
                 })
             }
+            #[cfg(feature = "storage-oss")]
+            Scheme::Oss => Ok(Self::Oss {
+                config: super::oss_config_parse(props)?.into(),
+            }),
             // Update doc on [`FileIO`] when adding new schemes.
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -161,6 +169,7 @@ impl Storage {
                     ))
                 }
             }
+
             #[cfg(feature = "storage-gcs")]
             Storage::Gcs { config } => {
                 let operator = super::gcs_config_build(config, path)?;
@@ -192,13 +201,30 @@ impl Storage {
                 configured_scheme,
                 config,
             } => super::azdls_create_operator(path, config, configured_scheme),
+
+            #[cfg(feature = "storage-oss")]
+            Storage::Oss { config } => {
+                let op = super::oss_config_build(config, path)?;
+
+                // Check prefix of oss path.
+                let prefix = format!("oss://{}/", op.info().name());
+                if path.starts_with(&prefix) {
+                    Ok((op, &path[prefix.len()..]))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid oss url: {}, should start with {}", path, prefix),
+                    ))
+                }
+            }
+
             #[cfg(all(
                 not(feature = "storage-s3"),
                 not(feature = "storage-fs"),
                 not(feature = "storage-gcs"),
                 not(feature = "storage-azblob"),
                 not(feature = "storage-oss"),
-                // not(feature = "storage-azdls"),
+                not(feature = "storage-azdls"),
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
