@@ -48,6 +48,9 @@ pub(crate) enum Storage {
         /// s3 storage could have `s3://` and `s3a://`.
         /// Storing the scheme string here to return the correct path.
         configured_scheme: String,
+        /// uses the same client for one FileIO Storage.
+        /// TODO: allow users to configure this client.
+        client: reqwest::Client,
         config: Arc<S3Config>,
     },
     #[cfg(feature = "storage-oss")]
@@ -82,6 +85,7 @@ impl Storage {
             #[cfg(feature = "storage-s3")]
             Scheme::S3 => Ok(Self::S3 {
                 configured_scheme: scheme_str,
+                client: reqwest::Client::new(),
                 config: super::s3_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-gcs")]
@@ -151,9 +155,10 @@ impl Storage {
             #[cfg(feature = "storage-s3")]
             Storage::S3 {
                 configured_scheme,
+                client,
                 config,
             } => {
-                let op = super::s3_config_build(config, path)?;
+                let op = super::s3_config_build(client, config, path)?;
                 let op_info = op.info();
 
                 // Check prefix of s3 path.
