@@ -56,8 +56,6 @@ pub(crate) enum Storage {
     Gcs { config: Arc<GcsConfig> },
     #[cfg(feature = "storage-azblob")]
     Azblob { config: Arc<AzblobConfig> },
-    #[cfg(feature = "storage-oss")]
-    Oss { config: Arc<OssConfig> },
     /// Expects paths of the form
     /// `abfs[s]://<filesystem>@<account>.dfs.<endpoint-suffix>/<path>` or
     /// `wasb[s]://<container>@<account>.blob.<endpoint-suffix>/<path>`.
