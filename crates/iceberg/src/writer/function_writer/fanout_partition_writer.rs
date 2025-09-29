@@ -17,8 +17,8 @@
 
 //! This module contains the fanout partition writer.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -26,10 +26,10 @@ use arrow_row::OwnedRow;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use itertools::Itertools;
 
-use crate::arrow::{schema_to_arrow_schema, RecordBatchPartitionSpliter};
+use crate::Result;
+use crate::arrow::{RecordBatchPartitionSpliter, schema_to_arrow_schema};
 use crate::spec::{DataFile, PartitionSpecRef, SchemaRef};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-use crate::Result;
 
 /// The builder for `FanoutPartitionWriter`.
 #[derive(Clone)]
@@ -154,18 +154,18 @@ mod test {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
+    use crate::Result;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         DataFileFormat, Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
         Schema, Struct, Transform, Type, UnboundPartitionField,
     };
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
-    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
     use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
+    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
     use crate::writer::function_writer::fanout_partition_writer::FanoutPartitionWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-    use crate::Result;
 
     #[tokio::test]
     async fn test_fanout_partition_writer() -> Result<()> {

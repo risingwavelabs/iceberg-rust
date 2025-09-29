@@ -204,8 +204,8 @@ pub mod function_writer;
 
 use arrow_array::RecordBatch;
 
-use crate::spec::{DataFile, SchemaRef};
 use crate::Result;
+use crate::spec::{DataFile, SchemaRef};
 
 type DefaultInput = RecordBatch;
 type DefaultOutput = Vec<DataFile>;

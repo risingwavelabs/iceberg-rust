@@ -25,8 +25,9 @@ use itertools::Itertools;
 
 use crate::error::Result;
 use crate::spec::{
-    ancestors_of, SnapshotReference, SnapshotRetention, TableMetadata, MAIN_BRANCH,
-    MAX_REF_AGE_MS_DEFAULT, MAX_SNAPSHOT_AGE_MS_DEFAULT, MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+    MAIN_BRANCH, MAX_REF_AGE_MS_DEFAULT, MAX_SNAPSHOT_AGE_MS_DEFAULT,
+    MIN_SNAPSHOTS_TO_KEEP_DEFAULT, SnapshotReference, SnapshotRetention, TableMetadata,
+    ancestors_of,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -388,7 +389,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::io::FileIOBuilder;
-    use crate::spec::{TableMetadata, MAIN_BRANCH};
+    use crate::spec::{MAIN_BRANCH, TableMetadata};
     use crate::table::Table;
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableIdent, TableRequirement};

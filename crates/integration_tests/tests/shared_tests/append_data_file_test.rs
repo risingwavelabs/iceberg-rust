@@ -23,10 +23,10 @@ use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, TableCreation};
 use iceberg_catalog_rest::RestCatalog;
@@ -131,12 +131,12 @@ async fn test_append_data_file() {
 
     // commit result again
     let tx = Transaction::new(&table);
-    
+
     // Create a new data file for the second commit
     let mut data_file_writer_2 = data_file_writer_builder.clone().build().await.unwrap();
     data_file_writer_2.write(batch.clone()).await.unwrap();
     let data_file_2 = data_file_writer_2.close().await.unwrap();
-    
+
     let append_action = tx.fast_append().add_data_files(data_file_2);
     let tx = append_action.apply(tx).unwrap();
     let table = tx.commit(&rest_catalog).await.unwrap();
