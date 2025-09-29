@@ -81,9 +81,6 @@ pub(crate) struct SnapshotProduceAction<'a> {
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
 
-    removed_data_files: Vec<DataFile>,
-    removed_delete_files: Vec<DataFile>,
-
     // for filtering out files that are removed by action
     pub removed_data_file_paths: HashSet<String>,
     pub removed_delete_file_paths: HashSet<String>,
@@ -97,8 +94,6 @@ pub(crate) struct SnapshotProduceAction<'a> {
 
     target_branch: String,
 
-    filter_manager: ManifestFilterManager,
-
     delete_filter_manager: ManifestFilterManager,
 }
 
@@ -111,19 +106,6 @@ impl<'a> SnapshotProduceAction<'a> {
         snapshot_properties: HashMap<String, String>,
     ) -> Result<Self> {
         let manifest_counter = Arc::new(AtomicU64::new(0));
-
-        let filter_manager = ManifestFilterManager::new(
-            tx.current_table.file_io().clone(),
-            ManifestWriterContext::new(
-                tx.current_table.metadata().location().to_string(),
-                META_ROOT_PATH.to_string(),
-                commit_uuid,
-                manifest_counter.clone(),
-                tx.current_table.metadata().format_version(),
-                snapshot_id,
-                tx.current_table.file_io().clone(),
-            ),
-        );
 
         let delete_filter_manager = ManifestFilterManager::new(
             tx.current_table.file_io().clone(),
@@ -145,15 +127,12 @@ impl<'a> SnapshotProduceAction<'a> {
             snapshot_properties,
             added_data_files: vec![],
             added_delete_files: vec![],
-            removed_data_files: vec![],
-            removed_delete_files: vec![],
             removed_data_file_paths: HashSet::new(),
             removed_delete_file_paths: HashSet::new(),
             manifest_counter,
             key_metadata,
             new_data_file_sequence_number: None,
             target_branch: MAIN_BRANCH.to_string(),
-            filter_manager,
             delete_filter_manager,
         })
     }
@@ -232,12 +211,9 @@ impl<'a> SnapshotProduceAction<'a> {
             if data_file.content_type() == DataContentType::Data {
                 self.removed_data_file_paths
                     .insert(data_file.file_path.clone());
-                self.removed_data_files.push(data_file.clone());
-                self.filter_manager.delete_file(data_file)?;
             } else {
                 self.removed_delete_file_paths
                     .insert(data_file.file_path.clone());
-                self.removed_delete_files.push(data_file.clone());
                 self.delete_filter_manager.delete_file(data_file)?;
             }
         }
@@ -470,12 +446,7 @@ impl<'a> SnapshotProduceAction<'a> {
             .cloned()
             .collect();
 
-        let filtered_data_manifests = self
-            .filter_manager
-            .filter_manifests(&schema, existing_data_manifests)
-            .await?;
-
-        let min_data_seq = filtered_data_manifests
+        let min_data_seq = existing_data_manifests
             .iter()
             .map(|m| m.min_sequence_number)
             .filter(|seq| *seq != UNASSIGNED_SEQUENCE_NUMBER)
@@ -483,7 +454,7 @@ impl<'a> SnapshotProduceAction<'a> {
             .map(|min_seq| std::cmp::min(min_seq, last_seq))
             .unwrap_or(last_seq);
 
-        manifest_files.extend(filtered_data_manifests);
+        manifest_files.extend(existing_data_manifests);
 
         self.delete_filter_manager
             .drop_delete_files_older_than(min_data_seq);

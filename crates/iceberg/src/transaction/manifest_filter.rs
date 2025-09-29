@@ -336,9 +336,9 @@ impl ManifestFilterManager {
                 self.delete_files.contains_key(file.file_path()) ||
                 // For delete manifests, check sequence number for old delete files
                 (is_delete && 
-                 entry.sequence_number().unwrap_or(0) > 0 &&
-                 entry.sequence_number().unwrap_or(0) < self.min_sequence_number);
-            
+                 entry.sequence_number().expect("sequence number missing") > 0 &&
+                 entry.sequence_number().expect("sequence number missing") < self.min_sequence_number);
+
             // TODO: Add expression evaluation logic (evaluator.rowsMightMatch)
             // For now, we'll use a simple approach and assume expression evaluation would return false
             // let rows_might_match = true; // evaluator.rowsMightMatch(file) equivalent
@@ -482,8 +482,8 @@ impl ManifestFilterManager {
                 // For delete manifests, check sequence number for old delete files
                 (is_delete && 
                  entry.status() != ManifestStatus::Deleted && // entry.isLive() in Java
-                 entry.sequence_number().unwrap_or(0) > 0 &&
-                 entry.sequence_number().unwrap_or(0) < self.min_sequence_number);
+                 entry.sequence_number().expect("sequence number missing") > 0 &&
+                 entry.sequence_number().expect("sequence number missing") < self.min_sequence_number);
                 // TODO: Add dangling delete vector check: (is_delete && self.is_dangling_dv(file))
             
             // TODO: Add expression evaluation logic (evaluator.rowsMightMatch)
