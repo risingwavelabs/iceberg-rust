@@ -169,7 +169,7 @@ impl Transaction {
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
     }
-    
+
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
@@ -283,8 +283,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::catalog::MockCatalog;
     use crate::io::FileIOBuilder;

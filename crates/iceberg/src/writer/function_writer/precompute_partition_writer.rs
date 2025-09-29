@@ -17,8 +17,8 @@
 
 //! This module contains the precompute partition writer.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use arrow_array::{RecordBatch, StructArray};
 use arrow_row::{OwnedRow, RowConverter, SortField};
@@ -150,18 +150,18 @@ mod test {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
+    use crate::Result;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         DataFileFormat, Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
         Schema, Struct, Transform, Type, UnboundPartitionField,
     };
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
-    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
     use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
+    use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
     use crate::writer::function_writer::precompute_partition_writer::PrecomputePartitionWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-    use crate::Result;
 
     #[tokio::test]
     async fn test_precompute_partition_writer() -> Result<()> {

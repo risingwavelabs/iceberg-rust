@@ -28,7 +28,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use super::record_batch_projector::RecordBatchProjector;
 use crate::arrow::{arrow_struct_to_literal, type_to_arrow_type};
 use crate::spec::{Literal, PartitionSpecRef, SchemaRef, Struct, StructType, Type};
-use crate::transform::{create_transform_function, BoxedTransformFunction};
+use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::{Error, ErrorKind, Result};
 
 /// A helper function to split the record batch into multiple record batches using computed partition columns.
@@ -468,11 +468,13 @@ mod tests {
             .with_spec_id(1)
             .build()
             .unwrap();
-        assert!(RecordBatchPartitionSpliter::new(
-            &schema_to_arrow_schema(&schema).unwrap(),
-            Arc::new(schema),
-            Arc::new(partition_spec),
+        assert!(
+            RecordBatchPartitionSpliter::new(
+                &schema_to_arrow_schema(&schema).unwrap(),
+                Arc::new(schema),
+                Arc::new(partition_spec),
+            )
+            .is_err()
         )
-        .is_err())
     }
 }
