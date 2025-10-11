@@ -29,6 +29,7 @@ iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true }
+futures = { workspace = true }
 
 [[example]]
 name = "rest-catalog-namespace"
@@ -37,3 +38,13 @@ path = "src/rest_catalog_namespace.rs"
 [[example]]
 name = "rest-catalog-table"
 path = "src/rest_catalog_table.rs"
+
+[[example]]
+name = "oss-backend"
+path = "src/oss_backend.rs"
+required-features = ["storage-oss"]
+
+
+[features]
+default = []
+storage-oss = ["iceberg/storage-oss"]
