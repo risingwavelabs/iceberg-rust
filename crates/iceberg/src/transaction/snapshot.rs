@@ -434,8 +434,9 @@ impl<'a> SnapshotProduceAction<'a> {
             let last_seq = self.tx.current_table.metadata().last_sequence_number();
 
             // Partition manifests by type to avoid cloning
-            let (existing_data_manifests, existing_delete_manifests): (Vec<_>, Vec<_>) = 
-                existing_manifests.into_iter()
+            let (existing_data_manifests, existing_delete_manifests): (Vec<_>, Vec<_>) =
+                existing_manifests
+                    .into_iter()
                     .partition(|m| matches!(m.content, ManifestContentType::Data));
 
             let min_data_seq = existing_data_manifests
@@ -604,11 +605,6 @@ impl<'a> SnapshotProduceAction<'a> {
                 ),
             ));
         }
-    }
-
-    /// Disable delete filter manager for this snapshot
-    pub fn disable_delete_filter_manager(&mut self) {
-        self.delete_filter_manager = None;
     }
 }
 
