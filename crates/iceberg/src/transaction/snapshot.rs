@@ -94,7 +94,7 @@ pub(crate) struct SnapshotProduceAction<'a> {
 
     target_branch: String,
 
-    delete_filter_manager: ManifestFilterManager,
+    delete_filter_manager: Option<ManifestFilterManager>,
 }
 
 impl<'a> SnapshotProduceAction<'a> {
@@ -107,19 +107,8 @@ impl<'a> SnapshotProduceAction<'a> {
     ) -> Result<Self> {
         let manifest_counter = Arc::new(AtomicU64::new(0));
 
-        let delete_filter_manager = ManifestFilterManager::new(
-            tx.current_table.file_io().clone(),
-            ManifestWriterContext::new(
-                tx.current_table.metadata().location().to_string(),
-                META_ROOT_PATH.to_string(),
-                commit_uuid,
-                manifest_counter.clone(),
-                tx.current_table.metadata().format_version(),
-                snapshot_id,
-                tx.current_table.file_io().clone(),
-                key_metadata.clone(),
-            ),
-        );
+        // Default: disable delete filter manager (need to explicitly enable)
+        let delete_filter_manager = None;
 
         Ok(Self {
             tx,
@@ -215,7 +204,10 @@ impl<'a> SnapshotProduceAction<'a> {
             } else {
                 self.removed_delete_file_paths
                     .insert(data_file.file_path.clone());
-                self.delete_filter_manager.delete_file(data_file)?;
+                // Only use delete filter manager if it's enabled (Some)
+                if let Some(ref mut manager) = self.delete_filter_manager {
+                    manager.delete_file(data_file)?;
+                }
             }
         }
         Ok(self)
@@ -409,72 +401,68 @@ impl<'a> SnapshotProduceAction<'a> {
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
-        let branch_snapshot_ref = self
-            .tx
-            .current_table
-            .metadata()
-            .snapshot_for_ref(&self.target_branch);
+        if let Some(delete_filter_manager) = self.delete_filter_manager.as_mut() {
+            let branch_snapshot_ref = self
+                .tx
+                .current_table
+                .metadata()
+                .snapshot_for_ref(&self.target_branch);
 
-        let schema_id = if let Some(branch_snapshot_ref) = branch_snapshot_ref {
-            branch_snapshot_ref
-                .schema_id()
-                .unwrap_or(self.tx.current_table.metadata().current_schema_id())
+            let schema_id = if let Some(branch_snapshot_ref) = branch_snapshot_ref {
+                branch_snapshot_ref
+                    .schema_id()
+                    .unwrap_or(self.tx.current_table.metadata().current_schema_id())
+            } else {
+                self.tx.current_table.metadata().current_schema_id()
+            };
+
+            let schema = self
+                .tx
+                .current_table
+                .metadata()
+                .schema_by_id(schema_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Invalid schema id for existing manifest filtering",
+                    )
+                    .with_context("schema id", schema_id.to_string())
+                })?
+                .as_ref()
+                .clone();
+
+            let last_seq = self.tx.current_table.metadata().last_sequence_number();
+
+            // Partition manifests by type to avoid cloning
+            let (existing_data_manifests, existing_delete_manifests): (Vec<_>, Vec<_>) = 
+                existing_manifests.into_iter()
+                    .partition(|m| matches!(m.content, ManifestContentType::Data));
+
+            let min_data_seq = existing_data_manifests
+                .iter()
+                .map(|m| m.min_sequence_number)
+                .filter(|seq| *seq != UNASSIGNED_SEQUENCE_NUMBER)
+                .reduce(std::cmp::min)
+                .map(|min_seq| std::cmp::min(min_seq, last_seq))
+                .unwrap_or(last_seq);
+
+            manifest_files.extend(existing_data_manifests);
+
+            delete_filter_manager.drop_delete_files_older_than(min_data_seq);
+
+            let filtered_delete_manifests: Vec<ManifestFile> = delete_filter_manager
+                .filter_manifests(&schema, existing_delete_manifests)
+                .await?;
+            manifest_files.extend(filtered_delete_manifests);
+
+            manifest_files.retain(|m| {
+                m.has_added_files()
+                    || m.has_existing_files()
+                    || m.added_snapshot_id == self.snapshot_id
+            });
         } else {
-            self.tx.current_table.metadata().current_schema_id()
-        };
-
-        let schema = self
-            .tx
-            .current_table
-            .metadata()
-            .schema_by_id(schema_id)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Invalid schema id for existing manifest filtering",
-                )
-                .with_context("schema id", schema_id.to_string())
-            })?
-            .as_ref()
-            .clone();
-
-        let last_seq = self.tx.current_table.metadata().last_sequence_number();
-
-        // data
-        let existing_data_manifests: Vec<ManifestFile> = existing_manifests
-            .iter()
-            .filter(|m| matches!(m.content, ManifestContentType::Data))
-            .cloned()
-            .collect();
-
-        let min_data_seq = existing_data_manifests
-            .iter()
-            .map(|m| m.min_sequence_number)
-            .filter(|seq| *seq != UNASSIGNED_SEQUENCE_NUMBER)
-            .reduce(std::cmp::min)
-            .map(|min_seq| std::cmp::min(min_seq, last_seq))
-            .unwrap_or(last_seq);
-
-        manifest_files.extend(existing_data_manifests);
-
-        self.delete_filter_manager
-            .drop_delete_files_older_than(min_data_seq);
-
-        let existing_delete_manifests: Vec<ManifestFile> = existing_manifests
-            .iter()
-            .filter(|m| matches!(m.content, ManifestContentType::Deletes))
-            .cloned()
-            .collect();
-
-        let filtered_delete_manifests: Vec<ManifestFile> = self
-            .delete_filter_manager
-            .filter_manifests(&schema, existing_delete_manifests)
-            .await?;
-        manifest_files.extend(filtered_delete_manifests);
-
-        manifest_files.retain(|m| {
-            m.has_added_files() || m.has_existing_files() || m.added_snapshot_id == self.snapshot_id
-        });
+            manifest_files.extend(existing_manifests);
+        }
 
         manifest_process
             .process_manifest(self, manifest_files)
@@ -597,6 +585,30 @@ impl<'a> SnapshotProduceAction<'a> {
 
     pub fn target_branch(&self) -> &str {
         &self.target_branch
+    }
+
+    /// Enable delete filter manager for this snapshot (lazy initialization)
+    pub fn enable_delete_filter_manager(&mut self) {
+        if self.delete_filter_manager.is_none() {
+            self.delete_filter_manager = Some(ManifestFilterManager::new(
+                self.tx.current_table.file_io().clone(),
+                ManifestWriterContext::new(
+                    self.tx.current_table.metadata().location().to_string(),
+                    META_ROOT_PATH.to_string(),
+                    self.commit_uuid,
+                    self.manifest_counter.clone(),
+                    self.tx.current_table.metadata().format_version(),
+                    self.snapshot_id,
+                    self.tx.current_table.file_io().clone(),
+                    self.key_metadata.clone(),
+                ),
+            ));
+        }
+    }
+
+    /// Disable delete filter manager for this snapshot
+    pub fn disable_delete_filter_manager(&mut self) {
+        self.delete_filter_manager = None;
     }
 }
 
