@@ -305,10 +305,7 @@ impl ManifestFilterManager {
                              && seq_num > 0 
                              && seq_num < self.min_sequence_number));
 
-            // TODO: Add expression evaluation logic (evaluator.rowsMightMatch)
-            // For now, we'll use a simple approach and assume expression evaluation would return false
-            // let rows_might_match = true; // evaluator.rowsMightMatch(file) equivalent
-            
+            // TODO: Add expression evaluation logic     
             if marked_for_delete {
                 // Check if all rows match
                 let all_rows_match = marked_for_delete;
@@ -432,11 +429,8 @@ impl ManifestFilterManager {
                              && seq_num < self.min_sequence_number));
                 // TODO: Add dangling delete vector check: (is_delete && self.is_dangling_dv(file))
             
-            // TODO: Add expression evaluation logic (evaluator.rowsMightMatch)
-            // For now, we'll use a simple approach and assume expression evaluation would return false
-            let rows_might_match = false; // evaluator.rowsMightMatch(file) equivalent
-            
-            if marked_for_delete || rows_might_match {
+            // TODO: Add expression evaluation logic
+            if marked_for_delete {
                 // Check if all rows match
                 let all_rows_match = marked_for_delete; // || evaluator.rowsMustMatch(file) equivalent
                 
