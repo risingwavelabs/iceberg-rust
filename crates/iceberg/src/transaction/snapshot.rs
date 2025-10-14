@@ -117,6 +117,7 @@ impl<'a> SnapshotProduceAction<'a> {
                 tx.current_table.metadata().format_version(),
                 snapshot_id,
                 tx.current_table.file_io().clone(),
+                key_metadata.clone(),
             ),
         );
 
