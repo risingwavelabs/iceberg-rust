@@ -361,7 +361,7 @@ pub struct OutputFile {
     relative_path_pos: usize,
     // Chunk size for write operations to ensure consistent size of multipart chunks
     chunk_size: Option<usize>,
-    // Whether to use append mode for writes (required for some storage backends like ADLS)
+    // Whether to use append mode for writes (required for some storage backends like AZDLS)
     append_file: bool,
 }
 
