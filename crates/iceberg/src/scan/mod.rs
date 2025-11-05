@@ -362,7 +362,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             delete_file_processing_enabled: self.delete_file_processing_enabled,
-            build_delete_file_in_task: self.delete_file_processing_enabled,
+            build_delete_file_in_task: self.build_delete_file_in_task,
         })
     }
 }
@@ -472,7 +472,7 @@ impl TableScan {
 
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         // Process the data file [`ManifestEntry`] stream in parallel
-        let build_delete_file_in_task = self.delete_file_processing_enabled;
+        let build_delete_file_in_task = self.build_delete_file_in_task;
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
