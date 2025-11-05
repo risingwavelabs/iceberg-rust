@@ -113,16 +113,20 @@ impl ManifestFileContext {
 impl ManifestEntryContext {
     /// consume this `ManifestEntryContext`, returning a `FileScanTask`
     /// created from it
-    pub(crate) async fn into_file_scan_task(self,build_delete_file_in_task: bool) -> Result<FileScanTask> {
-        let deletes = if !build_delete_file_in_task && let Some(delete_file_index) = self.delete_file_index  {
-            delete_file_index
-                .get_deletes_for_data_file(
-                    self.manifest_entry.data_file(),
-                    self.manifest_entry.sequence_number(),
-                )
-                .await?
-        } else {
-            vec![]
+    pub(crate) async fn into_file_scan_task(
+        self,
+        build_delete_file_in_task: bool,
+    ) -> Result<FileScanTask> {
+        let deletes = match (self.delete_file_index, build_delete_file_in_task) {
+            (Some(delete_file_index), false) => {
+                delete_file_index
+                    .get_deletes_for_data_file(
+                        self.manifest_entry.data_file(),
+                        self.manifest_entry.sequence_number(),
+                    )
+                    .await?
+            }
+            _ => vec![],
         };
 
         Ok(FileScanTask {

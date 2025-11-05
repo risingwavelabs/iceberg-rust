@@ -19,11 +19,11 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 
-use opendal::Configurator;
 use opendal::services::AzdlsConfig;
+use opendal::Configurator;
 use url::Url;
 
-use crate::{Error, ErrorKind, Result, ensure_data_valid};
+use crate::{ensure_data_valid, Error, ErrorKind, Result};
 
 /// A connection string.
 ///
@@ -341,7 +341,7 @@ mod tests {
 
     use opendal::services::AzdlsConfig;
 
-    use super::{AzureStoragePath, AzureStorageScheme, azdls_create_operator};
+    use super::{azdls_create_operator, AzureStoragePath, AzureStorageScheme};
     use crate::io::azdls_config_parse;
 
     #[test]

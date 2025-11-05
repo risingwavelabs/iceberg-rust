@@ -394,7 +394,7 @@ pub struct TableScan {
 
 impl TableScan {
     /// Returns a stream of [`FileScanTask`]s.
-    pub async fn plan_files(&self) -> Result<(FileScanTaskStream,Option<DeleteFileIndex>)> {
+    pub async fn plan_files(&self) -> Result<(FileScanTaskStream, Option<DeleteFileIndex>)> {
         let concurrency_limit_manifest_files = self.concurrency_limit_manifest_files;
         let concurrency_limit_manifest_entries = self.concurrency_limit_manifest_entries;
 
@@ -442,9 +442,7 @@ impl TableScan {
             }
         });
 
-        let delete_file_index = delete_file_idx_and_tx
-            .as_ref()
-            .map(|(idx, _)| idx.clone());
+        let delete_file_index = delete_file_idx_and_tx.as_ref().map(|(idx, _)| idx.clone());
         if let Some((_, delete_file_tx)) = delete_file_idx_and_tx {
             let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
@@ -482,7 +480,12 @@ impl TableScan {
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
                         spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx, build_delete_file_in_task).await
+                            Self::process_data_manifest_entry(
+                                manifest_entry_context,
+                                tx,
+                                build_delete_file_in_task,
+                            )
+                            .await
                         })
                         .await
                     },
@@ -495,9 +498,9 @@ impl TableScan {
         });
 
         if self.build_delete_file_in_task {
-            Ok((file_scan_task_rx.boxed(),None))
-        }else{
-            Ok((file_scan_task_rx.boxed(),delete_file_index))
+            Ok((file_scan_task_rx.boxed(), None))
+        } else {
+            Ok((file_scan_task_rx.boxed(), delete_file_index))
         }
     }
 
@@ -580,7 +583,9 @@ impl TableScan {
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
         file_scan_task_tx
-            .send(Ok(manifest_entry_context.into_file_scan_task(build_delete_file_in_task).await?))
+            .send(Ok(manifest_entry_context
+                .into_file_scan_task(build_delete_file_in_task)
+                .await?))
             .await?;
 
         Ok(())
@@ -1283,7 +1288,8 @@ pub mod tests {
         let mut tasks = table_scan
             .plan_files()
             .await
-            .unwrap().0
+            .unwrap()
+            .0
             .try_fold(vec![], |mut acc, task| async move {
                 acc.push(task);
                 Ok(acc)
@@ -1347,7 +1353,8 @@ pub mod tests {
         let mut plan_task: Vec<_> = table_scan
             .plan_files()
             .await
-            .unwrap().0
+            .unwrap()
+            .0
             .try_collect()
             .await
             .unwrap();
