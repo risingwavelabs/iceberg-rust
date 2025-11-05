@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use opendal::layers::{RetryLayer, TimeoutLayer};
 #[cfg(feature = "storage-azblob")]
@@ -121,6 +123,7 @@ impl Storage {
     /// # Arguments
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    /// * props: Configuration properties including timeout and retry settings.
     ///
     /// # Returns
     ///
@@ -131,6 +134,7 @@ impl Storage {
     pub(crate) fn create_operator<'a>(
         &self,
         path: &'a impl AsRef<str>,
+        props: &HashMap<String, String>,
     ) -> crate::Result<(Operator, &'a str)> {
         let path = path.as_ref();
         let (operator, relative_path): (Operator, &str) = match self {
@@ -235,9 +239,48 @@ impl Storage {
             )),
         }?;
 
+        // Configure timeout layer
+        let timeout_layer = if let Some(timeout_str) = props.get(super::file_io::IO_TIMEOUT_SECONDS)
+        {
+            if let Ok(timeout_secs) = timeout_str.parse::<u64>() {
+                TimeoutLayer::new().with_io_timeout(Duration::from_secs(timeout_secs))
+            } else {
+                TimeoutLayer::new()
+            }
+        } else {
+            TimeoutLayer::new()
+        };
+
+        // Configure retry layer
+        let mut retry_layer = RetryLayer::new();
+
+        if let Some(max_attempts_str) = props.get(super::file_io::IO_RETRY_MAX_ATTEMPTS) {
+            if let Ok(max_attempts) = max_attempts_str.parse::<usize>() {
+                retry_layer = retry_layer.with_max_times(max_attempts);
+            }
+        }
+
+        if let Some(initial_backoff_str) = props.get(super::file_io::IO_RETRY_INITIAL_BACKOFF_MS) {
+            if let Ok(initial_backoff_ms) = initial_backoff_str.parse::<u64>() {
+                retry_layer = retry_layer.with_min_delay(Duration::from_millis(initial_backoff_ms));
+            }
+        }
+
+        if let Some(max_backoff_str) = props.get(super::file_io::IO_RETRY_MAX_BACKOFF_MS) {
+            if let Ok(max_backoff_ms) = max_backoff_str.parse::<u64>() {
+                retry_layer = retry_layer.with_max_delay(Duration::from_millis(max_backoff_ms));
+            }
+        }
+
+        if let Some(backoff_base_str) = props.get(super::file_io::IO_RETRY_BACKOFF_BASE) {
+            if let Ok(backoff_base) = backoff_base_str.parse::<f32>() {
+                retry_layer = retry_layer.with_factor(backoff_base);
+            }
+        }
+
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
-        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
+        let operator = operator.layer(timeout_layer).layer(retry_layer);
 
         Ok((operator, relative_path))
     }

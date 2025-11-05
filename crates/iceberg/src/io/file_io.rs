@@ -33,6 +33,35 @@ use crate::{Error, ErrorKind, Result};
 /// like Cloudlare R2 requires all chunk sizes to be consistent except for the last.
 pub const IO_CHUNK_SIZE: &str = "io.write.chunk-size";
 
+/// Configuration property for setting the timeout duration for IO operations in seconds.
+///
+/// This timeout applies to individual operations like read, write, delete etc.
+/// If not set, a default timeout will be used.
+pub const IO_TIMEOUT_SECONDS: &str = "io.timeout.seconds";
+
+/// Configuration property for setting the maximum number of retries for IO operations.
+///
+/// This controls how many times an operation will be retried on transient failures.
+/// If not set, a default retry count will be used.
+pub const IO_RETRY_MAX_ATTEMPTS: &str = "io.retry.max-attempts";
+
+/// Configuration property for setting the initial backoff interval for retries in milliseconds.
+///
+/// This is the initial delay before the first retry. The delay typically increases
+/// exponentially for subsequent retries.
+pub const IO_RETRY_INITIAL_BACKOFF_MS: &str = "io.retry.initial-backoff-ms";
+
+/// Configuration property for setting the maximum backoff interval for retries in milliseconds.
+///
+/// This caps the maximum delay between retry attempts.
+pub const IO_RETRY_MAX_BACKOFF_MS: &str = "io.retry.max-backoff-ms";
+
+/// Configuration property for setting the exponential base for retry backoff.
+///
+/// The backoff interval is multiplied by this factor after each retry.
+/// Common values are 1.5 or 2.0.
+pub const IO_RETRY_BACKOFF_BASE: &str = "io.retry.backoff-base";
+
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
 /// # Note
@@ -96,7 +125,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn delete(&self, path: impl AsRef<str>) -> Result<()> {
-        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let (op, relative_path) = self.inner.create_operator(&path, &self.builder.props)?;
         Ok(op.delete(relative_path).await?)
     }
 
@@ -106,7 +135,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn remove_all(&self, path: impl AsRef<str>) -> Result<()> {
-        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let (op, relative_path) = self.inner.create_operator(&path, &self.builder.props)?;
         Ok(op.remove_all(relative_path).await?)
     }
 
@@ -116,7 +145,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn exists(&self, path: impl AsRef<str>) -> Result<bool> {
-        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let (op, relative_path) = self.inner.create_operator(&path, &self.builder.props)?;
         Ok(op.exists(relative_path).await?)
     }
 
@@ -126,7 +155,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_input(&self, path: impl AsRef<str>) -> Result<InputFile> {
-        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let (op, relative_path) = self.inner.create_operator(&path, &self.builder.props)?;
         let path = path.as_ref().to_string();
         let relative_path_pos = path.len() - relative_path.len();
         Ok(InputFile {
@@ -142,16 +171,16 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
-        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let (op, relative_path) = self.inner.create_operator(&path, &self.builder.props)?;
         let path = path.as_ref().to_string();
         let relative_path_pos = path.len() - relative_path.len();
-        
+
         // ADLS requires append mode for writes
         #[cfg(feature = "storage-azdls")]
         let append_file = matches!(self.inner.as_ref(), Storage::Azdls { .. });
         #[cfg(not(feature = "storage-azdls"))]
         let append_file = false;
-        
+
         Ok(OutputFile {
             op,
             path,
@@ -573,5 +602,33 @@ mod tests {
         let path = format!("{}/1.txt", TempDir::new().unwrap().path().to_str().unwrap());
         let output_file = io.new_output(&path).unwrap();
         assert_eq!(Some(32 * 1024 * 1024), output_file.chunk_size);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_and_retry_config() {
+        // Test that timeout and retry configurations can be set
+        let io = FileIOBuilder::new("memory")
+            .with_prop(super::IO_TIMEOUT_SECONDS, "30")
+            .with_prop(super::IO_RETRY_MAX_ATTEMPTS, "5")
+            .with_prop(super::IO_RETRY_INITIAL_BACKOFF_MS, "100")
+            .with_prop(super::IO_RETRY_MAX_BACKOFF_MS, "10000")
+            .with_prop(super::IO_RETRY_BACKOFF_BASE, "2.0")
+            .build()
+            .unwrap();
+
+        // Create a file to verify the operator is configured correctly
+        let path = "memory://test_timeout_retry.txt";
+        let content = "test content";
+        io.new_output(&path)
+            .unwrap()
+            .write(content.into())
+            .await
+            .unwrap();
+
+        // Verify the file was created successfully
+        assert!(io.exists(&path).await.unwrap());
+
+        // Clean up
+        io.delete(&path).await.unwrap();
     }
 }
