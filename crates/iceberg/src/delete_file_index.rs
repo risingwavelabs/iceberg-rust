@@ -37,11 +37,12 @@ pub struct DeleteFileIndex {
 type DeleteFileContextAndTask = (Arc<DeleteFileContext>, Arc<FileScanTask>);
 
 #[derive(Debug)]
-struct PopulatedDeleteFileIndex {
+pub struct PopulatedDeleteFileIndex {
     #[allow(dead_code)]
     global_deletes: Vec<DeleteFileContextAndTask>,
     eq_deletes_by_partition: HashMap<Struct, Vec<DeleteFileContextAndTask>>,
     pos_deletes_by_partition: HashMap<Struct, Vec<DeleteFileContextAndTask>>,
+    deletes: Vec<Arc<FileScanTask>>,
     // TODO: do we need this?
     // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
 
@@ -81,6 +82,17 @@ impl DeleteFileIndex {
         )
     }
 
+    pub async fn get_all(&self) -> Vec<Arc<FileScanTask>> {
+        match self.index.get() {
+            Some(idx) => idx.deletes.clone(),
+            None => {
+                // Wait until the index is populated
+                self.ready_notify.notified().await;
+                self.index.get().unwrap().deletes.clone()
+            }
+        }
+    }
+
     /// Gets all the delete files that apply to the specified data file.
     pub(crate) async fn get_deletes_for_data_file(
         &self,
@@ -115,12 +127,14 @@ impl PopulatedDeleteFileIndex {
         let mut pos_deletes_by_partition = HashMap::default();
 
         let mut global_deletes: Vec<(Arc<DeleteFileContext>, Arc<FileScanTask>)> = vec![];
+        let mut deletes: Vec<Arc<FileScanTask>> = vec![];
 
         files.into_iter().for_each(|ctx| {
             let arc_ctx = Arc::new(ctx);
             let file_scan_task: Arc<FileScanTask> = Arc::new(arc_ctx.as_ref().into());
 
             let partition = arc_ctx.manifest_entry.data_file().partition();
+            deletes.push(file_scan_task.clone());
 
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
             if partition.fields().is_empty() {
@@ -150,6 +164,7 @@ impl PopulatedDeleteFileIndex {
             global_deletes,
             eq_deletes_by_partition,
             pos_deletes_by_partition,
+            deletes,
         }
     }
 
