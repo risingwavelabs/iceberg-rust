@@ -52,6 +52,7 @@
 //! ```
 
 #![deny(missing_docs)]
+#![feature(let_chains)]
 
 #[macro_use]
 extern crate derive_builder;

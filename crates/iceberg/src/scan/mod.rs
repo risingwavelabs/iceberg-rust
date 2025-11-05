@@ -68,6 +68,7 @@ pub struct TableScanBuilder<'a> {
     // is still being worked on but will switch to a default of true
     // once this work is complete
     delete_file_processing_enabled: bool,
+    build_delete_file_in_task: bool,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -89,6 +90,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             delete_file_processing_enabled: false,
+            build_delete_file_in_task: false,
         }
     }
 
@@ -215,6 +217,12 @@ impl<'a> TableScanBuilder<'a> {
         delete_file_processing_enabled: bool,
     ) -> Self {
         self.delete_file_processing_enabled = delete_file_processing_enabled;
+        self
+    }
+
+    /// Determines whether to build delete file information in the FileScanTasks
+    pub fn with_build_delete_file_in_task(mut self, build_in_task: bool) -> Self {
+        self.build_delete_file_in_task = build_in_task;
         self
     }
 
@@ -354,6 +362,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             delete_file_processing_enabled: self.delete_file_processing_enabled,
+            build_delete_file_in_task: self.delete_file_processing_enabled,
         })
     }
 }
@@ -380,11 +389,12 @@ pub struct TableScan {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     delete_file_processing_enabled: bool,
+    build_delete_file_in_task: bool,
 }
 
 impl TableScan {
     /// Returns a stream of [`FileScanTask`]s.
-    pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
+    pub async fn plan_files(&self) -> Result<(FileScanTaskStream,Option<DeleteFileIndex>)> {
         let concurrency_limit_manifest_files = self.concurrency_limit_manifest_files;
         let concurrency_limit_manifest_entries = self.concurrency_limit_manifest_entries;
 
@@ -432,6 +442,9 @@ impl TableScan {
             }
         });
 
+        let delete_file_index = delete_file_idx_and_tx
+            .as_ref()
+            .map(|(idx, _)| idx.clone());
         if let Some((_, delete_file_tx)) = delete_file_idx_and_tx {
             let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
@@ -461,6 +474,7 @@ impl TableScan {
 
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         // Process the data file [`ManifestEntry`] stream in parallel
+        let build_delete_file_in_task = self.delete_file_processing_enabled;
         spawn(async move {
             let result = manifest_entry_data_ctx_rx
                 .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
@@ -468,7 +482,7 @@ impl TableScan {
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
                         spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
+                            Self::process_data_manifest_entry(manifest_entry_context, tx, build_delete_file_in_task).await
                         })
                         .await
                     },
@@ -480,7 +494,11 @@ impl TableScan {
             }
         });
 
-        return Ok(file_scan_task_rx.boxed());
+        if self.build_delete_file_in_task {
+            Ok((file_scan_task_rx.boxed(),None))
+        }else{
+            Ok((file_scan_task_rx.boxed(),delete_file_index))
+        }
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
@@ -496,7 +514,7 @@ impl TableScan {
 
         arrow_reader_builder
             .build()
-            .read(self.plan_files().await?)
+            .read(self.plan_files().await?.0)
             .await
     }
 
@@ -513,6 +531,7 @@ impl TableScan {
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+        build_delete_file_in_task: bool,
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
@@ -561,7 +580,7 @@ impl TableScan {
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
         file_scan_task_tx
-            .send(Ok(manifest_entry_context.into_file_scan_task().await?))
+            .send(Ok(manifest_entry_context.into_file_scan_task(build_delete_file_in_task).await?))
             .await?;
 
         Ok(())
@@ -1264,7 +1283,7 @@ pub mod tests {
         let mut tasks = table_scan
             .plan_files()
             .await
-            .unwrap()
+            .unwrap().0
             .try_fold(vec![], |mut acc, task| async move {
                 acc.push(task);
                 Ok(acc)
@@ -1328,7 +1347,7 @@ pub mod tests {
         let mut plan_task: Vec<_> = table_scan
             .plan_files()
             .await
-            .unwrap()
+            .unwrap().0
             .try_collect()
             .await
             .unwrap();

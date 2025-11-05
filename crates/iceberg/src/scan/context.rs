@@ -113,8 +113,8 @@ impl ManifestFileContext {
 impl ManifestEntryContext {
     /// consume this `ManifestEntryContext`, returning a `FileScanTask`
     /// created from it
-    pub(crate) async fn into_file_scan_task(self) -> Result<FileScanTask> {
-        let deletes = if let Some(delete_file_index) = self.delete_file_index {
+    pub(crate) async fn into_file_scan_task(self,build_delete_file_in_task: bool) -> Result<FileScanTask> {
+        let deletes = if !build_delete_file_in_task && let Some(delete_file_index) = self.delete_file_index  {
             delete_file_index
                 .get_deletes_for_data_file(
                     self.manifest_entry.data_file(),

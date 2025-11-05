@@ -29,7 +29,7 @@ use crate::Result;
 
 /// Index of delete files
 #[derive(Clone, Debug)]
-pub(crate) struct DeleteFileIndex {
+pub struct DeleteFileIndex {
     index: Arc<OnceLock<PopulatedDeleteFileIndex>>,
     ready_notify: Arc<Notify>,
 }
