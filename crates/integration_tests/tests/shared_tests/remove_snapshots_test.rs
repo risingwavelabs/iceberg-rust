@@ -29,6 +29,7 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, TableCreation};
 use iceberg_catalog_rest::RestCatalog;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::file::properties::WriterProperties;
 
 use crate::get_shared_containers;
@@ -74,38 +75,73 @@ async fn test_expire_snapshots_by_count() {
         file_name_generator.clone(),
     );
     let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
+    let mut data_file_writer = data_file_writer_builder.clone().build().await.unwrap();
+    let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
+    let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
+    let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![
+        Arc::new(col1) as ArrayRef,
+        Arc::new(col2) as ArrayRef,
+        Arc::new(col3) as ArrayRef,
+    ])
+    .unwrap();
+    data_file_writer.write(batch.clone()).await.unwrap();
+    let data_file = data_file_writer.close().await.unwrap();
+
+    // check parquet file schema
+    let content = table
+        .file_io()
+        .new_input(data_file[0].file_path())
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let parquet_reader = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+        &content,
+        ArrowReaderOptions::default(),
+    )
+    .unwrap();
+    let field_ids: Vec<i32> = parquet_reader
+        .parquet_schema()
+        .columns()
+        .iter()
+        .map(|col| col.self_type().get_basic_info().id())
+        .collect();
+    assert_eq!(field_ids, vec![1, 2, 3]);
 
     // commit result
     for i in 0..10 {
         // Create a new data file writer for each iteration
         let mut data_file_writer = data_file_writer_builder.clone().build().await.unwrap();
-        
+
         // Create different data for each iteration
         let col1 = StringArray::from(vec![
-            Some(format!("foo_{}", i)), 
-            Some(format!("bar_{}", i)), 
-            None, 
-            Some(format!("baz_{}", i))
+            Some(format!("foo_{}", i)),
+            Some(format!("bar_{}", i)),
+            None,
+            Some(format!("baz_{}", i)),
         ]);
-        let col2 = Int32Array::from(vec![Some(i), Some(i+1), Some(i+2), Some(i+3)]);
-        let col3 = BooleanArray::from(vec![Some(i % 2 == 0), Some(i % 2 == 1), None, Some(i % 3 == 0)]);
+        let col2 = Int32Array::from(vec![Some(i), Some(i + 1), Some(i + 2), Some(i + 3)]);
+        let col3 = BooleanArray::from(vec![
+            Some(i % 2 == 0),
+            Some(i % 2 == 1),
+            None,
+            Some(i % 3 == 0),
+        ]);
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(col1) as ArrayRef,
             Arc::new(col2) as ArrayRef,
             Arc::new(col3) as ArrayRef,
         ])
         .unwrap();
-        
+
         // Write the unique data and get the data file
         data_file_writer.write(batch.clone()).await.unwrap();
         let data_file = data_file_writer.close().await.unwrap();
-        
+
         let tx = Transaction::new(&table);
         let append_action = tx.fast_append();
-        let tx = append_action
-            .add_data_files(data_file)
-            .apply(tx)
-            .unwrap();
+        let tx = append_action.add_data_files(data_file).apply(tx).unwrap();
         table = tx.commit(&rest_catalog).await.unwrap();
     }
 

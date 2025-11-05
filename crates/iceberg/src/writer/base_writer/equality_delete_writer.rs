@@ -182,8 +182,8 @@ mod test {
     use arrow_schema::{DataType, Field, Fields};
     use arrow_select::concat::concat_batches;
     use itertools::Itertools;
-    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -197,9 +197,9 @@ mod test {
     use crate::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
-    use crate::writer::file_writer::ParquetWriterBuilder;
-    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
     use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
+    use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
+    use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
     async fn check_parquet_data_file_with_equality_delete_write(
@@ -296,10 +296,12 @@ mod test {
                 NestedField::required(
                     1,
                     "col1",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::required(5, "sub_col", Type::Primitive(PrimitiveType::Int))
-                            .into(),
-                    ])),
+                    Type::Struct(StructType::new(vec![NestedField::required(
+                        5,
+                        "sub_col",
+                        Type::Primitive(PrimitiveType::Int),
+                    )
+                    .into()])),
                 )
                 .into(),
                 NestedField::required(2, "col2", Type::Primitive(PrimitiveType::String)).into(),
@@ -315,21 +317,17 @@ mod test {
                 NestedField::required(
                     4,
                     "col4",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::required(
-                            7,
-                            "sub_col",
-                            Type::Struct(StructType::new(vec![
-                                NestedField::required(
-                                    8,
-                                    "sub_sub_col",
-                                    Type::Primitive(PrimitiveType::Int),
-                                )
-                                .into(),
-                            ])),
+                    Type::Struct(StructType::new(vec![NestedField::required(
+                        7,
+                        "sub_col",
+                        Type::Struct(StructType::new(vec![NestedField::required(
+                            8,
+                            "sub_sub_col",
+                            Type::Primitive(PrimitiveType::Int),
                         )
-                        .into(),
-                    ])),
+                        .into()])),
+                    )
+                    .into()])),
                 )
                 .into(),
             ])
@@ -441,27 +439,23 @@ mod test {
                     NestedField::required(
                         3,
                         "col3",
-                        Type::Struct(StructType::new(vec![
-                            NestedField::required(
-                                4,
-                                "sub_col",
-                                Type::Primitive(PrimitiveType::Int),
-                            )
-                            .into(),
-                        ])),
+                        Type::Struct(StructType::new(vec![NestedField::required(
+                            4,
+                            "sub_col",
+                            Type::Primitive(PrimitiveType::Int),
+                        )
+                        .into()])),
                     )
                     .into(),
                     NestedField::optional(
                         5,
                         "col4",
-                        Type::Struct(StructType::new(vec![
-                            NestedField::required(
-                                6,
-                                "sub_col2",
-                                Type::Primitive(PrimitiveType::Int),
-                            )
-                            .into(),
-                        ])),
+                        Type::Struct(StructType::new(vec![NestedField::required(
+                            6,
+                            "sub_col2",
+                            Type::Primitive(PrimitiveType::Int),
+                        )
+                        .into()])),
                     )
                     .into(),
                     NestedField::required(
@@ -680,30 +674,28 @@ mod test {
                 NestedField::optional(
                     1,
                     "col1",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::optional(2, "sub_col", Type::Primitive(PrimitiveType::Int))
-                            .into(),
-                    ])),
+                    Type::Struct(StructType::new(vec![NestedField::optional(
+                        2,
+                        "sub_col",
+                        Type::Primitive(PrimitiveType::Int),
+                    )
+                    .into()])),
                 )
                 .into(),
                 NestedField::optional(
                     3,
                     "col2",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::optional(
-                            4,
-                            "sub_struct_col",
-                            Type::Struct(StructType::new(vec![
-                                NestedField::optional(
-                                    5,
-                                    "sub_sub_col",
-                                    Type::Primitive(PrimitiveType::Int),
-                                )
-                                .into(),
-                            ])),
+                    Type::Struct(StructType::new(vec![NestedField::optional(
+                        4,
+                        "sub_struct_col",
+                        Type::Struct(StructType::new(vec![NestedField::optional(
+                            5,
+                            "sub_sub_col",
+                            Type::Primitive(PrimitiveType::Int),
                         )
-                        .into(),
-                    ])),
+                        .into()])),
+                    )
+                    .into()])),
                 )
                 .into(),
             ])
@@ -730,14 +722,11 @@ mod test {
             let inner_col = {
                 let nulls = NullBuffer::from(vec![true, false, true]);
                 Arc::new(StructArray::new(
-                    Fields::from(vec![
-                        Field::new("sub_sub_col", DataType::Int32, true).with_metadata(
-                            HashMap::from([(
-                                PARQUET_FIELD_ID_META_KEY.to_string(),
-                                "5".to_string(),
-                            )]),
-                        ),
-                    ]),
+                    Fields::from(vec![Field::new("sub_sub_col", DataType::Int32, true)
+                        .with_metadata(HashMap::from([(
+                            PARQUET_FIELD_ID_META_KEY.to_string(),
+                            "5".to_string(),
+                        )]))]),
                     vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), None]))],
                     Some(nulls),
                 ))

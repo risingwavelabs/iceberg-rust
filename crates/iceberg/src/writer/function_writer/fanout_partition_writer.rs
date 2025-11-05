@@ -134,6 +134,7 @@ impl<B: IcebergWriterBuilder> IcebergWriter for FanoutPartitionWriter<B> {
             let mut data_files = writer.close().await?;
             for data_file in data_files.iter_mut() {
                 data_file.rewrite_partition(partition_value.clone());
+                data_file.rewrite_partition_id(self.partition_splitter.partition_spec().spec_id());
             }
             result.append(&mut data_files);
         }
