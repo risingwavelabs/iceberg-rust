@@ -89,7 +89,7 @@
 
         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
             <div class="sidebar-scrollbox">
-                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="download.html">Download</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="CONTRIBUTING.html">Contributing</a></li><li class="chapter-item expanded "><a href="release.html">Release</a></li><li class="chapter-item expanded affix "><li class="part-title">Reference</li><li class="chapter-item expanded "><a href="reference/podman.html">Using Podman instead of Docker</a></li><li class="chapter-item expanded "><a href="reference/setup_gpg.html">Setup GPG key</a></li></ol>
+                <ol class="chapter"><li class="chapter-item expanded "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">User Guide</li><li class="chapter-item expanded "><a href="install.html">Install</a></li><li class="chapter-item expanded "><a href="download.html">Download</a></li><li class="chapter-item expanded "><a href="api.html">API</a></li><li class="chapter-item expanded affix "><li class="part-title">Developer Guide</li><li class="chapter-item expanded "><a href="CONTRIBUTING.html">Contributing</a></li><li class="chapter-item expanded "><a href="release.html">Release</a></li><li class="chapter-item expanded affix "><li class="part-title">Reference</li><li class="chapter-item expanded "><a href="reference/podman.html">Using Podman instead of Docker</a></li><li class="chapter-item expanded "><a href="reference/orbstack.html">OrbStack as a docker alternative</a></li><li class="chapter-item expanded "><a href="reference/setup_gpg.html">Setup GPG key</a></li></ol>
             </div>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -196,7 +196,14 @@
   ~ under the License.
 -->
 <h1 id="iceberg-rust"><a class="header" href="#iceberg-rust">Iceberg Rust</a></h1>
-<p>Iceberg Rust is a rust implementation for accessing iceberg tables.</p>
+<p><code>iceberg-rust</code> is a Rust implementation for managing Apache Iceberg tables.</p>
+<h2 id="what-is-apache-iceberg"><a class="header" href="#what-is-apache-iceberg">What is Apache Iceberg?</a></h2>
+<p><a href="https://iceberg.apache.org">Apache Iceberg</a> is a modern, high-performance open table format
+for huge analytic datasets that brings SQL-like tables to processing engines including Spark, Trino, PrestoDB, Flink, Hive and Impala. </p>
+<p>Iceberg provides a metadata layer that sits on top of formats like Parquet 
+and ORC, ensuring data is organized, accessible, and safe to work with at scale. It introduces features long
+expected in databases such as transactional consistency, schema evolution, and time travel into environments 
+where files are stored directly on systems like Amazon S3.</p>
 <div style="break-before: page; page-break-before: always;"></div><!--
   ~ Licensed to the Apache Software Foundation (ASF) under one
   ~ or more contributor license agreements.  See the NOTICE file
@@ -220,8 +227,11 @@
 Cargo 1.75.0 or later is required to build.
 </div>
 <p>Add <code>iceberg</code> and <code>iceberg-catalog-rest</code> into <code>Cargo.toml</code> dependencies:</p>
-<pre><code class="language-toml">iceberg = &quot;0.2.0&quot;
-iceberg-catalog-rest = &quot;0.2.0&quot;
+<pre><code class="language-toml">iceberg = &quot;0.6.0&quot;
+iceberg-catalog-rest = &quot;0.6.0&quot;
+</code></pre>
+<p>using <code>cargo add</code>:</p>
+<pre><code class="language-bash">$ cargo add iceberg iceberg-catalog-rest
 </code></pre>
 <p>iceberg is under active development, you may want to use the git version instead:</p>
 <pre><code class="language-toml">iceberg = { git = &quot;https://github.com/apache/iceberg-rust&quot;, rev = &quot;commit-hash&quot; }
@@ -247,8 +257,8 @@ iceberg-catalog-rest = &quot;0.2.0&quot;
 <h1 id="apache-iceberg-rust-downloads"><a class="header" href="#apache-iceberg-rust-downloads">Apache Iceberg™ Rust Downloads</a></h1>
 <p>The official Apache Iceberg-Rust releases are provided as source artifacts.</p>
 <h2 id="releases"><a class="header" href="#releases">Releases</a></h2>
-<p>The latest source release is <a href="https://www.apache.org/dyn/closer.lua/iceberg/apache-iceberg-rust-0.5.1/apache-iceberg-rust-0.5.1-src.tar.gz?action=download">0.5.1</a> (<a href="https://downloads.apache.org/iceberg/apache-iceberg-rust-0.5.1/apache-iceberg-rust-0.5.1-src.tar.gz.asc">asc</a>,
-<a href="https://downloads.apache.org/iceberg/apache-iceberg-rust-0.5.1/apache-iceberg-rust-0.5.1-src.tar.gz.sha512">sha512</a>).</p>
+<p>The latest source release is <a href="https://www.apache.org/dyn/closer.lua/iceberg/apache-iceberg-rust-0.7.0/apache-iceberg-rust-0.7.0-src.tar.gz">0.7.0</a> (<a href="https://downloads.apache.org/iceberg/apache-iceberg-rust-0.7.0/apache-iceberg-rust-0.7.0-src.tar.gz.asc">asc</a>,
+<a href="https://downloads.apache.org/iceberg/apache-iceberg-rust-0.7.0/apache-iceberg-rust-0.7.0-src.tar.gz.sha512">sha512</a>).</p>
 <p>For older releases, please check the <a href="https://archive.apache.org/dist/iceberg/">archive</a>.</p>
 <h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
 <ul>
@@ -301,8 +311,19 @@ iceberg-catalog-rest = &quot;0.2.0&quot;
 <li>Create and list namespaces.</li>
 <li>Create, load, and drop tables</li>
 </ul>
-<p>Currently only rest catalog has been implemented, and other catalogs are under active development. Here is an 
-example of how to create a <code>RestCatalog</code>:</p>
+<p>There is support for the following catalogs:</p>
+<div class="table-wrapper"><table><thead><tr><th>Catalog</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>Rest</code></td><td>the Iceberg REST catalog</td></tr>
+<tr><td><code>Glue</code></td><td>the AWS Glue Data Catalog</td></tr>
+<tr><td><code>Memory</code></td><td>a memory-based Catalog</td></tr>
+<tr><td><code>HMS</code></td><td>Apache Iceberg HiveMetaStore catalog</td></tr>
+<tr><td><code>S3Tables</code></td><td>AWS S3 Tables</td></tr>
+<tr><td><code>SQL</code></td><td>SQL-based catalog</td></tr>
+</tbody></table>
+</div>
+<p>Not all catalog implementations are complete.</p>
+<h2 id="restcatalog"><a class="header" href="#restcatalog"><code>RestCatalog</code></a></h2>
+<p>Here is an example of how to create a <code>RestCatalog</code>:</p>
 <pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
 </span><span class="boring">// or more contributor license agreements.  See the NOTICE file
 </span><span class="boring">// distributed with this work for additional information
@@ -322,8 +343,8 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">
 </span><span class="boring">use std::collections::HashMap;
 </span><span class="boring">
-</span><span class="boring">use iceberg::{Catalog, NamespaceIdent};
-</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+</span><span class="boring">use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 </span><span class="boring">
 </span><span class="boring">static REST_URI: &amp;str = &quot;http://localhost:8181&quot;;
 </span><span class="boring">
@@ -337,17 +358,17 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">#[tokio::main]
 </span><span class="boring">async fn main() {
 </span>    // Create the REST iceberg catalog.
-    let config = RestCatalogConfig::builder()
-        .uri(REST_URI.to_string())
-        .build();
-    let catalog = RestCatalog::new(config);
+    let catalog = RestCatalogBuilder::default()
+        .load(
+            &quot;rest&quot;,
+            HashMap::from([(REST_CATALOG_PROP_URI.to_string(), REST_URI.to_string())]),
+        )
+        .await
+        .unwrap();
 <span class="boring">
 </span><span class="boring">    // List all namespaces already in the catalog.
 </span><span class="boring">    let existing_namespaces = catalog.list_namespaces(None).await.unwrap();
-</span><span class="boring">    println!(
-</span><span class="boring">        &quot;Namespaces alreading in the existing catalog: {:?}&quot;,
-</span><span class="boring">        existing_namespaces
-</span><span class="boring">    );
+</span><span class="boring">    println!(&quot;Namespaces alreading in the existing catalog: {existing_namespaces:?}&quot;);
 </span><span class="boring">
 </span><span class="boring">    // Create a new namespace identifier.
 </span><span class="boring">    let namespace_ident =
@@ -367,10 +388,10 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">        )
 </span><span class="boring">        .await
 </span><span class="boring">        .unwrap();
-</span><span class="boring">    println!(&quot;Namespace {:?} created!&quot;, namespace_ident);
+</span><span class="boring">    println!(&quot;Namespace {namespace_ident:?} created!&quot;);
 </span><span class="boring">
 </span><span class="boring">    let loaded_namespace = catalog.get_namespace(&amp;namespace_ident).await.unwrap();
-</span><span class="boring">    println!(&quot;Namespace loaded!\n\nNamespace: {:#?}&quot;, loaded_namespace,);
+</span><span class="boring">    println!(&quot;Namespace loaded!\n\nNamespace: {loaded_namespace:#?}&quot;,);
 </span><span class="boring">}</span></code></pre>
 <p>You can run following code to list all root namespaces:</p>
 <pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
@@ -392,8 +413,8 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">
 </span><span class="boring">use std::collections::HashMap;
 </span><span class="boring">
-</span><span class="boring">use iceberg::{Catalog, NamespaceIdent};
-</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+</span><span class="boring">use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 </span><span class="boring">
 </span><span class="boring">static REST_URI: &amp;str = &quot;http://localhost:8181&quot;;
 </span><span class="boring">
@@ -407,17 +428,17 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">#[tokio::main]
 </span><span class="boring">async fn main() {
 </span><span class="boring">    // Create the REST iceberg catalog.
-</span><span class="boring">    let config = RestCatalogConfig::builder()
-</span><span class="boring">        .uri(REST_URI.to_string())
-</span><span class="boring">        .build();
-</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">    let catalog = RestCatalogBuilder::default()
+</span><span class="boring">        .load(
+</span><span class="boring">            &quot;rest&quot;,
+</span><span class="boring">            HashMap::from([(REST_CATALOG_PROP_URI.to_string(), REST_URI.to_string())]),
+</span><span class="boring">        )
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
 </span><span class="boring">
 </span>    // List all namespaces already in the catalog.
     let existing_namespaces = catalog.list_namespaces(None).await.unwrap();
-    println!(
-        &quot;Namespaces alreading in the existing catalog: {:?}&quot;,
-        existing_namespaces
-    );
+    println!(&quot;Namespaces alreading in the existing catalog: {existing_namespaces:?}&quot;);
 <span class="boring">
 </span><span class="boring">    // Create a new namespace identifier.
 </span><span class="boring">    let namespace_ident =
@@ -437,10 +458,10 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">        )
 </span><span class="boring">        .await
 </span><span class="boring">        .unwrap();
-</span><span class="boring">    println!(&quot;Namespace {:?} created!&quot;, namespace_ident);
+</span><span class="boring">    println!(&quot;Namespace {namespace_ident:?} created!&quot;);
 </span><span class="boring">
 </span><span class="boring">    let loaded_namespace = catalog.get_namespace(&amp;namespace_ident).await.unwrap();
-</span><span class="boring">    println!(&quot;Namespace loaded!\n\nNamespace: {:#?}&quot;, loaded_namespace,);
+</span><span class="boring">    println!(&quot;Namespace loaded!\n\nNamespace: {loaded_namespace:#?}&quot;,);
 </span><span class="boring">}</span></code></pre>
 <p>Then you can run following code to create namespace:</p>
 <pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
@@ -462,8 +483,8 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">
 </span><span class="boring">use std::collections::HashMap;
 </span><span class="boring">
-</span><span class="boring">use iceberg::{Catalog, NamespaceIdent};
-</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+</span><span class="boring">use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 </span><span class="boring">
 </span><span class="boring">static REST_URI: &amp;str = &quot;http://localhost:8181&quot;;
 </span><span class="boring">
@@ -477,17 +498,17 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">#[tokio::main]
 </span><span class="boring">async fn main() {
 </span><span class="boring">    // Create the REST iceberg catalog.
-</span><span class="boring">    let config = RestCatalogConfig::builder()
-</span><span class="boring">        .uri(REST_URI.to_string())
-</span><span class="boring">        .build();
-</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">    let catalog = RestCatalogBuilder::default()
+</span><span class="boring">        .load(
+</span><span class="boring">            &quot;rest&quot;,
+</span><span class="boring">            HashMap::from([(REST_CATALOG_PROP_URI.to_string(), REST_URI.to_string())]),
+</span><span class="boring">        )
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
 </span><span class="boring">
 </span><span class="boring">    // List all namespaces already in the catalog.
 </span><span class="boring">    let existing_namespaces = catalog.list_namespaces(None).await.unwrap();
-</span><span class="boring">    println!(
-</span><span class="boring">        &quot;Namespaces alreading in the existing catalog: {:?}&quot;,
-</span><span class="boring">        existing_namespaces
-</span><span class="boring">    );
+</span><span class="boring">    println!(&quot;Namespaces alreading in the existing catalog: {existing_namespaces:?}&quot;);
 </span><span class="boring">
 </span>    // Create a new namespace identifier.
     let namespace_ident =
@@ -507,10 +528,10 @@ example of how to create a <code>RestCatalog</code>:</p>
         )
         .await
         .unwrap();
-    println!(&quot;Namespace {:?} created!&quot;, namespace_ident);
+    println!(&quot;Namespace {namespace_ident:?} created!&quot;);
 
     let loaded_namespace = catalog.get_namespace(&amp;namespace_ident).await.unwrap();
-    println!(&quot;Namespace loaded!\n\nNamespace: {:#?}&quot;, loaded_namespace,);
+    println!(&quot;Namespace loaded!\n\nNamespace: {loaded_namespace:#?}&quot;,);
 <span class="boring">}</span></code></pre>
 <h1 id="table"><a class="header" href="#table">Table</a></h1>
 <p>After creating <code>Catalog</code>, we can manipulate tables through <code>Catalog</code>.</p>
@@ -535,8 +556,8 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">use std::collections::HashMap;
 </span><span class="boring">
 </span><span class="boring">use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-</span><span class="boring">use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+</span><span class="boring">use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 </span><span class="boring">
 </span><span class="boring">static REST_URI: &amp;str = &quot;http://localhost:8181&quot;;
 </span><span class="boring">static NAMESPACE: &amp;str = &quot;default&quot;;
@@ -552,10 +573,13 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">#[tokio::main]
 </span><span class="boring">async fn main() {
 </span><span class="boring">    // Create the REST iceberg catalog.
-</span><span class="boring">    let config = RestCatalogConfig::builder()
-</span><span class="boring">        .uri(REST_URI.to_string())
-</span><span class="boring">        .build();
-</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">    let catalog = RestCatalogBuilder::default()
+</span><span class="boring">        .load(
+</span><span class="boring">            &quot;rest&quot;,
+</span><span class="boring">            HashMap::from([(REST_CATALOG_PROP_URI.to_string(), REST_URI.to_string())]),
+</span><span class="boring">        )
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
 </span><span class="boring">
 </span>    // Create the table identifier.
     let namespace_ident = NamespaceIdent::from_vec(vec![NAMESPACE.to_string()]).unwrap();
@@ -607,7 +631,7 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">
 </span><span class="boring">    // Load the table back from the catalog. It should be identical to the created table.
 </span><span class="boring">    let loaded_table = catalog.load_table(&amp;table_ident).await.unwrap();
-</span><span class="boring">    println!(&quot;Table {TABLE_NAME} loaded!\n\nTable: {:?}&quot;, loaded_table);
+</span><span class="boring">    println!(&quot;Table {TABLE_NAME} loaded!\n\nTable: {loaded_table:?}&quot;);
 </span><span class="boring">}</span></code></pre>
 <p>Also, you can load a table directly:</p>
 <pre><code class="language-rust no_run noplayground"><span class="boring">// Licensed to the Apache Software Foundation (ASF) under one
@@ -630,8 +654,8 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">use std::collections::HashMap;
 </span><span class="boring">
 </span><span class="boring">use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-</span><span class="boring">use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-</span><span class="boring">use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+</span><span class="boring">use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+</span><span class="boring">use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 </span><span class="boring">
 </span><span class="boring">static REST_URI: &amp;str = &quot;http://localhost:8181&quot;;
 </span><span class="boring">static NAMESPACE: &amp;str = &quot;default&quot;;
@@ -647,10 +671,13 @@ example of how to create a <code>RestCatalog</code>:</p>
 </span><span class="boring">#[tokio::main]
 </span><span class="boring">async fn main() {
 </span><span class="boring">    // Create the REST iceberg catalog.
-</span><span class="boring">    let config = RestCatalogConfig::builder()
-</span><span class="boring">        .uri(REST_URI.to_string())
-</span><span class="boring">        .build();
-</span><span class="boring">    let catalog = RestCatalog::new(config);
+</span><span class="boring">    let catalog = RestCatalogBuilder::default()
+</span><span class="boring">        .load(
+</span><span class="boring">            &quot;rest&quot;,
+</span><span class="boring">            HashMap::from([(REST_CATALOG_PROP_URI.to_string(), REST_URI.to_string())]),
+</span><span class="boring">        )
+</span><span class="boring">        .await
+</span><span class="boring">        .unwrap();
 </span><span class="boring">
 </span><span class="boring">    // Create the table identifier.
 </span><span class="boring">    let namespace_ident = NamespaceIdent::from_vec(vec![NAMESPACE.to_string()]).unwrap();
@@ -702,7 +729,7 @@ example of how to create a <code>RestCatalog</code>:</p>
 
     // Load the table back from the catalog. It should be identical to the created table.
     let loaded_table = catalog.load_table(&amp;table_ident).await.unwrap();
-    println!(&quot;Table {TABLE_NAME} loaded!\n\nTable: {:?}&quot;, loaded_table);
+    println!(&quot;Table {TABLE_NAME} loaded!\n\nTable: {loaded_table:?}&quot;);
 <span class="boring">}</span></code></pre>
 <div style="break-before: page; page-break-before: always;"></div><!--
   ~ Licensed to the Apache Software Foundation (ASF) under one
@@ -771,8 +798,8 @@ cargo 1.69.0 (6e9a83356 2023-04-12)
 </code></pre>
 <h4 id="install-docker-or-podman"><a class="header" href="#install-docker-or-podman">Install Docker or Podman</a></h4>
 <p>Currently, iceberg-rust uses Docker to set up environment for integration tests. Native Docker has some limitations, please check (https://github.com/apache/iceberg-rust/pull/748). Please use Orbstack or Podman.</p>
-<p>For MacOS users, you can install <a href="docs/contributing/orbstack.html">OrbStack as a docker alternative</a>.
-For Podman users, refer to <a href="docs/contributing/podman.html">Using Podman instead of Docker</a></p>
+<p>For MacOS users, you can install <a href="website/src/reference/orbstack.html">OrbStack as a docker alternative</a>.
+For Podman users, refer to <a href="website/src/reference/podman.html">Using Podman instead of Docker</a></p>
 <h2 id="build"><a class="header" href="#build">Build</a></h2>
 <ul>
 <li>To compile the project: <code>make build</code></li>
@@ -820,8 +847,8 @@ dependency versions without always upgrading to the latest.</p>
 <p>Here's an explanation of these terms:</p>
 <ul>
 <li><code>iceberg_version</code>: the version of Iceberg to be released, like <code>0.2.0</code>.</li>
-<li><code>release_version</code>: the version of release candidate, like <code>0.2.0-rc.1</code>.</li>
 <li><code>rc_version</code>: the minor version for voting round, like <code>rc.1</code>.</li>
+<li><code>release_version</code>: the version of release candidate, like <code>0.2.0-rc.1</code>.</li>
 </ul>
 <h2 id="preparation"><a class="header" href="#preparation">Preparation</a></h2>
 <div class="warning">
@@ -882,12 +909,13 @@ Please note that this version is the exact version of the release, not the relea
 </ul>
 <h3 id="generate-dependencies-list"><a class="header" href="#generate-dependencies-list">Generate dependencies list</a></h3>
 <p>Download and setup <code>cargo-deny</code>. You can refer to <a href="https://embarkstudios.github.io/cargo-deny/cli/index.html">cargo-deny</a>.</p>
-<p>Running <code>python3 ./scripts/dependencies.py generate</code> to update the dependencies list of every package.</p>
+<p>Run <code>python3 ./scripts/dependencies.py generate</code> to update the dependencies list of every package.</p>
+<p>Run <code>python3 ./scripts/dependencies.py check</code> to verify the updated dependencies' license.</p>
 <h3 id="push-release-candidate-tag"><a class="header" href="#push-release-candidate-tag">Push release candidate tag</a></h3>
 <p>After bump version PR gets merged, we can create a GitHub release for the release candidate:</p>
 <ul>
-<li>Create a tag at <code>main</code> branch on the <code>Bump Version</code> / <code>Patch up version</code> commit: <code>git tag -s &quot;v0.2.0-rc.1&quot;</code>, please correctly check out the corresponding commit instead of directly tagging on the main branch.</li>
-<li>Push tags to GitHub: <code>git push --tags</code>.</li>
+<li>Create a tag at <code>main</code> branch on the <code>Bump Version</code> / <code>Patch up version</code> commit: <code>git tag -s &quot;v${release_version}&quot;</code>, please correctly check out the corresponding commit instead of directly tagging on the main branch.</li>
+<li>Push tags to GitHub: <code>git push origin &quot;v${release_version}&quot;</code>.</li>
 </ul>
 <h2 id="asf-side"><a class="header" href="#asf-side">ASF Side</a></h2>
 <p>If any step in the ASF Release process fails and requires code changes,
@@ -904,9 +932,9 @@ Our release page will only display ASF releases instead of GitHub Releases.</p>
 <li>Create a new branch named by <code>release-${release_version}</code> from the tag</li>
 <li>Generate the release candidate artifacts under <code>dist</code>, including:
 <ul>
-<li><code>apache-iceberg-rust-${release_version}-src.tar.gz</code></li>
-<li><code>apache-iceberg-rust-${release_version}-src.tar.gz.asc</code></li>
-<li><code>apache-iceberg-rust-${release_version}-src.tar.gz.sha512</code></li>
+<li><code>apache-iceberg-rust-${release_version}.tar.gz</code></li>
+<li><code>apache-iceberg-rust-${release_version}.tar.gz.asc</code></li>
+<li><code>apache-iceberg-rust-${release_version}.tar.gz.sha512</code></li>
 </ul>
 </li>
 <li>Check the header of the source code. This step needs docker to run.</li>
@@ -914,19 +942,18 @@ Our release page will only display ASF releases instead of GitHub Releases.</p>
 </li>
 </ul>
 </li>
-<li>Push the newly created branch to GitHub</li>
 </ul>
 <p>This script will create a new release under <code>dist</code>.</p>
 <p>For example:</p>
 <pre><code class="language-shell">&gt; tree dist
 dist
-├── apache-iceberg-rust-0.2.0-src.tar.gz
-├── apache-iceberg-rust-0.2.0-src.tar.gz.asc
-└── apache-iceberg-rust-0.2.0-src.tar.gz.sha512
+├── apache-iceberg-rust-0.2.0.tar.gz
+├── apache-iceberg-rust-0.2.0.tar.gz.asc
+└── apache-iceberg-rust-0.2.0.tar.gz.sha512
 </code></pre>
 <h3 id="upload-artifacts-to-the-svn-dist-repo"><a class="header" href="#upload-artifacts-to-the-svn-dist-repo">Upload artifacts to the SVN dist repo</a></h3>
 <p>SVN is required for this step.</p>
-<p>The svn repository of the dev branch is: <a href="https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust">https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust</a></p>
+<p>The svn repository of the dev branch is: <a href="https://dist.apache.org/repos/dist/dev/iceberg/">https://dist.apache.org/repos/dist/dev/iceberg/</a></p>
 <p>First, checkout Iceberg to local directory:</p>
 <pre><code class="language-shell"># As this step will copy all the versions, it will take some time. If the network is broken, please use svn cleanup to delete the lock before re-execute it.
 svn co https://dist.apache.org/repos/dist/dev/iceberg/ /tmp/iceberg-dist-dev
@@ -936,21 +963,24 @@ svn co https://dist.apache.org/repos/dist/dev/iceberg/ /tmp/iceberg-dist-dev
 <p>The <code>${release_version}</code> here should be like <code>0.2.0-rc.1</code></p>
 </blockquote>
 <pre><code class="language-shell"># create a directory named by version
-mkdir /tmp/iceberg-dist-dev/${release_version}
+mkdir /tmp/iceberg-dist-dev/apache-iceberg-rust-${release_version}/
+
 # copy source code and signature package to the versioned directory
-cp ${repo_dir}/dist/* /tmp/iceberg-dist-dev/iceberg-rust-${release_version}/
+cp ./dist/* /tmp/iceberg-dist-dev/apache-iceberg-rust-${release_version}/
+
 # change dir to the svn folder
 cd /tmp/iceberg-dist-dev/
+
 # check svn status
 svn status
+
 # add to svn
-svn add ${release_version}
-# check svn status
-svn status
+svn add apache-iceberg-rust-${release_version}
+
 # commit to SVN remote server
-svn commit -m &quot;Prepare for ${release_version}&quot;
+svn commit -m &quot;Prepare for iceberg-rust ${release_version}&quot;
 </code></pre>
-<p>Visit <a href="https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust/">https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust/</a> to make sure the artifacts are uploaded correctly.</p>
+<p>Visit <a href="https://dist.apache.org/repos/dist/dev/iceberg/">https://dist.apache.org/repos/dist/dev/iceberg/</a> to make sure the artifacts are uploaded correctly.</p>
 <h3 id="rescue"><a class="header" href="#rescue">Rescue</a></h3>
 <p>If you accidentally published wrong or unexpected artifacts, like wrong signature files, wrong sha256 files,
 please cancel the release for the current <code>release_version</code>,
@@ -959,18 +989,18 @@ And remember to delete the wrong artifacts from the SVN dist repo.</p>
 <h2 id="voting"><a class="header" href="#voting">Voting</a></h2>
 <p>Iceberg Community Vote should send email to: <a href="mailto:dev@iceberg.apache.org">dev@iceberg.apache.org</a>:</p>
 <p>Title:</p>
-<pre><code>[VOTE] Release Apache Iceberg Rust ${release_version} RC1
+<pre><code>[VOTE] Release Apache Iceberg Rust ${iceberg_version} ${rc_version}
 </code></pre>
 <p>Content:</p>
 <pre><code>Hello, Apache Iceberg Rust Community,
 
 This is a call for a vote to release Apache Iceberg rust version ${iceberg_version}.
 
-The tag to be voted on is ${iceberg_version}.
+The tag to be voted on is v${release_version}.
 
 The release candidate:
 
-https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust-${release_version}/
+https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-rust-${release_version}/
 
 Keys to verify the release candidate:
 
@@ -978,7 +1008,7 @@ https://downloads.apache.org/iceberg/KEYS
 
 Git tag for the release:
 
-https://github.com/apache/iceberg-rust/releases/tag/v${iceberg_version}
+https://github.com/apache/iceberg-rust/releases/tag/v${release_version}
 
 Please download, verify, and test.
 
@@ -1009,7 +1039,7 @@ ${name}
 <p>Example: <a href="https://lists.apache.org/thread/c211gqq2yl15jbxqk4rcnq1bdqltjm5l">https://lists.apache.org/thread/c211gqq2yl15jbxqk4rcnq1bdqltjm5l</a></p>
 <p>After at least 3 <code>+1</code> binding vote (from Iceberg PMC member), claim the vote result:</p>
 <p>Title:</p>
-<pre><code>[RESULT][VOTE] Release Apache Iceberg Rust ${release_version} RC1
+<pre><code>[RESULT][VOTE] Release Apache Iceberg Rust ${iceberg_version} ${rc_version}
 </code></pre>
 <p>Content:</p>
 <pre><code>Hello, Apache Iceberg Rust Community,
@@ -1045,31 +1075,49 @@ ${name}
 </ul>
 <p>After downloading them, here are the instructions on how to verify them.</p>
 <ul>
-<li>Import keys:</li>
-</ul>
+<li>
+<p>Import keys:</p>
 <pre><code class="language-bash">curl https://downloads.apache.org/iceberg/KEYS -o KEYS
 gpg --import KEYS
 </code></pre>
-<ul>
-<li>Verify the <code>.asc</code> file: <code>gpg --verify apache-iceberg-rust-${iceberg_version}.tar.gz.asc</code></li>
-<li>Verify the checksums: <code>shasum -a 512 -c apache-iceberg-rust-${iceberg_version}.tar.gz.sha512</code></li>
-<li>Verify build and test:</li>
-</ul>
-<pre><code class="language-bash">tar -xzf apache-iceberg-rust-${iceberg_version}.tar.gz
-cd apache-iceberg-rust-${iceberg_version}
+</li>
+<li>
+<p>Verify the <code>.asc</code> file:</p>
+<pre><code class="language-bash">gpg --verify apache-iceberg-rust-*.tar.gz.asc
+</code></pre>
+<p>Expects: <code>&quot;apache-iceberg-rust-0.7.0.tar.gz: OK&quot;</code></p>
+</li>
+<li>
+<p>Verify the checksums: </p>
+<pre><code class="language-bash">shasum -a 512 -c apache-iceberg-rust-*.tar.gz.sha512
+</code></pre>
+<p>Expects: <code>gpg: Good signature from ...</code></p>
+</li>
+<li>
+<p>Verify build and test:</p>
+<pre><code class="language-bash">tar -xzf apache-iceberg-rust-*.tar.gz
+cd apache-iceberg-rust-*/
 make build &amp;&amp; make test
 </code></pre>
+</li>
+<li>
+<p>Verify license headers: </p>
+<pre><code class="language-bash">docker run -it --rm -v $(pwd):/github/workspace apache/skywalking-eyes header check
+</code></pre>
+<p>Expects: <code>INFO Totally checked _ files, valid: _, invalid: 0, ignored: _, fixed: 0 </code></p>
+</li>
+</ul>
 <h2 id="official-release"><a class="header" href="#official-release">Official Release</a></h2>
 <h3 id="push-the-release-git-tag"><a class="header" href="#push-the-release-git-tag">Push the release git tag</a></h3>
 <pre><code class="language-shell"># Checkout the tags that passed VOTE
-git checkout ${release_version}
+git checkout &quot;v${release_version}&quot;
 # Tag with the iceberg version
-git tag -s ${iceberg_version}
+git tag -s &quot;v${iceberg_version}&quot;
 # Push tags to github to trigger releases
-git push origin ${iceberg_version}
+git push origin &quot;v${iceberg_version}&quot;
 </code></pre>
 <h3 id="publish-artifacts-to-svn-release-branch"><a class="header" href="#publish-artifacts-to-svn-release-branch">Publish artifacts to SVN RELEASE branch</a></h3>
-<pre><code class="language-shell">svn mv https://dist.apache.org/repos/dist/dev/iceberg/iceberg-rust-${release_version} https://dist.apache.org/repos/dist/release/iceberg/iceberg-rust-${iceberg_version} -m &quot;Release Apache Iceberg Rust ${iceberg_version}&quot;
+<pre><code class="language-shell">svn mv https://dist.apache.org/repos/dist/dev/iceberg/apache-iceberg-rust-${release_version} https://dist.apache.org/repos/dist/release/iceberg/apache-iceberg-rust-${iceberg_version} -m &quot;Release Apache Iceberg Rust ${iceberg_version}&quot;
 </code></pre>
 <h3 id="change-iceberg-rust-website-download-link"><a class="header" href="#change-iceberg-rust-website-download-link">Change Iceberg Rust Website download link</a></h3>
 <p>Update the download link in <code>website/src/download.md</code> to the new release version.</p>
@@ -1109,6 +1157,8 @@ Apache Iceberg Rust website: https://rust.iceberg.apache.org/
 
 Download Links: https://rust.iceberg.apache.org/download
 
+From official ASF distribution: https://dist.apache.org/repos/dist/release/iceberg/apache-iceberg-rust-${release_version}/
+
 Iceberg Resources:
 - Issue: https://github.com/apache/iceberg-rust/issues
 - Mailing list: dev@iceberg.apache.org
@@ -1117,7 +1167,149 @@ Thanks
 On behalf of Apache Iceberg Community
 </code></pre>
 <p>Example: <a href="https://lists.apache.org/thread/oy77n55brvk72tnlb2bjzfs9nz3cfd0s">https://lists.apache.org/thread/oy77n55brvk72tnlb2bjzfs9nz3cfd0s</a></p>
-<div style="break-before: page; page-break-before: always;"></div><h1 id="using-podman-instead-of-docker"><a class="header" href="#using-podman-instead-of-docker">Using Podman instead of Docker</a></h1>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="using-podman-instead-of-docker"><a class="header" href="#using-podman-instead-of-docker">Using Podman instead of Docker</a></h1>
+<p>Iceberg-rust does not require containerization, except for integration tests, where &quot;docker&quot; and &quot;docker-compose&quot; are used to start containers for minio and various catalogs. Below instructions setup &quot;rootful podman&quot; and docker's official docker-compose plugin to run integration tests as an alternative to docker or Orbstack.</p>
+<ol>
+<li>Have podman v4 or newer.
+<pre><code class="language-shell">$ podman --version
+podman version 4.9.4-rhel
+</code></pre>
+</li>
+<li>Create a docker wrapper script:</li>
+</ol>
+<ul>
+<li>
+<p>Create a fresh <code>/usr/bin/docker</code> file and add the below contents:</p>
+<pre><code class="language-bash">#!/bin/sh
+[ -e /etc/containers/nodocker ] || \
+echo &quot;Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.&quot; &gt;&amp;2
+exec sudo /usr/bin/podman &quot;$@&quot;
+</code></pre>
+</li>
+<li>
+<p>Set new <code>/usr/bin/docker</code> file to executable.</p>
+<pre><code class="language-shell">sudo chmod +x /usr/bin/docker
+</code></pre>
+</li>
+</ul>
+<ol start="3">
+<li>
+<p>Install the <a href="https://docs.docker.com/compose/install/linux">docker compose plugin</a>. Check for successful installation.</p>
+<pre><code class="language-shell">$ docker compose version
+Docker Compose version v2.28.1
+</code></pre>
+</li>
+<li>
+<p>Append the below to <code>~/.bashrc</code> or equivalent shell config:</p>
+<pre><code class="language-bash">export DOCKER_HOST=unix:///run/podman/podman.sock
+</code></pre>
+</li>
+<li>
+<p>Start the &quot;rootful&quot; podman socket.</p>
+<pre><code class="language-shell">sudo systemctl start podman.socket
+sudo systemctl status podman.socket
+</code></pre>
+</li>
+<li>
+<p>Check that the following symlink exists.</p>
+<pre><code class="language-shell">$ ls -al /var/run/docker.sock
+lrwxrwxrwx 1 root root 27 Jul 24 12:18 /var/run/docker.sock -&gt; /var/run/podman/podman.sock
+</code></pre>
+<p>If the symlink does not exist, create it.</p>
+<pre><code class="language-shell">sudo ln -s /var/run/podman/podman.sock /var/run/docker.sock
+</code></pre>
+</li>
+<li>
+<p>Check that the docker socket is working.</p>
+<pre><code class="language-shell">sudo curl -H &quot;Content-Type: application/json&quot; --unix-socket /var/run/docker.sock http://localhost/_ping
+</code></pre>
+</li>
+<li>
+<p>Try some integration tests!</p>
+<pre><code class="language-shell">cargo test -p iceberg --test file_io_s3_test
+</code></pre>
+</li>
+</ol>
+<h1 id="references"><a class="header" href="#references">References</a></h1>
+<ul>
+<li><a href="https://docs.docker.com/compose/install/linux">https://docs.docker.com/compose/install/linux</a></li>
+<li><a href="https://www.redhat.com/sysadmin/podman-docker-compose">https://www.redhat.com/sysadmin/podman-docker-compose</a></li>
+</ul>
+<h1 id="note-on-rootless-containers"><a class="header" href="#note-on-rootless-containers">Note on rootless containers</a></h1>
+<p>As of podman v4, <a href="https://www.redhat.com/sysadmin/container-ip-address-podman">&quot;To be succinct and simple, when running rootless containers, the container itself does not have an IP address&quot;</a> This causes issues with iceberg-rust's integration tests, which rely upon ip-addressable containers via docker-compose. As a result, podman &quot;rootful&quot; containers are required throughout to ensure containers have IP addresses. Perhaps as a future work or with updates to default podman networking, the need for &quot;rootful&quot; podman containers can be eliminated.</p>
+<ul>
+<li><a href="https://www.redhat.com/sysadmin/container-ip-address-podman">https://www.redhat.com/sysadmin/container-ip-address-podman</a></li>
+<li><a href="https://github.com/containers/podman/blob/main/docs/tutorials/basic_networking.md">https://github.com/containers/podman/blob/main/docs/tutorials/basic_networking.md</a></li>
+</ul>
+<h1 id="debugging-note"><a class="header" href="#debugging-note">Debugging Note:</a></h1>
+<ul>
+<li>Fix for error: <code>Error: short-name &quot;apache/iceberg-rest-fixture&quot; did not resolve to an alias and no unqualified-search registries are defined in &quot;/etc/containers/registries.conf&quot;</code>
+<ul>
+<li>Add or modify the <code>/etc/containers/registries.conf</code> file:</li>
+</ul>
+<pre><code class="language-toml">[[registry]]
+prefix = &quot;docker.io&quot;
+location = &quot;docker.io&quot;
+</code></pre>
+</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+<h1 id="orbstack-as-a-docker-alternative-on-macos"><a class="header" href="#orbstack-as-a-docker-alternative-on-macos">OrbStack as a docker alternative on macOS</a></h1>
+<ol>
+<li>
+<p>Install OrbStack by downloading <a href="https://orbstack.dev/download">installer</a> or using Homebrew.</p>
+<pre><code class="language-shell">brew install orbstack
+</code></pre>
+</li>
+<li>
+<p>Migrate Docker data</p>
+<pre><code class="language-shell">orb migrate docker
+</code></pre>
+</li>
+<li>
+<p>(Optional) Add registry mirrors</p>
+<p>You can edit the config directly at <code>~/.orbstack/config/docker.json</code> and restart the engine with <code>orb restart docker</code>.</p>
+<pre><code>{
+    &quot;registry-mirrors&quot;: [&quot;&lt;mirror_addr&gt;&quot;]
+}
+</code></pre>
+</li>
+</ol>
 <div style="break-before: page; page-break-before: always;"></div><!--
   ~ Licensed to the Apache Software Foundation (ASF) under one
   ~ or more contributor license agreements.  See the NOTICE file

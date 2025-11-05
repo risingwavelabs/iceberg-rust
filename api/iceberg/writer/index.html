@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Iceberg writer module."><title>iceberg::writer - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-6c3ea77c.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="iceberg" data-themes="" data-resource-suffix="" data-rustdoc-version="1.87.0-nightly (f280acf4c 2025-02-19)" data-channel="nightly" data-search-js="search-f7327375.js" data-settings-js="settings-6dad6058.js" ><script src="../../static.files/storage-3a5871a4.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-5332ae0c.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-893ab5e7.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../iceberg/index.html">iceberg</a><span class="version">0.6.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module writer</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#simple-example-for-the-data-file-writer-used-parquet-physical-format" title="Simple example for the data file writer used parquet physical format:">Simple example for the data file writer used parquet physical format:</a></li><li><a href="#custom-writer-to-record-latency" title="Custom writer to record latency">Custom writer to record latency</a></li></ul><h3><a href="#modules">Module Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#traits" title="Traits">Traits</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate iceberg</a></h2></div></div></nav><div class="sidebar-resizer"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">iceberg</a></div><h1>Module <span>writer</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/iceberg/writer/mod.rs.html#18-287">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Iceberg writer module.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Iceberg writer module."><title>iceberg::writer - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-916cea96.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="iceberg" data-themes="" data-resource-suffix="" data-rustdoc-version="1.87.0-nightly (3f5502370 2025-03-27)" data-channel="nightly" data-search-js="search-e7298875.js" data-settings-js="settings-d72f25bb.js" ><script src="../../static.files/storage-82c7156e.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fb8c74a8.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-893ab5e7.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../iceberg/index.html">iceberg</a><span class="version">0.7.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module writer</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#simple-example-for-the-data-file-writer-used-parquet-physical-format" title="Simple example for the data file writer used parquet physical format:">Simple example for the data file writer used parquet physical format:</a></li><li><a href="#custom-writer-to-record-latency" title="Custom writer to record latency">Custom writer to record latency</a></li><li><a href="#adding-partitioning-to-data-file-writers" title="Adding Partitioning to Data File Writers">Adding Partitioning to Data File Writers</a><ul><li><a href="#fanoutwriter---for-unsorted-data" title="FanoutWriter - For Unsorted Data">FanoutWriter - For Unsorted Data</a></li><li><a href="#clusteredwriter---for-sorted-data" title="ClusteredWriter - For Sorted Data">ClusteredWriter - For Sorted Data</a></li></ul></li></ul><h3><a href="#modules">Module Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#traits" title="Traits">Traits</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate iceberg</a></h2></div></div></nav><div class="sidebar-resizer"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">iceberg</a></div><h1>Module <span>writer</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/iceberg/writer/mod.rs.html#18-474">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Iceberg writer module.</p>
 <p>This module contains the generic writer trait and specific writer implementation. We categorize the writer into two types:</p>
 <ol>
 <li>FileWriter: writer for physical file format (Such as parquet, orc).</li>
@@ -20,7 +20,8 @@ you can build a writer that automatically partitions the data and writes it in t
 They can also define custom writers by implementing the <code>Writer</code> trait,
 allowing seamless integration with existing writers. (See the example below.)</p>
 <h2 id="simple-example-for-the-data-file-writer-used-parquet-physical-format"><a class="doc-anchor" href="#simple-example-for-the-data-file-writer-used-parquet-physical-format">§</a>Simple example for the data file writer used parquet physical format:</h2>
-<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::sync::Arc;
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::collections::HashMap;
+<span class="kw">use </span>std::sync::Arc;
 
 <span class="kw">use </span>arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
 <span class="kw">use </span>async_trait::async_trait;
@@ -33,14 +34,24 @@ allowing seamless integration with existing writers. (See the example below.)</p
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 <span class="kw">use </span>iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-<span class="kw">use </span>iceberg::{Catalog, MemoryCatalog, <span class="prelude-ty">Result</span>, TableIdent};
+<span class="kw">use </span>iceberg::{Catalog, CatalogBuilder, MemoryCatalog, <span class="prelude-ty">Result</span>, TableIdent};
 <span class="kw">use </span>parquet::file::properties::WriterProperties;
 <span class="attr">#[tokio::main]
 </span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
-    <span class="comment">// Build your file IO.
-    </span><span class="kw">let </span>file_io = FileIOBuilder::new(<span class="string">"memory"</span>).build()<span class="question-mark">?</span>;
     <span class="comment">// Connect to a catalog.
-    </span><span class="kw">let </span>catalog = MemoryCatalog::new(file_io, <span class="prelude-val">None</span>);
+    </span><span class="kw">use </span>iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    <span class="kw">use </span>iceberg::writer::file_writer::rolling_writer::{
+        RollingFileWriter, RollingFileWriterBuilder,
+    };
+    <span class="kw">let </span>catalog = MemoryCatalogBuilder::default()
+        .load(
+            <span class="string">"memory"</span>,
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                <span class="string">"file:///path/to/warehouse"</span>.to_string(),
+            )]),
+        )
+        .<span class="kw">await</span><span class="question-mark">?</span>;
     <span class="comment">// Add customized code to create a table first.
 
     // Load table from catalog.
@@ -58,14 +69,20 @@ allowing seamless integration with existing writers. (See the example below.)</p
     </span><span class="kw">let </span>parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::default(),
         table.metadata().current_schema().clone(),
+    );
+
+    <span class="comment">// Create a rolling file writer using parquet file writer builder.
+    </span><span class="kw">let </span>rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
         table.file_io().clone(),
         location_generator.clone(),
         file_name_generator.clone(),
     );
+
     <span class="comment">// Create a data file writer using parquet file writer builder.
-    </span><span class="kw">let </span>data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, <span class="prelude-val">None</span>, <span class="number">0</span>);
+    </span><span class="kw">let </span>data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
     <span class="comment">// Build the data file writer
-    </span><span class="kw">let </span><span class="kw-2">mut </span>data_file_writer = data_file_writer_builder.build().<span class="kw">await</span>.unwrap();
+    </span><span class="kw">let </span><span class="kw-2">mut </span>data_file_writer = data_file_writer_builder.build(<span class="prelude-val">None</span>).<span class="kw">await</span><span class="question-mark">?</span>;
 
     <span class="comment">// Write the data using data_file_writer...
 
@@ -75,18 +92,20 @@ allowing seamless integration with existing writers. (See the example below.)</p
     <span class="prelude-val">Ok</span>(())
 }</code></pre></div>
 <h2 id="custom-writer-to-record-latency"><a class="doc-anchor" href="#custom-writer-to-record-latency">§</a>Custom writer to record latency</h2>
-<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::time::Instant;
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::collections::HashMap;
+<span class="kw">use </span>std::time::Instant;
 
 <span class="kw">use </span>arrow_array::RecordBatch;
 <span class="kw">use </span>iceberg::io::FileIOBuilder;
-<span class="kw">use </span>iceberg::spec::DataFile;
+<span class="kw">use </span>iceberg::memory::MemoryCatalogBuilder;
+<span class="kw">use </span>iceberg::spec::{DataFile, PartitionKey};
 <span class="kw">use </span>iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 <span class="kw">use </span>iceberg::writer::file_writer::ParquetWriterBuilder;
 <span class="kw">use </span>iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 <span class="kw">use </span>iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-<span class="kw">use </span>iceberg::{Catalog, MemoryCatalog, <span class="prelude-ty">Result</span>, TableIdent};
+<span class="kw">use </span>iceberg::{Catalog, CatalogBuilder, MemoryCatalog, <span class="prelude-ty">Result</span>, TableIdent};
 <span class="kw">use </span>parquet::file::properties::WriterProperties;
 
 <span class="attr">#[derive(Clone)]
@@ -106,9 +125,9 @@ allowing seamless integration with existing writers. (See the example below.)</p
 </span><span class="kw">impl</span>&lt;B: IcebergWriterBuilder&gt; IcebergWriterBuilder <span class="kw">for </span>LatencyRecordWriterBuilder&lt;B&gt; {
     <span class="kw">type </span>R = LatencyRecordWriter&lt;B::R&gt;;
 
-    <span class="kw">async fn </span>build(<span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>::R&gt; {
+    <span class="kw">async fn </span>build(<span class="self">self</span>, partition_key: <span class="prelude-ty">Option</span>&lt;PartitionKey&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>::R&gt; {
         <span class="prelude-val">Ok</span>(LatencyRecordWriter {
-            inner_writer: <span class="self">self</span>.inner_writer_builder.build().<span class="kw">await</span><span class="question-mark">?</span>,
+            inner_writer: <span class="self">self</span>.inner_writer_builder.build(partition_key).<span class="kw">await</span><span class="question-mark">?</span>,
         })
     }
 }
@@ -137,11 +156,22 @@ allowing seamless integration with existing writers. (See the example below.)</p
 
 <span class="attr">#[tokio::main]
 </span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
-    <span class="comment">// Build your file IO.
-    </span><span class="kw">use </span>iceberg::NamespaceIdent;
-    <span class="kw">let </span>file_io = FileIOBuilder::new(<span class="string">"memory"</span>).build()<span class="question-mark">?</span>;
     <span class="comment">// Connect to a catalog.
-    </span><span class="kw">let </span>catalog = MemoryCatalog::new(file_io, <span class="prelude-val">None</span>);
+    </span><span class="kw">use </span>iceberg::memory::MEMORY_CATALOG_WAREHOUSE;
+    <span class="kw">use </span>iceberg::spec::{Literal, PartitionKey, Struct};
+    <span class="kw">use </span>iceberg::writer::file_writer::rolling_writer::{
+        RollingFileWriter, RollingFileWriterBuilder,
+    };
+
+    <span class="kw">let </span>catalog = MemoryCatalogBuilder::default()
+        .load(
+            <span class="string">"memory"</span>,
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                <span class="string">"file:///path/to/warehouse"</span>.to_string(),
+            )]),
+        )
+        .<span class="kw">await</span><span class="question-mark">?</span>;
 
     <span class="comment">// Add customized code to create a table first.
 
@@ -149,6 +179,11 @@ allowing seamless integration with existing writers. (See the example below.)</p
     </span><span class="kw">let </span>table = catalog
         .load_table(<span class="kw-2">&amp;</span>TableIdent::from_strs([<span class="string">"hello"</span>, <span class="string">"world"</span>])<span class="question-mark">?</span>)
         .<span class="kw">await</span><span class="question-mark">?</span>;
+    <span class="kw">let </span>partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        Struct::from_iter(<span class="macro">vec!</span>[<span class="prelude-val">Some</span>(Literal::string(<span class="string">"Seattle"</span>))]),
+    );
     <span class="kw">let </span>location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
     <span class="kw">let </span>file_name_generator = DefaultFileNameGenerator::new(
         <span class="string">"test"</span>.to_string(),
@@ -160,18 +195,111 @@ allowing seamless integration with existing writers. (See the example below.)</p
     </span><span class="kw">let </span>parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::default(),
         table.metadata().current_schema().clone(),
+    );
+
+    <span class="comment">// Create a rolling file writer
+    </span><span class="kw">let </span>rolling_file_writer_builder = RollingFileWriterBuilder::new(
+        parquet_writer_builder,
+        <span class="number">512 </span>* <span class="number">1024 </span>* <span class="number">1024</span>,
         table.file_io().clone(),
         location_generator.clone(),
         file_name_generator.clone(),
     );
-    <span class="comment">// Create a data file writer builder using parquet file writer builder.
-    </span><span class="kw">let </span>data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, <span class="prelude-val">None</span>, <span class="number">0</span>);
+
+    <span class="comment">// Create a data file writer builder using rolling file writer.
+    </span><span class="kw">let </span>data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
     <span class="comment">// Create latency record writer using data file writer builder.
     </span><span class="kw">let </span>latency_record_builder = LatencyRecordWriterBuilder::new(data_file_writer_builder);
     <span class="comment">// Build the final writer
-    </span><span class="kw">let </span><span class="kw-2">mut </span>latency_record_data_file_writer = latency_record_builder.build().<span class="kw">await</span>.unwrap();
+    </span><span class="kw">let </span><span class="kw-2">mut </span>latency_record_data_file_writer = latency_record_builder
+        .build(<span class="prelude-val">Some</span>(partition_key))
+        .<span class="kw">await
+        </span>.unwrap();
 
     <span class="prelude-val">Ok</span>(())
 }</code></pre></div>
-</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="base_writer/index.html" title="mod iceberg::writer::base_writer">base_<wbr>writer</a></dt><dd>Base writer module contains the basic writer provide by iceberg: <code>DataFileWriter</code>, <code>PositionDeleteFileWriter</code>, <code>EqualityDeleteFileWriter</code>.</dd><dt><a class="mod" href="file_writer/index.html" title="mod iceberg::writer::file_writer">file_<wbr>writer</a></dt><dd>This module contains the writer for data file format supported by iceberg: parquet, orc.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.CurrentFileStatus.html" title="trait iceberg::writer::CurrentFileStatus">Current<wbr>File<wbr>Status</a></dt><dd>The current file status of the Iceberg writer.
+<h2 id="adding-partitioning-to-data-file-writers"><a class="doc-anchor" href="#adding-partitioning-to-data-file-writers">§</a>Adding Partitioning to Data File Writers</h2>
+<p>You can wrap a <code>DataFileWriter</code> with partitioning writers to handle partitioned tables.
+Iceberg provides two partitioning strategies:</p>
+<h3 id="fanoutwriter---for-unsorted-data"><a class="doc-anchor" href="#fanoutwriter---for-unsorted-data">§</a>FanoutWriter - For Unsorted Data</h3>
+<p>Wraps the data file writer to handle unsorted data by maintaining multiple active writers.
+Use this when your data is not pre-sorted by partition key. Writes to different partitions
+can happen in any order, even interleaved.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code>
+<span class="comment">// Wrap the data file writer with FanoutWriter for partitioning
+</span><span class="kw">use </span>iceberg::writer::partitioning::fanout_writer::FanoutWriter;
+<span class="kw">use </span>iceberg::writer::partitioning::PartitioningWriter;
+<span class="kw">use </span>iceberg::spec::{Literal, PartitionKey, Struct};
+
+<span class="kw">let </span><span class="kw-2">mut </span>fanout_writer = FanoutWriter::new(data_file_writer_builder);
+
+<span class="comment">// Create partition keys for different regions
+</span><span class="kw">let </span>schema = table.metadata().current_schema().clone();
+<span class="kw">let </span>partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+
+<span class="kw">let </span>partition_key_us = PartitionKey::new(
+    partition_spec.clone(),
+    schema.clone(),
+    Struct::from_iter([<span class="prelude-val">Some</span>(Literal::string(<span class="string">"US"</span>))]),
+);
+
+<span class="kw">let </span>partition_key_eu = PartitionKey::new(
+    partition_spec.clone(),
+    schema.clone(),
+    Struct::from_iter([<span class="prelude-val">Some</span>(Literal::string(<span class="string">"EU"</span>))]),
+);
+
+<span class="comment">// Write to different partitions in any order - can interleave partition writes
+// fanout_writer.write(partition_key_us.clone(), batch_us1).await?;
+// fanout_writer.write(partition_key_eu.clone(), batch_eu1).await?;
+// fanout_writer.write(partition_key_us.clone(), batch_us2).await?; // Back to US - OK!
+// fanout_writer.write(partition_key_eu.clone(), batch_eu2).await?; // Back to EU - OK!
+
+</span><span class="kw">let </span>data_files = fanout_writer.close().<span class="kw">await</span><span class="question-mark">?</span>;</code></pre></div>
+<h3 id="clusteredwriter---for-sorted-data"><a class="doc-anchor" href="#clusteredwriter---for-sorted-data">§</a>ClusteredWriter - For Sorted Data</h3>
+<p>Wraps the data file writer for pre-sorted data. More memory efficient as it maintains
+only one active writer at a time, but requires input sorted by partition key.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code>
+<span class="comment">// Wrap the data file writer with ClusteredWriter for sorted partitioning
+</span><span class="kw">use </span>iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
+<span class="kw">use </span>iceberg::writer::partitioning::PartitioningWriter;
+<span class="kw">use </span>iceberg::spec::{Literal, PartitionKey, Struct};
+
+<span class="kw">let </span><span class="kw-2">mut </span>clustered_writer = ClusteredWriter::new(data_file_writer_builder);
+
+<span class="comment">// Create partition keys (must write in sorted order)
+</span><span class="kw">let </span>schema = table.metadata().current_schema().clone();
+<span class="kw">let </span>partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+
+<span class="kw">let </span>partition_key_asia = PartitionKey::new(
+    partition_spec.clone(),
+    schema.clone(),
+    Struct::from_iter([<span class="prelude-val">Some</span>(Literal::string(<span class="string">"ASIA"</span>))]),
+);
+
+<span class="kw">let </span>partition_key_eu = PartitionKey::new(
+    partition_spec.clone(),
+    schema.clone(),
+    Struct::from_iter([<span class="prelude-val">Some</span>(Literal::string(<span class="string">"EU"</span>))]),
+);
+
+<span class="kw">let </span>partition_key_us = PartitionKey::new(
+    partition_spec.clone(),
+    schema.clone(),
+    Struct::from_iter([<span class="prelude-val">Some</span>(Literal::string(<span class="string">"US"</span>))]),
+);
+
+<span class="comment">// Write to partitions in sorted order (ASIA -&gt; EU -&gt; US)
+// clustered_writer.write(partition_key_asia, batch_asia).await?;
+// clustered_writer.write(partition_key_eu, batch_eu).await?;
+// clustered_writer.write(partition_key_us, batch_us).await?;
+// Writing back to ASIA would fail since data must be sorted!
+
+</span><span class="kw">let </span>data_files = clustered_writer.close().<span class="kw">await</span><span class="question-mark">?</span>;
+
+    <span class="prelude-val">Ok</span>(())
+}</code></pre></div>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="base_writer/index.html" title="mod iceberg::writer::base_writer">base_<wbr>writer</a></dt><dd>Base writer module contains the basic writer provide by iceberg: <code>DataFileWriter</code>, <code>PositionDeleteFileWriter</code>, <code>EqualityDeleteFileWriter</code>.</dd><dt><a class="mod" href="file_writer/index.html" title="mod iceberg::writer::file_writer">file_<wbr>writer</a></dt><dd>This module contains the writer for data file format supported by iceberg: parquet, orc.</dd><dt><a class="mod" href="partitioning/index.html" title="mod iceberg::writer::partitioning">partitioning</a></dt><dd>Partitioning writers for handling partitioned Iceberg tables.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.CurrentFileStatus.html" title="trait iceberg::writer::CurrentFileStatus">Current<wbr>File<wbr>Status</a></dt><dd>The current file status of the Iceberg writer.
 This is implemented for writers that write a single file at a time.</dd><dt><a class="trait" href="trait.IcebergWriter.html" title="trait iceberg::writer::IcebergWriter">Iceberg<wbr>Writer</a></dt><dd>The iceberg writer used to write data to iceberg table.</dd><dt><a class="trait" href="trait.IcebergWriterBuilder.html" title="trait iceberg::writer::IcebergWriterBuilder">Iceberg<wbr>Writer<wbr>Builder</a></dt><dd>The builder for iceberg writer.</dd></dl></section></div></main></body></html>
