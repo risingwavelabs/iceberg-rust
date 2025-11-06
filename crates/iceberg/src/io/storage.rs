@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use opendal::layers::{RetryLayer, TimeoutLayer};
@@ -233,23 +233,22 @@ impl Storage {
             .get("io.retry.factor")
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(2.0);
-        
+
         let mut operator = operator.layer(
             RetryLayer::new()
                 .with_max_times(retry_max_attempts)
                 .with_min_delay(Duration::from_millis(retry_min_delay_ms))
                 .with_max_delay(Duration::from_millis(retry_max_delay_ms))
-                .with_factor(retry_factor)
+                .with_factor(retry_factor),
         );
-        
+
         // Apply timeout layer if configured
         if let Some(timeout_ms) = props
             .get("io.timeout-ms")
-            .and_then(|v| v.parse::<u64>().ok()) {
-            operator = operator.layer(
-                TimeoutLayer::new()
-                    .with_timeout(Duration::from_millis(timeout_ms))
-            );
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            operator =
+                operator.layer(TimeoutLayer::new().with_timeout(Duration::from_millis(timeout_ms)));
         }
 
         Ok((operator, relative_path))
