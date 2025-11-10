@@ -282,25 +282,6 @@ impl Storage {
         Ok((operator, relative_path))
     }
 
-    /// Creates operator from path using default configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
-    ///
-    /// # Returns
-    ///
-    /// The return value consists of two parts:
-    ///
-    /// * An [`opendal::Operator`] instance used to operate on file.
-    /// * Relative path to the root uri of [`opendal::Operator`].
-    pub(crate) fn create_operator<'a>(
-        &self,
-        path: &'a impl AsRef<str>,
-    ) -> crate::Result<(Operator, &'a str)> {
-        self.create_operator_with_config(path, &HashMap::new())
-    }
-
     /// Parse scheme.
     fn parse_scheme(scheme: &str) -> crate::Result<Scheme> {
         match scheme {
