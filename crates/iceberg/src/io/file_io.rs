@@ -120,7 +120,9 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn delete(&self, path: impl AsRef<str>) -> Result<()> {
-        let (op, relative_path) = self.inner.create_operator_with_config(&path, &self.builder.props)?;
+        let (op, relative_path) = self
+            .inner
+            .create_operator_with_config(&path, &self.builder.props)?;
         Ok(op.delete(relative_path).await?)
     }
 
@@ -130,7 +132,9 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn remove_all(&self, path: impl AsRef<str>) -> Result<()> {
-        let (op, relative_path) = self.inner.create_operator_with_config(&path, &self.builder.props)?;
+        let (op, relative_path) = self
+            .inner
+            .create_operator_with_config(&path, &self.builder.props)?;
         Ok(op.remove_all(relative_path).await?)
     }
 
@@ -140,7 +144,9 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn exists(&self, path: impl AsRef<str>) -> Result<bool> {
-        let (op, relative_path) = self.inner.create_operator_with_config(&path, &self.builder.props)?;
+        let (op, relative_path) = self
+            .inner
+            .create_operator_with_config(&path, &self.builder.props)?;
         Ok(op.exists(relative_path).await?)
     }
 
@@ -150,7 +156,9 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_input(&self, path: impl AsRef<str>) -> Result<InputFile> {
-        let (op, relative_path) = self.inner.create_operator_with_config(&path, &self.builder.props)?;
+        let (op, relative_path) = self
+            .inner
+            .create_operator_with_config(&path, &self.builder.props)?;
         let path = path.as_ref().to_string();
         let relative_path_pos = path.len() - relative_path.len();
         Ok(InputFile {
@@ -166,16 +174,18 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
-        let (op, relative_path) = self.inner.create_operator_with_config(&path, &self.builder.props)?;
+        let (op, relative_path) = self
+            .inner
+            .create_operator_with_config(&path, &self.builder.props)?;
         let path = path.as_ref().to_string();
         let relative_path_pos = path.len() - relative_path.len();
-        
+
         // ADLS requires append mode for writes
         #[cfg(feature = "storage-azdls")]
         let append_file = matches!(self.inner.as_ref(), Storage::Azdls { .. });
         #[cfg(not(feature = "storage-azdls"))]
         let append_file = false;
-        
+
         Ok(OutputFile {
             op,
             path,
@@ -609,12 +619,12 @@ mod tests {
             .with_prop(IO_MAX_RETRIES, "5")
             .with_prop(IO_RETRY_MIN_DELAY_MS, "100")
             .with_prop(IO_RETRY_MAX_DELAY_MS, "5000");
-        
+
         assert_eq!(builder.props.get(IO_TIMEOUT_SECONDS).unwrap(), "30");
         assert_eq!(builder.props.get(IO_MAX_RETRIES).unwrap(), "5");
         assert_eq!(builder.props.get(IO_RETRY_MIN_DELAY_MS).unwrap(), "100");
         assert_eq!(builder.props.get(IO_RETRY_MAX_DELAY_MS).unwrap(), "5000");
-        
+
         // Verify that FileIO can be built with these configurations
         let file_io = builder.build();
         assert!(file_io.is_ok());

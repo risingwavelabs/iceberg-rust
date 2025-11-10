@@ -34,7 +34,9 @@ use opendal::{Operator, Scheme};
 
 #[cfg(feature = "storage-azdls")]
 use super::AzureStorageScheme;
-use super::{FileIOBuilder, IO_MAX_RETRIES, IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS, IO_TIMEOUT_SECONDS};
+use super::{
+    FileIOBuilder, IO_MAX_RETRIES, IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS, IO_TIMEOUT_SECONDS,
+};
 use crate::{Error, ErrorKind};
 
 /// The storage carries all supported storage services in iceberg
@@ -241,39 +243,40 @@ impl Storage {
 
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
-        
+
         // Configure timeout layer
         let operator = if let Some(timeout_str) = config.get(IO_TIMEOUT_SECONDS) {
             if let Ok(timeout_secs) = timeout_str.parse::<u64>() {
-                operator.layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(timeout_secs)))
+                operator
+                    .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(timeout_secs)))
             } else {
                 operator.layer(TimeoutLayer::new())
             }
         } else {
             operator.layer(TimeoutLayer::new())
         };
-        
+
         // Configure retry layer
         let mut retry_layer = RetryLayer::new();
-        
+
         if let Some(max_retries_str) = config.get(IO_MAX_RETRIES) {
             if let Ok(max_retries) = max_retries_str.parse::<usize>() {
                 retry_layer = retry_layer.with_max_times(max_retries);
             }
         }
-        
+
         if let Some(min_delay_str) = config.get(IO_RETRY_MIN_DELAY_MS) {
             if let Ok(min_delay_ms) = min_delay_str.parse::<u64>() {
                 retry_layer = retry_layer.with_min_delay(Duration::from_millis(min_delay_ms));
             }
         }
-        
+
         if let Some(max_delay_str) = config.get(IO_RETRY_MAX_DELAY_MS) {
             if let Ok(max_delay_ms) = max_delay_str.parse::<u64>() {
                 retry_layer = retry_layer.with_max_delay(Duration::from_millis(max_delay_ms));
             }
         }
-        
+
         let operator = operator.layer(retry_layer);
 
         Ok((operator, relative_path))
