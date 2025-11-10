@@ -17,8 +17,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use arrow_array::StringArray;
-use futures::TryStreamExt;
 use uuid::Uuid;
 
 use super::{
@@ -122,54 +120,14 @@ impl<'a> FastAppendAction<'a> {
 
     /// Finished building the action and apply it to the transaction.
     pub async fn apply(self) -> Result<Transaction<'a>> {
-        // Checks duplicate files
+        // Checks duplicate files using the unified validation function
         if self.check_duplicate {
-            let new_files: HashSet<&str> = self
-                .snapshot_produce_action
-                .added_data_files
-                .iter()
-                .map(|df| df.file_path.as_str())
-                .collect();
-
-            let mut manifest_stream = self
-                .snapshot_produce_action
-                .tx
-                .current_table
-                .inspect()
-                .manifests()
-                .scan()
+            self.snapshot_produce_action
+                .validate_data_file_changes(
+                    &self.snapshot_produce_action.added_data_files,
+                    &HashSet::new(), // FastAppend doesn't delete files
+                )
                 .await?;
-            let mut referenced_files = Vec::new();
-
-            while let Some(batch) = manifest_stream.try_next().await? {
-                let file_path_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            "Failed to downcast file_path column to StringArray",
-                        )
-                    })?;
-
-                for i in 0..batch.num_rows() {
-                    let file_path = file_path_array.value(i);
-                    if new_files.contains(file_path) {
-                        referenced_files.push(file_path.to_string());
-                    }
-                }
-            }
-
-            if !referenced_files.is_empty() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot add files that are already referenced by table, files: {}",
-                        referenced_files.join(", ")
-                    ),
-                ));
-            }
         }
 
         self.snapshot_produce_action

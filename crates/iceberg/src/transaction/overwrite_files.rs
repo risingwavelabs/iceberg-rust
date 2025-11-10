@@ -40,6 +40,7 @@ pub struct OverwriteFilesAction<'a> {
     target_size_bytes: u32,
     min_count_to_merge: u32,
     merge_enabled: bool,
+    check_file_existence: bool,
 }
 
 struct OverwriteFilesOperation {
@@ -92,7 +93,14 @@ impl<'a> OverwriteFilesAction<'a> {
             target_size_bytes,
             min_count_to_merge,
             merge_enabled,
+            check_file_existence: true,
         })
+    }
+
+    /// Set whether to check file existence (duplicate adds and non-existent deletes)
+    pub fn with_check_file_existence(mut self, v: bool) -> Self {
+        self.check_file_existence = v;
+        self
     }
 
     /// Add data files to the snapshot.
@@ -124,6 +132,16 @@ impl<'a> OverwriteFilesAction<'a> {
 
     /// Finished building the action and apply it to the transaction.
     pub async fn apply(self) -> Result<Transaction<'a>> {
+        // Validate file changes if enabled
+        if self.check_file_existence {
+            self.snapshot_produce_action
+                .validate_data_file_changes(
+                    &self.snapshot_produce_action.added_data_files,
+                    &self.snapshot_produce_action.removed_data_file_paths,
+                )
+                .await?;
+        }
+
         let inner = RewriteFilesOperation;
 
         if self.merge_enabled {

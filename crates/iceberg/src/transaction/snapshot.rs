@@ -608,6 +608,110 @@ impl<'a> SnapshotProduceAction<'a> {
             ));
         }
     }
+
+    /// Validate data file operations in a single pass through manifests.
+    /// This checks both:
+    /// 1. Added files don't already exist in the table (duplicate prevention)
+    /// 2. Deleted files actually exist in the table (existence validation)
+    pub(crate) async fn validate_data_file_changes(
+        &self,
+        added_data_files: &[DataFile],
+        deleted_file_paths: &HashSet<String>,
+    ) -> Result<()> {
+        // Early return if nothing to validate
+        if added_data_files.is_empty() && deleted_file_paths.is_empty() {
+            return Ok(());
+        }
+
+        let files_to_add: HashSet<&str> = added_data_files
+            .iter()
+            .map(|df| df.file_path.as_str())
+            .collect();
+
+        // Use a mutable set - remove files as we find them
+        let mut files_to_delete: HashSet<&str> = deleted_file_paths
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+
+        let table = &self.tx.current_table;
+
+        // If trying to delete files but no snapshot exists, that's an error
+        if !files_to_delete.is_empty() && table.metadata().current_snapshot().is_none() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot delete files from a table with no current snapshot, files: {}",
+                    files_to_delete.iter().copied().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+
+        let mut duplicate_files = Vec::new();
+
+        // Single pass through all manifests
+        if let Some(current_snapshot) = table.metadata().current_snapshot() {
+            let manifest_list = current_snapshot
+                .load_manifest_list(table.file_io(), table.metadata_ref().as_ref())
+                .await?;
+            
+            for manifest_list_entry in manifest_list.entries() {
+                let manifest = manifest_list_entry.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries() {
+                    if !entry.is_alive() {
+                        continue;
+                    }
+
+                    let file_path = entry.file_path();
+                    
+                    // Check for duplicate adds
+                    if files_to_add.contains(file_path) {
+                        duplicate_files.push(file_path.to_string());
+                    }
+                    
+                    // Remove from files_to_delete as we find them
+                    // Remaining files in the set don't exist in the snapshot
+                    if !files_to_delete.is_empty() {
+                        files_to_delete.remove(file_path);
+                    }
+
+                    // Early exit optimization: if both checks are done, stop scanning
+                    if duplicate_files.len() == files_to_add.len() && files_to_delete.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Validate no duplicate files are being added
+        if !duplicate_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add files that are already referenced by table, files: {}",
+                    duplicate_files.join(", ")
+                ),
+            ));
+        }
+
+        // Any remaining files in files_to_delete don't exist in the snapshot
+        if !files_to_delete.is_empty() {
+            let non_existent_files: Vec<String> = files_to_delete
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot delete files that are not in the current snapshot, files: {}",
+                    non_existent_files.join(", ")
+                ),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 pub(crate) struct MergeManifestProcess {
