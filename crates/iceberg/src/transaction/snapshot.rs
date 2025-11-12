@@ -623,38 +623,41 @@ impl<'a> SnapshotProduceAction<'a> {
             return Ok(());
         }
 
+        // Use a mutable set - remove files as we find them
+        let mut files_to_delete: HashSet<&str> =
+            deleted_file_paths.iter().map(|s| s.as_str()).collect();
+
+        let table = &self.tx.current_table;
+
+        // If trying to delete files but no snapshot exists, that's an error
+        let branch_snapshot_ref = table.metadata().snapshot_for_ref(self.target_branch());
+        if !files_to_delete.is_empty() && branch_snapshot_ref.is_none() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot delete files from a table with no current snapshot, files: {}",
+                    files_to_delete
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+
         let files_to_add: HashSet<&str> = added_data_files
             .iter()
             .map(|df| df.file_path.as_str())
             .collect();
 
-        // Use a mutable set - remove files as we find them
-        let mut files_to_delete: HashSet<&str> = deleted_file_paths
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-
-        let table = &self.tx.current_table;
-
-        // If trying to delete files but no snapshot exists, that's an error
-        if !files_to_delete.is_empty() && table.metadata().current_snapshot().is_none() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot delete files from a table with no current snapshot, files: {}",
-                    files_to_delete.iter().copied().collect::<Vec<_>>().join(", ")
-                ),
-            ));
-        }
-
         let mut duplicate_files = Vec::new();
 
         // Single pass through all manifests
-        if let Some(current_snapshot) = table.metadata().current_snapshot() {
+        if let Some(current_snapshot) = branch_snapshot_ref {
             let manifest_list = current_snapshot
                 .load_manifest_list(table.file_io(), table.metadata_ref().as_ref())
                 .await?;
-            
+
             for manifest_list_entry in manifest_list.entries() {
                 let manifest = manifest_list_entry.load_manifest(table.file_io()).await?;
                 for entry in manifest.entries() {
@@ -663,12 +666,12 @@ impl<'a> SnapshotProduceAction<'a> {
                     }
 
                     let file_path = entry.file_path();
-                    
+
                     // Check for duplicate adds
                     if files_to_add.contains(file_path) {
                         duplicate_files.push(file_path.to_string());
                     }
-                    
+
                     // Remove from files_to_delete as we find them
                     // Remaining files in the set don't exist in the snapshot
                     if !files_to_delete.is_empty() {
@@ -696,10 +699,8 @@ impl<'a> SnapshotProduceAction<'a> {
 
         // Any remaining files in files_to_delete don't exist in the snapshot
         if !files_to_delete.is_empty() {
-            let non_existent_files: Vec<String> = files_to_delete
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let non_existent_files: Vec<String> =
+                files_to_delete.iter().map(|s| s.to_string()).collect();
 
             return Err(Error::new(
                 ErrorKind::DataInvalid,
