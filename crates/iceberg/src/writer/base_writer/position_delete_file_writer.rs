@@ -23,9 +23,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_array::builder::{PrimitiveBuilder, StringBuilder};
 use arrow_array::types::Int64Type;
-use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use once_cell::sync::Lazy;
 
@@ -34,9 +34,9 @@ use crate::spec::{
     DataContentType, DataFile, NestedField, NestedFieldRef, PartitionKey, PrimitiveType, Schema,
     Struct, Type,
 };
+use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
-use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
@@ -239,11 +239,11 @@ mod tests {
         DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, Type,
     };
+    use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::tests::check_parquet_data_file;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
@@ -331,12 +331,9 @@ mod tests {
 
         let schema = Schema::builder()
             .with_schema_id(1)
-            .with_fields(vec![NestedField::required(
-                10,
-                "region",
-                Type::Primitive(PrimitiveType::String),
-            )
-            .into()])
+            .with_fields(vec![
+                NestedField::required(10, "region", Type::Primitive(PrimitiveType::String)).into(),
+            ])
             .build()?;
         let schema_ref = Arc::new(schema);
 
