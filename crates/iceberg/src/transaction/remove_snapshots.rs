@@ -83,37 +83,43 @@ impl<'a> RemoveSnapshotAction<'a> {
         }
     }
 
-    /// Finished building the action and apply it to the transaction.
+    /// Sets the flag to clear expired files.
     pub fn clear_expired_files(mut self, clear_expired_files: bool) -> Self {
         self.clear_expired_files = clear_expired_files;
         self
     }
 
-    /// Finished building the action and apply it to the transaction.
+    /// Sets the snapshot ID to expire.
     pub fn expire_snapshot_id(mut self, expire_snapshot_id: i64) -> Self {
         self.ids_to_remove.insert(expire_snapshot_id);
         self
     }
 
-    /// Finished building the action and apply it to the transaction.
+    /// Sets the timestamp to expire snapshots older than the given timestamp.
     pub fn expire_older_than(mut self, timestamp_ms: i64) -> Self {
         self.default_expired_older_than = timestamp_ms;
         self
     }
 
-    /// Finished building the action and apply it to the transaction.
+    /// Sets the minimum number of snapshots to retain.
     pub fn retain_last(mut self, min_num_snapshots: i32) -> Self {
         self.default_min_num_snapshots = min_num_snapshots;
         self
     }
 
-    /// Finished building the action and apply it to the transaction.
+    /// Sets the flag to clear expired metadata.
     pub fn clear_expired_meta_data(mut self, clear_expired_meta_data: bool) -> Self {
         self.clear_expired_meta_data = clear_expired_meta_data;
         self
     }
 
-    /// Finished building the action and apply it to the transaction.
+    /// Sets the maximum reference age in milliseconds.
+    pub fn max_ref_age_ms(mut self, max_ref_age_ms: i64) -> Self {
+        self.default_max_ref_age_ms = max_ref_age_ms;
+        self
+    }
+
+    /// Applies the action to the transaction.
     pub async fn apply(mut self) -> Result<RemoveSnapshotApplyResult<'a>> {
         if self.tx.current_table.metadata().refs.is_empty() {
             return Ok(RemoveSnapshotApplyResult {
