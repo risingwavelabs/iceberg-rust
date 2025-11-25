@@ -485,7 +485,7 @@ impl TableScan {
 
         return Ok(file_scan_task_rx.boxed());
     }
-    
+
     /// Returns a stream of [`FileScanTask`]s for all files (both data and delete files).
     /// This method does not distinguish between data and delete files.
     pub async fn plan_files_all(&self) -> Result<FileScanTaskStream> {
