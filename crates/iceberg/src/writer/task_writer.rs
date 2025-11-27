@@ -58,11 +58,11 @@ use arrow_array::RecordBatch;
 use crate::Result;
 use crate::arrow::RecordBatchPartitionSplitter;
 use crate::spec::{DataFile, PartitionSpecRef, SchemaRef};
-use crate::writer::IcebergWriterBuilder;
 use crate::writer::partitioning::PartitioningWriter;
 use crate::writer::partitioning::clustered_writer::ClusteredWriter;
 use crate::writer::partitioning::fanout_writer::FanoutWriter;
 use crate::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
+use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
 /// High-level writer that handles partitioning and routing of `RecordBatch` data to Iceberg tables.
 pub struct TaskWriter<B: IcebergWriterBuilder> {
@@ -172,6 +172,17 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: IcebergWriterBuilder> IcebergWriter for TaskWriter<B> {
+    async fn write(&mut self, input: RecordBatch) -> Result<()> {
+        self.write(input).await
+    }
+
+    async fn close(&mut self) -> Result<Vec<DataFile>> {
+        self.close().await
     }
 }
 
