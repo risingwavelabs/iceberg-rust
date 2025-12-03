@@ -100,6 +100,27 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         schema: SchemaRef,
         partition_spec: PartitionSpecRef,
     ) -> Self {
+        Self::new_with_partition_splitter(
+            writer_builder,
+            fanout_enabled,
+            schema,
+            partition_spec,
+            None,
+        )
+    }
+
+    /// Create a new `TaskWriter` with a pre-configured partition splitter.
+    ///
+    /// This allows callers to provide a custom [`RecordBatchPartitionSplitter`], enabling use cases
+    /// such as computing partition values at runtime rather than expecting a pre-computed
+    /// `_partition` column in incoming batches.
+    pub fn new_with_partition_splitter(
+        writer_builder: B,
+        fanout_enabled: bool,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
+        partition_splitter: Option<RecordBatchPartitionSplitter>,
+    ) -> Self {
         let writer = if partition_spec.is_unpartitioned() {
             SupportedWriter::Unpartitioned(UnpartitionedWriter::new(writer_builder))
         } else if fanout_enabled {
@@ -110,7 +131,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
 
         Self {
             writer,
-            partition_splitter: None,
+            partition_splitter,
             schema,
             partition_spec,
         }
@@ -198,7 +219,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::Result;
-    use crate::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
+    use crate::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter};
     use crate::io::FileIOBuilder;
     use crate::spec::{
         DataFile, DataFileFormat, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Type,
@@ -351,6 +372,48 @@ mod tests {
             );
         }
         partition_counts
+    }
+
+    #[tokio::test]
+    async fn test_task_writer_partitioned_with_computed_partitions() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let schema = create_test_schema()?;
+        let arrow_schema = create_arrow_schema();
+
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(1)
+                .add_partition_field("region", "region", crate::spec::Transform::Identity)?
+                .build()?,
+        );
+        let partition_splitter = RecordBatchPartitionSplitter::new_with_computed_values(
+            schema.clone(),
+            partition_spec.clone(),
+        )?;
+
+        let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
+        let mut task_writer = TaskWriter::new_with_partition_splitter(
+            writer_builder,
+            true,
+            schema,
+            partition_spec,
+            Some(partition_splitter),
+        );
+
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])) as ArrayRef,
+        ])?;
+
+        task_writer.write(batch).await?;
+        let data_files = task_writer.close().await?;
+
+        let partition_counts = verify_partition_files(&data_files, 4);
+        assert_eq!(partition_counts.get("US"), Some(&2));
+        assert_eq!(partition_counts.get("EU"), Some(&2));
+
+        Ok(())
     }
 
     #[tokio::test]
