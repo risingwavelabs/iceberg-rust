@@ -386,6 +386,7 @@
 
 pub mod base_writer;
 pub mod file_writer;
+pub mod function_writer;
 pub mod partitioning;
 pub mod task_writer;
 
