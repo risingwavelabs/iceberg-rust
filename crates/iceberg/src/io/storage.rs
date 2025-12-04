@@ -246,11 +246,18 @@ impl Storage {
 
         // Configure timeout layer
         let operator = if let Some(timeout_str) = config.get(IO_TIMEOUT_SECONDS) {
-            if let Ok(timeout_secs) = timeout_str.parse::<u64>() {
-                operator
-                    .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(timeout_secs)))
-            } else {
-                operator.layer(TimeoutLayer::new())
+            match timeout_str.parse::<u64>() {
+                Ok(timeout_secs) => operator
+                    .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(timeout_secs))),
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_TIMEOUT_SECONDS, timeout_str
+                        ),
+                    ))
+                }
             }
         } else {
             operator.layer(TimeoutLayer::new())
@@ -260,20 +267,51 @@ impl Storage {
         let mut retry_layer = RetryLayer::new();
 
         if let Some(max_retries_str) = config.get(IO_MAX_RETRIES) {
-            if let Ok(max_retries) = max_retries_str.parse::<usize>() {
-                retry_layer = retry_layer.with_max_times(max_retries);
+            match max_retries_str.parse::<usize>() {
+                Ok(max_retries) => retry_layer = retry_layer.with_max_times(max_retries),
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_MAX_RETRIES, max_retries_str
+                        ),
+                    ))
+                }
             }
         }
 
         if let Some(min_delay_str) = config.get(IO_RETRY_MIN_DELAY_MS) {
-            if let Ok(min_delay_ms) = min_delay_str.parse::<u64>() {
-                retry_layer = retry_layer.with_min_delay(Duration::from_millis(min_delay_ms));
+            match min_delay_str.parse::<u64>() {
+                Ok(min_delay_ms) => {
+                    retry_layer = retry_layer.with_min_delay(Duration::from_millis(min_delay_ms))
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_RETRY_MIN_DELAY_MS, min_delay_str
+                        ),
+                    ))
+                }
             }
         }
 
         if let Some(max_delay_str) = config.get(IO_RETRY_MAX_DELAY_MS) {
-            if let Ok(max_delay_ms) = max_delay_str.parse::<u64>() {
-                retry_layer = retry_layer.with_max_delay(Duration::from_millis(max_delay_ms));
+            match max_delay_str.parse::<u64>() {
+                Ok(max_delay_ms) => {
+                    retry_layer = retry_layer.with_max_delay(Duration::from_millis(max_delay_ms))
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_RETRY_MAX_DELAY_MS, max_delay_str
+                        ),
+                    ))
+                }
             }
         }
 

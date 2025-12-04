@@ -629,4 +629,76 @@ mod tests {
         let file_io = builder.build();
         assert!(file_io.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_invalid_timeout_config_returns_error() {
+        let file_io = FileIOBuilder::new("memory")
+            .with_prop(IO_TIMEOUT_SECONDS, "not_a_number")
+            .build()
+            .unwrap();
+
+        let path = "memory://test/file.txt";
+        let result = file_io.new_input(path);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err
+            .to_string()
+            .contains("cannot be parsed as a positive integer"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_max_retries_config_returns_error() {
+        let file_io = FileIOBuilder::new("memory")
+            .with_prop(IO_MAX_RETRIES, "invalid")
+            .build()
+            .unwrap();
+
+        let path = "memory://test/file.txt";
+        let result = file_io.new_input(path);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err
+            .to_string()
+            .contains("cannot be parsed as a positive integer"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_retry_min_delay_config_returns_error() {
+        let file_io = FileIOBuilder::new("memory")
+            .with_prop(IO_RETRY_MIN_DELAY_MS, "-100")
+            .build()
+            .unwrap();
+
+        let path = "memory://test/file.txt";
+        let result = file_io.new_input(path);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err
+            .to_string()
+            .contains("cannot be parsed as a positive integer"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_retry_max_delay_config_returns_error() {
+        let file_io = FileIOBuilder::new("memory")
+            .with_prop(IO_RETRY_MAX_DELAY_MS, "abc123")
+            .build()
+            .unwrap();
+
+        let path = "memory://test/file.txt";
+        let result = file_io.new_input(path);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err
+            .to_string()
+            .contains("cannot be parsed as a positive integer"));
+    }
 }
