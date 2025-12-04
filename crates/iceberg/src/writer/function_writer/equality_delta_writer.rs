@@ -197,7 +197,7 @@ where
         self.write_position_deletes(position_deletes).await?;
 
         let delete_mask = delete_row.finish();
-        if delete_mask.null_count() as usize == delete_mask.len() {
+        if delete_mask.null_count() == delete_mask.len() {
             return Ok(());
         }
 
@@ -337,6 +337,25 @@ mod tests {
     };
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
+    type WriterBuildersResult = (
+        DataFileWriterBuilder<
+            ParquetWriterBuilder,
+            DefaultLocationGenerator,
+            DefaultFileNameGenerator,
+        >,
+        PositionDeleteFileWriterBuilder<
+            ParquetWriterBuilder,
+            DefaultLocationGenerator,
+            DefaultFileNameGenerator,
+        >,
+        EqualityDeleteFileWriterBuilder<
+            ParquetWriterBuilder,
+            DefaultLocationGenerator,
+            DefaultFileNameGenerator,
+        >,
+        EqualityDeleteWriterConfig,
+    );
+
     fn position_delete_arrow_schema() -> ArrowSchema {
         schema_to_arrow_schema(
             &Schema::builder()
@@ -361,24 +380,7 @@ mod tests {
         file_io: &crate::io::FileIO,
         location_gen: DefaultLocationGenerator,
         file_name_gen: DefaultFileNameGenerator,
-    ) -> Result<(
-        DataFileWriterBuilder<
-            ParquetWriterBuilder,
-            DefaultLocationGenerator,
-            DefaultFileNameGenerator,
-        >,
-        PositionDeleteFileWriterBuilder<
-            ParquetWriterBuilder,
-            DefaultLocationGenerator,
-            DefaultFileNameGenerator,
-        >,
-        EqualityDeleteFileWriterBuilder<
-            ParquetWriterBuilder,
-            DefaultLocationGenerator,
-            DefaultFileNameGenerator,
-        >,
-        EqualityDeleteWriterConfig,
-    )> {
+    ) -> Result<WriterBuildersResult> {
         let parquet_writer_builder =
             ParquetWriterBuilder::new(WriterProperties::builder().build(), data_schema.clone());
         let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
@@ -590,8 +592,9 @@ mod tests {
             .build()
             .unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
-        let equality_schema =
-            Arc::new(arrow_schema_to_schema(equality_config.projected_arrow_schema_ref())?.into());
+        let equality_schema = Arc::new(arrow_schema_to_schema(
+            equality_config.projected_arrow_schema_ref(),
+        )?);
         let equality_arrow_schema = Arc::new(schema_to_arrow_schema(&equality_schema)?);
         let res = concat_batches(&equality_arrow_schema, &batches).unwrap();
         let expected_batches = RecordBatch::try_new(equality_arrow_schema.clone(), vec![
