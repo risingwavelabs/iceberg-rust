@@ -67,7 +67,7 @@ use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 /// High-level writer that handles partitioning and routing of `RecordBatch` data to Iceberg tables.
 pub struct TaskWriter<B: IcebergWriterBuilder> {
     /// The underlying writer (unpartitioned, fanout, or clustered)
-    writer: SupportedWriter<B>,
+    writer: Option<SupportedWriter<B>>,
     /// Lazily initialized partition splitter for partitioned tables
     partition_splitter: Option<RecordBatchPartitionSplitter>,
     /// Iceberg schema reference used for partition splitting
@@ -130,7 +130,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         };
 
         Self {
-            writer,
+            writer: Some(writer),
             partition_splitter,
             schema,
             partition_spec,
@@ -142,7 +142,14 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     /// For the first write against a partitioned table, the partition splitter is initialised
     /// lazily. Unpartitioned tables bypass the splitter entirely.
     pub async fn write(&mut self, batch: RecordBatch) -> Result<()> {
-        match &mut self.writer {
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::Unexpected,
+                "TaskWriter has been closed and cannot be used",
+            )
+        })?;
+
+        match writer {
             SupportedWriter::Unpartitioned(writer) => writer.write(batch).await,
             SupportedWriter::Fanout(writer) => {
                 if self.partition_splitter.is_none() {
@@ -171,10 +178,17 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
 
     /// Close the `TaskWriter` and return all written data files.
     pub async fn close(self) -> Result<Vec<DataFile>> {
-        match self.writer {
-            SupportedWriter::Unpartitioned(writer) => writer.close().await,
-            SupportedWriter::Fanout(writer) => writer.close().await,
-            SupportedWriter::Clustered(writer) => writer.close().await,
+        if let Some(writer) = self.writer {
+            match writer {
+                SupportedWriter::Unpartitioned(writer) => writer.close().await,
+                SupportedWriter::Fanout(writer) => writer.close().await,
+                SupportedWriter::Clustered(writer) => writer.close().await,
+            }
+        } else {
+            Err(crate::Error::new(
+                crate::ErrorKind::Unexpected,
+                "TaskWriter has already been closed",
+            ))
         }
     }
 
@@ -203,7 +217,18 @@ impl<B: IcebergWriterBuilder> IcebergWriter for TaskWriter<B> {
     }
 
     async fn close(&mut self) -> Result<Vec<DataFile>> {
-        self.close().await
+        if let Some(writer) = self.writer.take() {
+            match writer {
+                SupportedWriter::Unpartitioned(writer) => writer.close().await,
+                SupportedWriter::Fanout(writer) => writer.close().await,
+                SupportedWriter::Clustered(writer) => writer.close().await,
+            }
+        } else {
+            Err(crate::Error::new(
+                crate::ErrorKind::Unexpected,
+                "TaskWriter has already been closed",
+            ))
+        }
     }
 }
 
