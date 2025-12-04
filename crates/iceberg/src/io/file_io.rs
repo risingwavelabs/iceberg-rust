@@ -49,13 +49,13 @@ pub const IO_MAX_RETRIES: &str = "io.max-retries";
 ///
 /// This controls the minimum delay between retry attempts.
 /// If not set, uses OpenDAL's default minimum delay.
-pub const IO_RETRY_MIN_DELAY_MS: &str = "io.retry.min-delay";
+pub const IO_RETRY_MIN_DELAY_MS: &str = "io.retry.min-delay-ms";
 
 /// Configuration property for setting the maximum retry delay in milliseconds.
 ///
 /// This controls the maximum delay between retry attempts.
 /// If not set, uses OpenDAL's default maximum delay.
-pub const IO_RETRY_MAX_DELAY_MS: &str = "io.retry.max-delay";
+pub const IO_RETRY_MAX_DELAY_MS: &str = "io.retry.max-delay-ms";
 
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
