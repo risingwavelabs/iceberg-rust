@@ -708,14 +708,17 @@ impl<'a> SnapshotProducer<'a> {
         Ok(ActionCommit::new(updates, requirements))
     }
 
+    /// Set the new data file sequence number for this snapshot
     pub fn set_new_data_file_sequence_number(&mut self, new_data_file_sequence_number: i64) {
         self.new_data_file_sequence_number = Some(new_data_file_sequence_number);
     }
 
+    /// Set the target branch for this snapshot
     pub fn set_target_branch(&mut self, target_branch: String) {
         self.target_branch = target_branch;
     }
 
+    /// Get the target branch for this snapshot
     pub fn target_branch(&self) -> &str {
         &self.target_branch
     }

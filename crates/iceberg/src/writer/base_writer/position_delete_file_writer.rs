@@ -54,7 +54,8 @@ static DELETE_FILE_POS: Lazy<NestedFieldRef> = Lazy::new(|| {
         Type::Primitive(PrimitiveType::Long),
     ))
 });
-static POSITION_DELETE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+/// Iceberg schema used for position delete files (file_path, pos).
+pub static POSITION_DELETE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
     Schema::builder()
         .with_fields(vec![DELETE_FILE_PATH.clone(), DELETE_FILE_POS.clone()])
         .build()
