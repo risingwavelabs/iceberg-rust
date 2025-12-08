@@ -267,7 +267,6 @@ pub struct TableCreation {
 
 /// TableCommit represents the commit of a table in the catalog.
 #[derive(Debug, TypedBuilder)]
-#[builder(build_method(vis = "pub(crate)"))]
 pub struct TableCommit {
     /// The table ident.
     ident: TableIdent,
