@@ -141,10 +141,7 @@ impl DataFileSerde {
             content: value.content as i32,
             file_path: value.file_path,
             file_format: value.file_format.to_string().to_ascii_uppercase(),
-            partition: RawLiteral::try_from(
-                Literal::Struct(value.partition),
-                &Type::Struct(partition_type.clone()),
-            )?,
+            partition: RawLiteral::try_from_struct_as_list(value.partition, partition_type)?,
             record_count: value.record_count.try_into()?,
             file_size_in_bytes: value.file_size_in_bytes.try_into()?,
             block_size_in_bytes,
@@ -444,6 +441,64 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual_data_file[0].content, DataContentType::Data)
+    }
+
+    #[test]
+    fn test_partition_field_order_is_preserved() {
+        use crate::spec::Literal;
+
+        let partition_type = StructType::new(vec![
+            NestedField::optional(2, "second", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(1, "first", Type::Primitive(PrimitiveType::Int)).into(),
+        ]);
+        let partition = Struct::from_iter(vec![
+            Some(Literal::string("b_value")),
+            Some(Literal::int(7)),
+        ]);
+
+        let data_file = DataFile {
+            content: DataContentType::Data,
+            file_path: "test/path.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition,
+            record_count: 1,
+            file_size_in_bytes: 123,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            split_offsets: vec![0],
+            equality_ids: None,
+            sort_order_id: None,
+            partition_spec_id: 0,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+
+        let mut buffer = Vec::new();
+        write_data_files_to_avro(
+            &mut buffer,
+            vec![data_file.clone()].into_iter(),
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+
+        let actual_data_files = read_data_files_from_avro(
+            &mut Cursor::new(buffer),
+            &schema(),
+            0,
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+
+        assert_eq!(vec![data_file], actual_data_files);
     }
 
     #[test]

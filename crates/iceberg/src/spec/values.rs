@@ -2260,7 +2260,8 @@ mod _serde {
     use serde_bytes::ByteBuf;
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
 
-    use super::{Literal, Map, PrimitiveLiteral};
+    use super::{Literal, Map, PrimitiveLiteral, Struct};
+    use crate::spec::datatypes::StructType;
     use crate::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, PrimitiveType, Type};
     use crate::{Error, ErrorKind};
 
@@ -2273,6 +2274,42 @@ mod _serde {
         /// Covert literal to raw literal.
         pub fn try_from(literal: Literal, ty: &Type) -> Result<Self, Error> {
             Ok(Self(RawLiteralEnum::try_from(literal, ty)?))
+        }
+
+        /// Convert a struct literal to a raw literal represented as a list to preserve field order.
+        pub fn try_from_struct_as_list(
+            struct_literal: Struct,
+            struct_ty: &StructType,
+        ) -> Result<Self, Error> {
+            let expected_len = struct_ty.fields().len();
+            let actual_len = struct_literal.fields().len();
+            if actual_len != expected_len {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Struct literal length {actual_len} does not match struct type field length {expected_len}"
+                    ),
+                ));
+            }
+
+            let mut list_literal = Vec::with_capacity(expected_len);
+            for (value, field) in struct_literal.into_iter().zip(struct_ty.fields()) {
+                match value {
+                    Some(value) => list_literal.push(Some(value)),
+                    None if field.required => {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Can't convert null to required field",
+                        ));
+                    }
+                    None => list_literal.push(None),
+                }
+            }
+
+            Self::try_from(
+                Literal::List(list_literal),
+                &Type::Struct(struct_ty.clone()),
+            )
         }
 
         /// Convert raw literal to literal.
@@ -2521,8 +2558,42 @@ mod _serde {
                     }
                     RawLiteralEnum::Record(Record { required, optional })
                 }
-                Literal::List(list) => {
-                    if let Type::List(list_ty) = ty {
+                Literal::List(list) => match ty {
+                    Type::Struct(struct_ty) => {
+                        if list.len() != struct_ty.fields().len() {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Struct type requires {} fields, got {} values",
+                                    struct_ty.fields().len(),
+                                    list.len()
+                                ),
+                            ));
+                        }
+                        let mut required = Vec::new();
+                        let mut optional = Vec::new();
+                        for (value, field) in list.into_iter().zip(struct_ty.fields()) {
+                            match value {
+                                Some(value) => {
+                                    let raw = RawLiteralEnum::try_from(value, &field.field_type)?;
+                                    if field.required {
+                                        required.push((field.name.clone(), raw));
+                                    } else {
+                                        optional.push((field.name.clone(), Some(raw)));
+                                    }
+                                }
+                                None if field.required => {
+                                    return Err(Error::new(
+                                        ErrorKind::DataInvalid,
+                                        "Can't convert null to required field",
+                                    ));
+                                }
+                                None => optional.push((field.name.clone(), None)),
+                            }
+                        }
+                        RawLiteralEnum::Record(Record { required, optional })
+                    }
+                    Type::List(list_ty) => {
                         let list = list
                             .into_iter()
                             .map(|v| {
@@ -2536,13 +2607,14 @@ mod _serde {
                             list,
                             required: list_ty.element_field.required,
                         })
-                    } else {
+                    }
+                    _ => {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
-                            format!("Type {ty} should be a list"),
+                            format!("Type {ty} should be a list or struct"),
                         ));
                     }
-                }
+                },
                 Literal::Map(map) => {
                     if let Type::Map(map_ty) = ty {
                         if let Type::Primitive(PrimitiveType::String) = *map_ty.key_field.field_type
@@ -2748,6 +2820,32 @@ mod _serde {
                     _ => Err(invalid_err("bytes")),
                 },
                 RawLiteralEnum::List(v) => match ty {
+                    Type::Struct(struct_ty) => {
+                        if v.list.len() != struct_ty.fields().len() {
+                            return Err(invalid_err_with_reason(
+                                "list",
+                                "Struct field count does not match list length",
+                            ));
+                        }
+                        let mut values = Vec::with_capacity(v.list.len());
+                        for (raw_value, field) in v.list.into_iter().zip(struct_ty.fields()) {
+                            let value = match raw_value {
+                                Some(value) => value.try_into(&field.field_type)?,
+                                None => None,
+                            };
+                            if field.required && value.is_none() {
+                                return Err(invalid_err_with_reason(
+                                    "list",
+                                    &format!(
+                                        "Field {} is required, value cannot be null",
+                                        field.name
+                                    ),
+                                ));
+                            }
+                            values.push(value);
+                        }
+                        Ok(Some(Literal::Struct(super::Struct::from_iter(values))))
+                    }
                     Type::List(ty) => Ok(Some(Literal::List(
                         v.list
                             .into_iter()
@@ -2904,27 +3002,49 @@ mod _serde {
                     }
                     _ => Err(invalid_err("list")),
                 },
-                RawLiteralEnum::Record(Record {
-                    required,
-                    optional: _,
-                }) => match ty {
+                RawLiteralEnum::Record(Record { required, optional }) => match ty {
                     Type::Struct(struct_ty) => {
-                        let iters: Vec<Option<Literal>> = required
-                            .into_iter()
-                            .map(|(field_name, value)| {
-                                let field = struct_ty
-                                    .field_by_name(field_name.as_str())
-                                    .ok_or_else(|| {
-                                        invalid_err_with_reason(
+                        let mut field_map = std::collections::HashMap::with_capacity(
+                            required.len() + optional.len(),
+                        );
+                        for (field_name, value) in required {
+                            field_map.insert(field_name, Some(value));
+                        }
+                        for (field_name, value) in optional {
+                            field_map.insert(field_name, value);
+                        }
+
+                        let mut values = Vec::with_capacity(struct_ty.fields().len());
+                        for field in struct_ty.fields() {
+                            match field_map.remove(&field.name) {
+                                Some(Some(value)) => {
+                                    values.push(value.try_into(&field.field_type)?);
+                                }
+                                Some(None) => {
+                                    if field.required {
+                                        return Err(invalid_err_with_reason(
                                             "record",
-                                            &format!("field {} is not exist", &field_name),
-                                        )
-                                    })?;
-                                let value = value.try_into(&field.field_type)?;
-                                Ok(value)
-                            })
-                            .collect::<Result<_, Error>>()?;
-                        Ok(Some(Literal::Struct(super::Struct::from_iter(iters))))
+                                            &format!(
+                                                "field {} is required but value is null",
+                                                field.name
+                                            ),
+                                        ));
+                                    }
+                                    values.push(None);
+                                }
+                                None => {
+                                    if field.required {
+                                        return Err(invalid_err_with_reason(
+                                            "record",
+                                            &format!("field {} is missing", field.name),
+                                        ));
+                                    }
+                                    values.push(None);
+                                }
+                            }
+                        }
+
+                        Ok(Some(Literal::Struct(super::Struct::from_iter(values))))
                     }
                     Type::Map(map_ty) => {
                         if *map_ty.key_field.field_type != Type::Primitive(PrimitiveType::String) {
