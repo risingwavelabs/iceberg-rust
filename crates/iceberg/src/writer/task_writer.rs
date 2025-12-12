@@ -53,10 +53,13 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
+use arrow_schema::Schema as ArrowSchema;
 
 use crate::Result;
-use crate::arrow::RecordBatchPartitionSplitter;
+use crate::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter};
 use crate::spec::{DataFile, PartitionSpecRef, SchemaRef};
 use crate::writer::partitioning::PartitioningWriter;
 use crate::writer::partitioning::clustered_writer::ClusteredWriter;
@@ -200,10 +203,52 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         let splitter = partition_splitter
             .as_ref()
             .expect("partition splitter must be initialised before use");
+        let partition_column_index = if splitter.uses_precomputed_values() {
+            Some(
+                batch
+                    .schema()
+                    .index_of(PROJECTED_PARTITION_VALUE_COLUMN)
+                    .map_err(|_| {
+                        crate::Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            format!(
+                                "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
+                            ),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let partitioned_batches = splitter.split(batch)?;
 
         for (partition_key, partition_batch) in partitioned_batches {
-            writer.write(partition_key, partition_batch).await?;
+            // If the batch contains the precomputed partition column, drop it before writing to
+            // the data writer to align with the table schema.
+            let projected_batch = if let Some(idx) = partition_column_index {
+                let mut columns = partition_batch.columns().to_vec();
+                columns.remove(idx);
+                let fields: Vec<_> = partition_batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| (i != idx).then(|| f.clone()))
+                    .collect();
+                let schema = Arc::new(ArrowSchema::new(fields));
+                RecordBatch::try_new(schema, columns).map_err(|err| {
+                    crate::Error::new(
+                        crate::ErrorKind::Unexpected,
+                        "Failed to build projected RecordBatch",
+                    )
+                    .with_source(err)
+                })?
+            } else {
+                partition_batch
+            };
+
+            writer.write(partition_key, projected_batch).await?;
         }
 
         Ok(())

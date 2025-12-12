@@ -115,6 +115,11 @@ impl RecordBatchPartitionSplitter {
         Self::new(iceberg_schema, partition_spec, None)
     }
 
+    /// Whether this splitter expects a precomputed `_partition` column instead of computing values.
+    pub fn uses_precomputed_values(&self) -> bool {
+        self.calculator.is_none()
+    }
+
     /// Split the record batch into multiple record batches based on the partition spec.
     pub fn split(&self, batch: &RecordBatch) -> Result<Vec<(PartitionKey, RecordBatch)>> {
         let partition_structs = if let Some(calculator) = &self.calculator {
