@@ -17,6 +17,6 @@
 
 //! Higher-level delta writers built on top of base Iceberg writers.
 
-pub mod delta_writer;
+pub mod writer;
 
-pub use delta_writer::{DELETE_OP, DeltaWriter, DeltaWriterBuilder, INSERT_OP};
+pub use writer::{DELETE_OP, DeltaWriter, DeltaWriterBuilder, INSERT_OP};
