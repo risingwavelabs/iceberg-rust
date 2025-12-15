@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Higher-level functional writers built on top of base Iceberg writers.
+//! Higher-level delta writers built on top of base Iceberg writers.
 
-pub mod equality_delta_writer;
+pub mod delta_writer;
+
+pub use delta_writer::{DELETE_OP, DeltaWriter, DeltaWriterBuilder, INSERT_OP};

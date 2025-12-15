@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Equality delta writer that produces data files, position delete files and equality delete files
+//! Delta writer that produces data files, position delete files and equality delete files
 //! in a single pass.
 
 use std::collections::HashMap;
@@ -41,9 +41,9 @@ pub const INSERT_OP: i32 = 1;
 /// Delete operation marker.
 pub const DELETE_OP: i32 = 2;
 
-/// Builder for [`EqualityDeltaWriter`].
+/// Builder for [`DeltaWriter`].
 #[derive(Clone)]
-pub struct EqualityDeltaWriterBuilder<DB, PDB, EDB> {
+pub struct DeltaWriterBuilder<DB, PDB, EDB> {
     data_writer_builder: DB,
     position_delete_writer_builder: PDB,
     equality_delete_writer_builder: EDB,
@@ -51,8 +51,8 @@ pub struct EqualityDeltaWriterBuilder<DB, PDB, EDB> {
     schema: SchemaRef,
 }
 
-impl<DB, PDB, EDB> EqualityDeltaWriterBuilder<DB, PDB, EDB> {
-    /// Create a new `EqualityDeltaWriterBuilder`.
+impl<DB, PDB, EDB> DeltaWriterBuilder<DB, PDB, EDB> {
+    /// Create a new `DeltaWriterBuilder`.
     pub fn new(
         data_writer_builder: DB,
         position_delete_writer_builder: PDB,
@@ -71,14 +71,14 @@ impl<DB, PDB, EDB> EqualityDeltaWriterBuilder<DB, PDB, EDB> {
 }
 
 #[async_trait::async_trait]
-impl<DB, PDB, EDB> IcebergWriterBuilder for EqualityDeltaWriterBuilder<DB, PDB, EDB>
+impl<DB, PDB, EDB> IcebergWriterBuilder for DeltaWriterBuilder<DB, PDB, EDB>
 where
     DB: IcebergWriterBuilder,
     PDB: IcebergWriterBuilder<Vec<PositionDeleteInput>>,
     EDB: IcebergWriterBuilder,
     DB::R: CurrentFileStatus,
 {
-    type R = EqualityDeltaWriter<DB::R, PDB::R, EDB::R>;
+    type R = DeltaWriter<DB::R, PDB::R, EDB::R>;
 
     async fn build(self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         Self::R::try_new(
@@ -98,7 +98,7 @@ where
 }
 
 /// Writer that handles insert and delete operations in a single stream.
-pub struct EqualityDeltaWriter<D, PD, ED> {
+pub struct DeltaWriter<D, PD, ED> {
     data_writer: D,
     position_delete_writer: PD,
     equality_delete_writer: ED,
@@ -107,7 +107,7 @@ pub struct EqualityDeltaWriter<D, PD, ED> {
     row_converter: RowConverter,
 }
 
-impl<D, PD, ED> EqualityDeltaWriter<D, PD, ED>
+impl<D, PD, ED> DeltaWriter<D, PD, ED>
 where
     D: IcebergWriter + CurrentFileStatus,
     PD: IcebergWriter<Vec<PositionDeleteInput>>,
@@ -244,7 +244,7 @@ where
 }
 
 #[async_trait::async_trait]
-impl<D, PD, ED> IcebergWriter for EqualityDeltaWriter<D, PD, ED>
+impl<D, PD, ED> IcebergWriter for DeltaWriter<D, PD, ED>
 where
     D: IcebergWriter + CurrentFileStatus,
     PD: IcebergWriter<Vec<PositionDeleteInput>>,
@@ -254,7 +254,7 @@ where
         if batch.num_columns() == 0 {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                "Equality delta writer expects at least one column for operation markers",
+                "Delta writer expects at least one column for operation markers",
             ));
         }
 
@@ -327,14 +327,12 @@ mod tests {
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
     };
     use crate::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
+    use crate::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use crate::writer::file_writer::parquet_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use crate::writer::function_writer::equality_delta_writer::{
-        DELETE_OP, EqualityDeltaWriterBuilder, INSERT_OP,
-    };
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
     type WriterBuildersResult = (
@@ -446,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_equality_delta_writer() -> Result<()> {
+    async fn test_delta_writer() -> Result<()> {
         let schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
@@ -483,7 +481,7 @@ mod tests {
             file_name_gen.clone(),
         )?;
 
-        let mut equality_delta_writer = EqualityDeltaWriterBuilder::new(
+        let mut delta_writer = DeltaWriterBuilder::new(
             data_file_writer_builder,
             position_delete_writer_builder,
             equality_delete_writer_builder,
@@ -513,7 +511,7 @@ mod tests {
             Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"])),
             Arc::new(Int32Array::from(vec![INSERT_OP; 7])),
         ])?;
-        equality_delta_writer.write(batch_one).await?;
+        delta_writer.write(batch_one).await?;
 
         let batch_two = RecordBatch::try_new(arrow_schema.clone(), vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
@@ -522,9 +520,9 @@ mod tests {
                 DELETE_OP, DELETE_OP, DELETE_OP, INSERT_OP,
             ])),
         ])?;
-        equality_delta_writer.write(batch_two).await?;
+        delta_writer.write(batch_two).await?;
 
-        let data_files = equality_delta_writer.close().await?;
+        let data_files = delta_writer.close().await?;
         assert_eq!(data_files.len(), 3);
 
         let data_schema = Arc::new(ArrowSchema::new(vec![
