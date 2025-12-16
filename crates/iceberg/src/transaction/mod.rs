@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 
 pub use append::FastAppendAction;
+pub use update_schema::UpdateSchemaAction;
 mod manifest_filter;
 
 pub use manifest_filter::*;
@@ -85,7 +86,6 @@ use crate::transaction::overwrite_files::OverwriteFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
-use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
