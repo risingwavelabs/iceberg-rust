@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use opendal::layers::{RetryLayer, TimeoutLayer};
 #[cfg(feature = "storage-azblob")]
@@ -32,7 +34,9 @@ use opendal::{Operator, Scheme};
 
 #[cfg(feature = "storage-azdls")]
 use super::AzureStorageScheme;
-use super::FileIOBuilder;
+use super::{
+    FileIOBuilder, IO_MAX_RETRIES, IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS, IO_TIMEOUT_SECONDS,
+};
 use crate::{Error, ErrorKind};
 
 /// The storage carries all supported storage services in iceberg
@@ -116,11 +120,12 @@ impl Storage {
         }
     }
 
-    /// Creates operator from path.
+    /// Creates operator from path with configuration.
     ///
     /// # Arguments
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    /// * config: Configuration properties for timeout and retry settings.
     ///
     /// # Returns
     ///
@@ -128,9 +133,10 @@ impl Storage {
     ///
     /// * An [`opendal::Operator`] instance used to operate on file.
     /// * Relative path to the root uri of [`opendal::Operator`].
-    pub(crate) fn create_operator<'a>(
+    pub(crate) fn create_operator_with_config<'a>(
         &self,
         path: &'a impl AsRef<str>,
+        config: &HashMap<String, String>,
     ) -> crate::Result<(Operator, &'a str)> {
         let path = path.as_ref();
         let (operator, relative_path): (Operator, &str) = match self {
@@ -237,7 +243,79 @@ impl Storage {
 
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
-        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
+
+        // Configure timeout layer
+        let operator = if let Some(timeout_str) = config.get(IO_TIMEOUT_SECONDS) {
+            match timeout_str.parse::<u64>() {
+                Ok(timeout_secs) => operator
+                    .layer(TimeoutLayer::new().with_io_timeout(Duration::from_secs(timeout_secs))),
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_TIMEOUT_SECONDS, timeout_str
+                        ),
+                    ))
+                }
+            }
+        } else {
+            operator.layer(TimeoutLayer::new())
+        };
+
+        // Configure retry layer
+        let mut retry_layer = RetryLayer::new();
+
+        if let Some(max_retries_str) = config.get(IO_MAX_RETRIES) {
+            match max_retries_str.parse::<usize>() {
+                Ok(max_retries) => retry_layer = retry_layer.with_max_times(max_retries),
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_MAX_RETRIES, max_retries_str
+                        ),
+                    ))
+                }
+            }
+        }
+
+        if let Some(min_delay_str) = config.get(IO_RETRY_MIN_DELAY_MS) {
+            match min_delay_str.parse::<u64>() {
+                Ok(min_delay_ms) => {
+                    retry_layer = retry_layer.with_min_delay(Duration::from_millis(min_delay_ms))
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_RETRY_MIN_DELAY_MS, min_delay_str
+                        ),
+                    ))
+                }
+            }
+        }
+
+        if let Some(max_delay_str) = config.get(IO_RETRY_MAX_DELAY_MS) {
+            match max_delay_str.parse::<u64>() {
+                Ok(max_delay_ms) => {
+                    retry_layer = retry_layer.with_max_delay(Duration::from_millis(max_delay_ms))
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid {}: '{}' cannot be parsed as a positive integer",
+                            IO_RETRY_MAX_DELAY_MS, max_delay_str
+                        ),
+                    ))
+                }
+            }
+        }
+
+        let operator = operator.layer(retry_layer);
 
         Ok((operator, relative_path))
     }
