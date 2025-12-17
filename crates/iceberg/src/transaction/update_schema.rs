@@ -101,9 +101,7 @@ impl TransactionAction for UpdateSchemaAction {
             .build()?;
 
         let updates = vec![
-            TableUpdate::AddSchema {
-                schema: new_schema,
-            },
+            TableUpdate::AddSchema { schema: new_schema },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ];
 
@@ -142,7 +140,11 @@ mod tests {
             Type::Primitive(PrimitiveType::String),
         ));
 
-        let tx = tx.update_schema().add_field(new_field.clone()).apply(tx).unwrap();
+        let tx = tx
+            .update_schema()
+            .add_field(new_field.clone())
+            .apply(tx)
+            .unwrap();
 
         assert_eq!(tx.actions.len(), 1);
 
@@ -224,8 +226,7 @@ mod tests {
     #[tokio::test]
     async fn test_commit_action() {
         use crate::transaction::TransactionAction;
-        use crate::TableRequirement;
-        use crate::TableUpdate;
+        use crate::{TableRequirement, TableUpdate};
 
         let table = make_v2_table();
         let original_schema = table.metadata().current_schema();
