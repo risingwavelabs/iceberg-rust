@@ -49,7 +49,7 @@ pub struct ObjectCache {
 impl ObjectCache {
     /// Creates a new [`ObjectCache`]
     /// with the default cache size
-    pub fn new(file_io: FileIO) -> Self {
+    pub(crate) fn new(file_io: FileIO) -> Self {
         Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES)
     }
 
