@@ -49,7 +49,7 @@ pub struct ObjectCache {
 impl ObjectCache {
     /// Creates a new [`ObjectCache`]
     /// with the default cache size
-    pub(crate) fn new(file_io: FileIO) -> Self {
+    pub fn new(file_io: FileIO) -> Self {
         Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES)
     }
 
@@ -120,7 +120,7 @@ impl ObjectCache {
 
     /// Retrieves an Arc [`ManifestList`] from the cache
     /// or retrieves one from FileIO and parses it if not present
-    pub(crate) async fn get_manifest_list(
+    pub async fn get_manifest_list(
         &self,
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
