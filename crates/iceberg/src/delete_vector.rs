@@ -15,13 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::ops::BitOrAssign;
 
+use crc32fast::Hasher;
 use roaring::RoaringTreemap;
 use roaring::bitmap::Iter;
 use roaring::treemap::BitmapIter;
 
+use crate::puffin::{Blob, DELETION_VECTOR_V1};
 use crate::{Error, ErrorKind, Result};
+
+const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+
+pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
+pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 
 #[derive(Debug, Default)]
 pub struct DeleteVector {
@@ -67,6 +75,69 @@ impl DeleteVector {
     #[allow(unused)]
     pub fn len(&self) -> u64 {
         self.inner.len()
+    }
+
+    pub(crate) fn to_puffin_blob(&self, properties: HashMap<String, String>) -> Result<Blob> {
+        Self::check_properties(&properties)?;
+
+        let serialized_bitmap_size = self.inner.serialized_size();
+        let combined_length = (DELETION_VECTOR_MAGIC_BYTES.len() + serialized_bitmap_size) as u32;
+        let mut data = Vec::with_capacity(
+            std::mem::size_of_val(&combined_length)
+                + DELETION_VECTOR_MAGIC_BYTES.len()
+                + serialized_bitmap_size
+                + 4,
+        );
+
+        data.extend_from_slice(&combined_length.to_be_bytes());
+        data.extend_from_slice(&DELETION_VECTOR_MAGIC_BYTES);
+
+        let bitmap_start = data.len();
+        data.resize(bitmap_start + serialized_bitmap_size, 0);
+        {
+            let mut cursor = std::io::Cursor::new(&mut data[bitmap_start..]);
+            self.inner.serialize_into(&mut cursor).map_err(|err| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "failed to serialize deletion vector bitmap".to_string(),
+                )
+                .with_source(err)
+            })?;
+        }
+
+        let mut hasher = Hasher::new();
+        hasher.update(&data[4..]);
+        let crc = hasher.finalize();
+        data.extend_from_slice(&crc.to_be_bytes());
+
+        Ok(Blob::builder()
+            .r#type(DELETION_VECTOR_V1.to_string())
+            .fields(vec![])
+            .snapshot_id(-1)
+            .sequence_number(-1)
+            .data(data)
+            .properties(properties)
+            .build())
+    }
+
+    fn check_properties(properties: &HashMap<String, String>) -> Result<()> {
+        if !properties.contains_key(DELETION_VECTOR_PROPERTY_CARDINALITY) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector properties must include {DELETION_VECTOR_PROPERTY_CARDINALITY}"
+                ),
+            ));
+        }
+        if !properties.contains_key(DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector properties must include {DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE}"
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
