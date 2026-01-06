@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::ops::BitOrAssign;
 
 use crc32fast::Hasher;
@@ -27,8 +28,11 @@ use crate::puffin::{Blob, DELETION_VECTOR_V1};
 use crate::{Error, ErrorKind, Result};
 
 const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
 
+/// Puffin blob property for deletion vector cardinality.
 pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
+/// Puffin blob property for referenced data file path.
 pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 
 #[derive(Debug, Default)]
@@ -77,6 +81,7 @@ impl DeleteVector {
         self.inner.len()
     }
 
+    /// Serialize this delete vector into a Puffin deletion vector blob.
     pub(crate) fn to_puffin_blob(&self, properties: HashMap<String, String>) -> Result<Blob> {
         Self::check_properties(&properties)?;
 
@@ -118,6 +123,78 @@ impl DeleteVector {
             .data(data)
             .properties(properties)
             .build())
+    }
+
+    /// Deserialize a delete vector from a Puffin deletion vector blob.
+    pub(crate) fn from_puffin_blob(blob: Blob) -> Result<Self> {
+        if blob.blob_type() != DELETION_VECTOR_V1 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("unsupported puffin blob type: {}", blob.blob_type()),
+            ));
+        }
+
+        let data = blob.data();
+        if data.len() < MIN_SERIALIZED_DELETION_VECTOR_BLOB {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "serialized deletion vector blob too small".to_string(),
+            ));
+        }
+
+        let magic = &data[4..8];
+        if magic != DELETION_VECTOR_MAGIC_BYTES {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "invalid deletion vector magic bytes".to_string(),
+            ));
+        }
+
+        let combined_length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let expected_len = std::mem::size_of_val(&combined_length) + combined_length as usize + 4;
+        if expected_len != data.len() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "serialized deletion vector length mismatch: expected {expected_len}, actual {}",
+                    data.len()
+                ),
+            ));
+        }
+
+        let bitmap_start = 8;
+        let bitmap_end = data.len() - 4;
+        let bitmap_data = &data[bitmap_start..bitmap_end];
+
+        let mut hasher = Hasher::new();
+        hasher.update(&data[4..bitmap_end]);
+        let expected_crc = hasher.finalize();
+        let stored_crc = u32::from_be_bytes([
+            data[data.len() - 4],
+            data[data.len() - 3],
+            data[data.len() - 2],
+            data[data.len() - 1],
+        ]);
+        if expected_crc != stored_crc {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector crc mismatch: expected {expected_crc}, got {stored_crc}"
+                ),
+            ));
+        }
+
+        let bitmap = RoaringTreemap::deserialize_from(&mut Cursor::new(bitmap_data)).map_err(
+            |err| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "failed to deserialize deletion vector bitmap".to_string(),
+                )
+                .with_source(err)
+            },
+        )?;
+
+        Ok(DeleteVector::new(bitmap))
     }
 
     fn check_properties(properties: &HashMap<String, String>) -> Result<()> {
