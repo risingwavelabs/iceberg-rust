@@ -361,8 +361,7 @@ pub struct TableScan {
 }
 
 impl TableScan {
-    /// Returns a stream of [`FileScanTask`]s.
-    pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
+    async fn plan_files_inner(&self, all_files: bool) -> Result<FileScanTaskStream> {
         let Some(plan_context) = self.plan_context.as_ref() else {
             return Ok(Box::pin(futures::stream::empty()));
         };
@@ -379,7 +378,13 @@ impl TableScan {
         // used to stream the results back to the caller
         let (file_scan_task_tx, file_scan_task_rx) = channel(concurrency_limit_manifest_entries);
 
-        let (delete_file_idx, delete_file_tx) = DeleteFileIndex::new();
+        let (delete_file_idx, delete_file_tx) = if all_files {
+            // When processing all files, we don't need delete file index
+            let (tx, _rx) = channel(1);
+            (DeleteFileIndex::empty(), tx)
+        } else {
+            DeleteFileIndex::new()
+        };
 
         let manifest_list = plan_context.get_manifest_list().await?;
 
@@ -444,7 +449,11 @@ impl TableScan {
                     concurrency_limit_manifest_entries,
                     |(manifest_entry_context, tx)| async move {
                         spawn(async move {
-                            Self::process_data_manifest_entry(manifest_entry_context, tx).await
+                            if all_files {
+                                Self::process_all_manifest_entry(manifest_entry_context, tx).await
+                            } else {
+                                Self::process_data_manifest_entry(manifest_entry_context, tx).await
+                            }
                         })
                         .await
                     },
@@ -457,6 +466,17 @@ impl TableScan {
         });
 
         Ok(file_scan_task_rx.boxed())
+    }
+
+    /// Returns a stream of [`FileScanTask`]s for all files (both data and delete files).
+    /// This method does not distinguish between data and delete files.
+    pub async fn plan_files_all(&self) -> Result<FileScanTaskStream> {
+        self.plan_files_inner(true).await
+    }
+
+    /// Returns a stream of [`FileScanTask`]s.
+    pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
+        self.plan_files_inner(false).await
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
@@ -483,6 +503,39 @@ impl TableScan {
         self.plan_context.as_ref().map(|x| &x.snapshot)
     }
 
+    /// Helper method to evaluate filters on a manifest entry.
+    /// Returns true if the manifest entry passes both partition and metrics filters.
+    /// For data files, both partition and metrics filters are checked.
+    /// For delete files, only partition filter is checked.
+    fn eval_filters(
+        manifest_entry_context: &ManifestEntryContext,
+        bound_predicates: &BoundPredicates,
+    ) -> Result<bool> {
+        // Check partition filter
+        let expression_evaluator_cache = manifest_entry_context.expression_evaluator_cache.as_ref();
+        let expression_evaluator = expression_evaluator_cache.get(
+            manifest_entry_context.partition_spec_id,
+            &bound_predicates.partition_bound_predicate,
+        )?;
+
+        if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
+            return Ok(false);
+        }
+
+        // Check metrics filter only for data files
+        if manifest_entry_context.manifest_entry.content_type() == DataContentType::Data {
+            if !InclusiveMetricsEvaluator::eval(
+                &bound_predicates.snapshot_bound_predicate,
+                manifest_entry_context.manifest_entry.data_file(),
+                false,
+            )? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
@@ -501,31 +554,8 @@ impl TableScan {
         }
 
         if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
-            let BoundPredicates {
-                snapshot_bound_predicate,
-                partition_bound_predicate,
-            } = bound_predicates.as_ref();
-
-            let expression_evaluator_cache =
-                manifest_entry_context.expression_evaluator_cache.as_ref();
-
-            let expression_evaluator = expression_evaluator_cache.get(
-                manifest_entry_context.partition_spec_id,
-                partition_bound_predicate,
-            )?;
-
-            // skip any data file whose partition data indicates that it can't contain
-            // any data that matches this scan's filter
-            if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
-                return Ok(());
-            }
-
-            // skip any data file whose metrics don't match this scan's filter
-            if !InclusiveMetricsEvaluator::eval(
-                snapshot_bound_predicate,
-                manifest_entry_context.manifest_entry.data_file(),
-                false,
-            )? {
+            // skip any data file that doesn't pass partition and metrics filters
+            if !Self::eval_filters(&manifest_entry_context, bound_predicates)? {
                 return Ok(());
             }
         }
@@ -533,6 +563,31 @@ impl TableScan {
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
+        file_scan_task_tx
+            .send(Ok(manifest_entry_context.into_file_scan_task().await?))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn process_all_manifest_entry(
+        manifest_entry_context: ManifestEntryContext,
+        mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+    ) -> Result<()> {
+        // skip processing this manifest entry if it has been marked as deleted
+        if !manifest_entry_context.manifest_entry.is_alive() {
+            return Ok(());
+        }
+
+        if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
+            // For data files, check both partition and metrics filters
+            // For delete files, only check partition filter
+            if !Self::eval_filters(&manifest_entry_context, bound_predicates)? {
+                return Ok(());
+            }
+        }
+
+        // Create a corresponding FileScanTask and push it to the result stream
         file_scan_task_tx
             .send(Ok(manifest_entry_context.into_file_scan_task().await?))
             .await?;
@@ -558,17 +613,9 @@ impl TableScan {
         }
 
         if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
-            let expression_evaluator_cache =
-                manifest_entry_context.expression_evaluator_cache.as_ref();
-
-            let expression_evaluator = expression_evaluator_cache.get(
-                manifest_entry_context.partition_spec_id,
-                &bound_predicates.partition_bound_predicate,
-            )?;
-
-            // skip any data file whose partition data indicates that it can't contain
-            // any data that matches this scan's filter
-            if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
+            // skip any delete file whose partition data indicates that it can't contain
+            // any data that matches this scan's filter (no metrics check for delete files)
+            if !Self::eval_filters(&manifest_entry_context, bound_predicates)? {
                 return Ok(());
             }
         }
