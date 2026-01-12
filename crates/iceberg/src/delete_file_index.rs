@@ -83,16 +83,6 @@ impl DeleteFileIndex {
         (DeleteFileIndex { state }, tx)
     }
 
-    /// create an empty `DeleteFileIndex` that returns no delete files
-    pub(crate) fn empty() -> DeleteFileIndex {
-        let populated_index = PopulatedDeleteFileIndex::new(vec![]);
-        DeleteFileIndex {
-            state: Arc::new(RwLock::new(DeleteFileIndexState::Populated(
-                populated_index,
-            ))),
-        }
-    }
-
     /// Gets all the delete files that apply to the specified data file.
     pub(crate) async fn get_deletes_for_data_file(
         &self,
