@@ -25,6 +25,7 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
+use crate::transaction::utils::ReachableFileCleanupStrategy;
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -243,6 +244,20 @@ impl Table {
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone())
+    }
+
+    /// Cleans up files from expired snapshots.
+    ///
+    /// Compares metadata before and after snapshot expiration to identify and delete
+    /// unreachable files (manifest lists, manifests, and data files).
+    pub async fn cleanup_expired_files(
+        &self,
+        before_metadata: &TableMetadataRef,
+    ) -> Result<()> {
+        let cleanup_strategy = ReachableFileCleanupStrategy::new(self.file_io.clone());
+        cleanup_strategy
+            .clean_files(before_metadata, &self.metadata_ref())
+            .await
     }
 
     /// Returns a new `Table` instance with the provided object cache.

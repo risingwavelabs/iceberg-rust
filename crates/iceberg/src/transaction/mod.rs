@@ -70,6 +70,7 @@ mod update_properties;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
+pub mod utils;
 
 use std::sync::Arc;
 use std::time::Duration;
