@@ -25,7 +25,7 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::transaction::utils::ReachableFileCleanupStrategy;
+use crate::utils::{ReachableFileCleanupStrategy, DEFAULT_DELETE_CONCURRENCY_LIMIT};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -254,7 +254,19 @@ impl Table {
         &self,
         before_metadata: &TableMetadataRef,
     ) -> Result<()> {
-        let cleanup_strategy = ReachableFileCleanupStrategy::new(self.file_io.clone());
+        self.cleanup_expired_files_with_concurrency(before_metadata, DEFAULT_DELETE_CONCURRENCY_LIMIT)
+            .await
+    }
+
+    /// Cleans up files from expired snapshots with configurable concurrency.
+    pub async fn cleanup_expired_files_with_concurrency(
+        &self,
+        before_metadata: &TableMetadataRef,
+        concurrency_limit: usize,
+    ) -> Result<()> {
+        let cleanup_strategy = ReachableFileCleanupStrategy::new(self.file_io.clone())
+            .with_concurrency_limit(concurrency_limit);
+
         cleanup_strategy
             .clean_files(before_metadata, &self.metadata_ref())
             .await
