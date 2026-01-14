@@ -293,6 +293,23 @@ impl RestCatalogConfig {
         params
     }
 
+    /// Get the GCP service account JSON from the config for BigLake authentication.
+    ///
+    /// Looks for `gcp.service-account` property which should contain the JSON
+    /// content of a service account key file.
+    pub(crate) fn gcp_service_account(&self) -> Option<String> {
+        self.props.get("gcp.service-account").cloned()
+    }
+
+    /// Extract the GCP project ID from the service account JSON.
+    ///
+    /// This is used to populate the `x-goog-user-project` header required by BigLake API.
+    pub(crate) fn gcp_project_id(&self) -> Option<String> {
+        let sa_json = self.gcp_service_account()?;
+        let parsed: serde_json::Value = serde_json::from_str(&sa_json).ok()?;
+        parsed.get("project_id")?.as_str().map(String::from)
+    }
+
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
     pub(crate) fn merge_with_config(mut self, mut config: CatalogConfig) -> Self {
         if let Some(uri) = config.overrides.remove("uri") {
