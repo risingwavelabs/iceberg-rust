@@ -306,8 +306,8 @@ impl ReachableFileCleanupStrategy {
         before_expiration: &TableMetadataRef,
         after_expiration: &TableMetadataRef,
     ) -> Result<()> {
-        let (expired_snapshots, manifest_lists_to_delete) = self
-            .collect_expired_snapshots(before_expiration, after_expiration);
+        let (expired_snapshots, manifest_lists_to_delete) =
+            self.collect_expired_snapshots(before_expiration, after_expiration);
 
         let deletion_candidates = {
             let mut deletion_candidates = HashSet::default();
@@ -423,15 +423,16 @@ impl ReachableFileCleanupStrategy {
 
 #[cfg(test)]
 mod cleanup_tests {
-    use super::*;
     use std::collections::HashSet;
     use std::fs::File;
     use std::io::BufReader;
     use std::sync::Arc;
+
+    use super::*;
+    use crate::TableIdent;
     use crate::io::FileIOBuilder;
     use crate::spec::TableMetadata;
     use crate::table::Table;
-    use crate::TableIdent;
 
     #[cfg(test)]
     fn make_v2_table_with_multi_snapshot() -> Table {
@@ -460,30 +461,30 @@ mod cleanup_tests {
     ) -> TableMetadataRef {
         let mut cloned = metadata.as_ref().clone();
         cloned.snapshots.retain(|id, _| !expired_ids.contains(id));
-        cloned.snapshot_log.retain(|log| !expired_ids.contains(&log.snapshot_id));
+        cloned
+            .snapshot_log
+            .retain(|log| !expired_ids.contains(&log.snapshot_id));
         Arc::new(cloned)
     }
 
     #[test]
     fn test_cleanup_strategy_builder() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        
+
         // Test default concurrency limit
         let strategy = ReachableFileCleanupStrategy::new(file_io.clone());
         assert_eq!(
-            strategy.concurrency_limit,
-            DEFAULT_DELETE_CONCURRENCY_LIMIT,
+            strategy.concurrency_limit, DEFAULT_DELETE_CONCURRENCY_LIMIT,
             "Default concurrency limit should be {}",
             DEFAULT_DELETE_CONCURRENCY_LIMIT
         );
-        
+
         // Test custom concurrency limit
         let custom_limit = 20;
-        let strategy = ReachableFileCleanupStrategy::new(file_io)
-            .with_concurrency_limit(custom_limit);
+        let strategy =
+            ReachableFileCleanupStrategy::new(file_io).with_concurrency_limit(custom_limit);
         assert_eq!(
-            strategy.concurrency_limit,
-            custom_limit,
+            strategy.concurrency_limit, custom_limit,
             "Custom concurrency limit should be set correctly"
         );
     }
@@ -492,9 +493,8 @@ mod cleanup_tests {
     fn test_expired_snapshot_detection_scenarios() {
         let table = make_v2_table_with_multi_snapshot();
         let before_metadata = table.metadata_ref();
-        let strategy = ReachableFileCleanupStrategy::new(
-            FileIOBuilder::new("memory").build().unwrap(),
-        );
+        let strategy =
+            ReachableFileCleanupStrategy::new(FileIOBuilder::new("memory").build().unwrap());
 
         let mut all_snapshot_ids: Vec<i64> = before_metadata
             .snapshots()
@@ -514,13 +514,11 @@ mod cleanup_tests {
             "After-metadata should retain the non-expired snapshots only"
         );
 
-        let (expired_snapshots, manifest_lists_to_delete) = strategy
-            .collect_expired_snapshots(&before_metadata, &after_with_expired);
+        let (expired_snapshots, manifest_lists_to_delete) =
+            strategy.collect_expired_snapshots(&before_metadata, &after_with_expired);
 
-        let expired_ids_found: HashSet<_> = expired_snapshots
-            .iter()
-            .map(|s| s.snapshot_id())
-            .collect();
+        let expired_ids_found: HashSet<_> =
+            expired_snapshots.iter().map(|s| s.snapshot_id()).collect();
 
         assert_eq!(
             expired_ids_found.len(),
@@ -533,8 +531,7 @@ mod cleanup_tests {
             "Each expired snapshot must contribute one manifest list"
         );
         assert_eq!(
-            expired_ids_found,
-            expired_ids,
+            expired_ids_found, expired_ids,
             "Expired snapshot IDs should be identified precisely"
         );
         for snapshot in &expired_snapshots {
@@ -558,12 +555,11 @@ mod cleanup_tests {
             "Snapshots retained in after-metadata must not be marked expired"
         );
 
-        let (no_expired, no_manifest_lists) = strategy
-            .collect_expired_snapshots(&before_metadata, &before_metadata);
+        let (no_expired, no_manifest_lists) =
+            strategy.collect_expired_snapshots(&before_metadata, &before_metadata);
         assert!(
             no_expired.is_empty() && no_manifest_lists.is_empty(),
             "When after-metadata keeps all snapshots, expired collections should be empty"
         );
     }
-
 }

@@ -25,7 +25,7 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::utils::{ReachableFileCleanupStrategy, DEFAULT_DELETE_CONCURRENCY_LIMIT};
+use crate::utils::{DEFAULT_DELETE_CONCURRENCY_LIMIT, ReachableFileCleanupStrategy};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -250,12 +250,12 @@ impl Table {
     ///
     /// Compares metadata before and after snapshot expiration to identify and delete
     /// unreachable files (manifest lists, manifests, and data files).
-    pub async fn cleanup_expired_files(
-        &self,
-        before_metadata: &TableMetadataRef,
-    ) -> Result<()> {
-        self.cleanup_expired_files_with_concurrency(before_metadata, DEFAULT_DELETE_CONCURRENCY_LIMIT)
-            .await
+    pub async fn cleanup_expired_files(&self, before_metadata: &TableMetadataRef) -> Result<()> {
+        self.cleanup_expired_files_with_concurrency(
+            before_metadata,
+            DEFAULT_DELETE_CONCURRENCY_LIMIT,
+        )
+        .await
     }
 
     /// Cleans up files from expired snapshots with configurable concurrency.
