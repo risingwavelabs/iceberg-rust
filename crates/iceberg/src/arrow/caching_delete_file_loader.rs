@@ -963,6 +963,9 @@ mod tests {
             sequence_number: 0,
             equality_ids: None,
             file_size_in_bytes: 0,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let eq_del_scan_task = FileScanTask {
@@ -979,6 +982,9 @@ mod tests {
             sequence_number: 0,
             equality_ids: eq_del.equality_ids.clone(),
             file_size_in_bytes: 0,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let file_scan_task = FileScanTask {
@@ -995,6 +1001,9 @@ mod tests {
             data_file_content: DataContentType::Data,
             equality_ids: None,
             file_size_in_bytes: 0,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         // Load the deletes - should handle both types without error

@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::expr::BoundPredicate;
-use crate::spec::{DataContentType, DataFileFormat, ManifestEntryRef, Schema, SchemaRef};
+use crate::spec::{
+    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    SchemaRef, Struct,
+};
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
@@ -57,8 +60,6 @@ pub struct FileScanTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predicate: Option<BoundPredicate>,
 
-    /// The list of delete files that may need to be applied to this data file
-    pub deletes: Vec<Arc<FileScanTask>>,
     /// sequence number
     pub sequence_number: i64,
     /// equality ids
@@ -66,6 +67,30 @@ pub struct FileScanTask {
 
     /// The size of the file in bytes.
     pub file_size_in_bytes: u64,
+
+    /// The list of delete files that may need to be applied to this data file
+    pub deletes: Vec<Arc<FileScanTask>>,
+
+    /// Partition data from the manifest entry, used to identify which columns can use
+    /// constant values from partition metadata vs. reading from the data file.
+    /// Per the Iceberg spec, only identity-transformed partition fields should use constants.
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub partition: Option<Struct>,
+
+    /// The partition spec for this file, used to distinguish identity transforms
+    /// (which use partition metadata constants) from non-identity transforms like
+    /// bucket/truncate (which must read source columns from the data file).
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub partition_spec: Option<Arc<PartitionSpec>>,
+
+    /// Name mapping from table metadata (property: schema.name-mapping.default),
+    /// used to resolve field IDs from column names when Parquet files lack field IDs
+    /// or have field ID conflicts.
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
+    pub name_mapping: Option<Arc<NameMapping>>,
 }
 
 impl FileScanTask {
@@ -146,6 +171,10 @@ impl From<&DeleteFileContext> for FileScanTask {
             sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
             equality_ids: ctx.manifest_entry.data_file().equality_ids(),
             file_size_in_bytes: ctx.manifest_entry.data_file().file_size_in_bytes(),
+
+            partition: Some(ctx.manifest_entry.data_file().partition().clone()),
+            partition_spec: None, // TODO: pass through partition spec info
+            name_mapping: None,   // TODO: implement name mapping
         }
     }
 }
