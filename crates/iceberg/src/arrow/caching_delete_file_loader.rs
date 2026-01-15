@@ -26,13 +26,11 @@ use tokio::sync::oneshot::{Receiver, channel};
 use super::delete_filter::DeleteFilter;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
-use crate::delete_vector::{
-    DeleteVector, DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
-};
+use crate::delete_vector::{DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE, DeleteVector};
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Predicate, Reference};
 use crate::io::{FileIO, InputFile};
-use crate::puffin::{PuffinReader, DELETION_VECTOR_V1};
+use crate::puffin::{DELETION_VECTOR_V1, PuffinReader};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask};
 use crate::spec::{
     DataContentType, DataFileFormat, Datum, ListType, MapType, NestedField, NestedFieldRef,
@@ -227,8 +225,7 @@ impl CachingDeleteFileLoader {
                         ));
                     }
                     Ok(DeleteFileContext::DelVec {
-                        input_file: basic_delete_file_loader
-                            .input_file(task.data_file_path())?,
+                        input_file: basic_delete_file_loader.input_file(task.data_file_path())?,
                         blob_offset: task.start,
                         blob_length: task.length,
                     })
@@ -380,10 +377,7 @@ impl CachingDeleteFileLoader {
         if blob_metadata.blob_type() != DELETION_VECTOR_V1 {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "unexpected puffin blob type: {}",
-                    blob_metadata.blob_type()
-                ),
+                format!("unexpected puffin blob type: {}", blob_metadata.blob_type()),
             ));
         }
 

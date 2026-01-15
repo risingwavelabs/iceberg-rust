@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use crate::delete_vector::{
-    DeleteVector, DELETION_VECTOR_PROPERTY_CARDINALITY,
-    DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
+    DELETION_VECTOR_PROPERTY_CARDINALITY, DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
+    DeleteVector,
 };
 use crate::io::FileIO;
 use crate::puffin::{CompressionCodec, PuffinWriter};

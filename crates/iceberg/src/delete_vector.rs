@@ -178,21 +178,18 @@ impl DeleteVector {
         if expected_crc != stored_crc {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "deletion vector crc mismatch: expected {expected_crc}, got {stored_crc}"
-                ),
+                format!("deletion vector crc mismatch: expected {expected_crc}, got {stored_crc}"),
             ));
         }
 
-        let bitmap = RoaringTreemap::deserialize_from(&mut Cursor::new(bitmap_data)).map_err(
-            |err| {
+        let bitmap =
+            RoaringTreemap::deserialize_from(&mut Cursor::new(bitmap_data)).map_err(|err| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     "failed to deserialize deletion vector bitmap".to_string(),
                 )
                 .with_source(err)
-            },
-        )?;
+            })?;
 
         Ok(DeleteVector::new(bitmap))
     }
