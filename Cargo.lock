@@ -3514,6 +3514,7 @@ dependencies = [
  "bimap",
  "bytes",
  "chrono",
+ "crc32fast",
  "ctor",
  "derive_builder",
  "expect-test",
