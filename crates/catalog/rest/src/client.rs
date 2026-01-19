@@ -26,8 +26,8 @@ use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
-use crate::{GCP_CLOUD_PLATFORM_SCOPE, GOOG_USER_PROJECT_HEADER, RestCatalogConfig};
 use crate::types::{ErrorResponse, TokenResponse};
+use crate::{GCP_CLOUD_PLATFORM_SCOPE, GOOG_USER_PROJECT_HEADER, RestCatalogConfig};
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -61,7 +61,7 @@ impl HttpClient {
     /// Create a new http client.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
         let mut extra_headers = cfg.extra_headers()?;
-        
+
         // Add x-goog-user-project header if GCP service account is configured
         if let Some(project_id) = cfg.gcp_project_id() {
             extra_headers.insert(
@@ -75,7 +75,7 @@ impl HttpClient {
                 })?,
             );
         }
-        
+
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
             token: Mutex::new(cfg.token()),
@@ -96,7 +96,7 @@ impl HttpClient {
             .then(|| cfg.extra_headers())
             .transpose()?
             .unwrap_or(self.extra_headers);
-        
+
         // Add x-goog-user-project header if GCP service account is configured
         if let Some(project_id) = cfg.gcp_project_id() {
             extra_headers.insert(
@@ -110,7 +110,7 @@ impl HttpClient {
                 })?,
             );
         }
-        
+
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
             token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
@@ -221,25 +221,15 @@ impl HttpClient {
         // Use gcp_auth library to handle authentication
         let service_account = gcp_auth::CustomServiceAccount::from_json(service_account_json)
             .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Invalid GCP service account JSON",
-                )
-                .with_source(e)
+                Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
+                    .with_source(e)
             })?;
 
         // Get access token with cloud-platform scope
         let scopes = &[GCP_CLOUD_PLATFORM_SCOPE];
-        let token = service_account
-            .token(scopes)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to get GCP access token",
-                )
-                .with_source(e)
-            })?;
+        let token = service_account.token(scopes).await.map_err(|e| {
+            Error::new(ErrorKind::Unexpected, "Failed to get GCP access token").with_source(e)
+        })?;
 
         Ok(token.as_str().to_string())
     }
