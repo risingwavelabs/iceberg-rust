@@ -55,6 +55,21 @@ const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
 
+/// Google Cloud Storage credentials JSON string, base64 encoded.
+///
+/// E.g. base64::prelude::BASE64_STANDARD.encode(serde_json::to_string(credential).as_bytes())
+pub const GCS_CREDENTIALS_JSON: &str = "gcs.credentials-json";
+
+/// HTTP header name for specifying the GCP project for billing/quota purposes.
+/// Required by BigLake and other GCP APIs.
+pub(crate) const GOOG_USER_PROJECT_HEADER: &str = "x-goog-user-project";
+
+/// JSON field name for extracting project ID from GCP service account JSON.
+pub(crate) const GCP_PROJECT_ID_FIELD: &str = "project_id";
+
+/// OAuth2 scope for Google Cloud Platform API access.
+pub(crate) const GCP_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+
 /// Builder for [`RestCatalog`].
 #[derive(Debug)]
 pub struct RestCatalogBuilder(RestCatalogConfig);
@@ -296,9 +311,25 @@ impl RestCatalogConfig {
     /// Get the GCP service account JSON from the config for BigLake authentication.
     ///
     /// Looks for `gcp.service-account` property which should contain the JSON
-    /// content of a service account key file.
+    /// content of a service account key file, or a base64-encoded JSON string.
     pub(crate) fn gcp_service_account(&self) -> Option<String> {
-        self.props.get("gcp.service-account").cloned()
+        let value = self.props.get(GCS_CREDENTIALS_JSON)?;
+        
+        // Try to decode as base64 first
+        if let Ok(decoded) = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            value.as_bytes(),
+        ) {
+            if let Ok(json_str) = String::from_utf8(decoded) {
+                // Validate it's valid JSON
+                if serde_json::from_str::<serde_json::Value>(&json_str).is_ok() {
+                    return Some(json_str);
+                }
+            }
+        }
+        
+        // Fall back to treating it as plain JSON
+        Some(value.clone())
     }
 
     /// Extract the GCP project ID from the service account JSON.
@@ -307,7 +338,7 @@ impl RestCatalogConfig {
     pub(crate) fn gcp_project_id(&self) -> Option<String> {
         let sa_json = self.gcp_service_account()?;
         let parsed: serde_json::Value = serde_json::from_str(&sa_json).ok()?;
-        parsed.get("project_id")?.as_str().map(String::from)
+        parsed.get(GCP_PROJECT_ID_FIELD)?.as_str().map(String::from)
     }
 
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).

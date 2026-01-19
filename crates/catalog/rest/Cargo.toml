@@ -30,6 +30,7 @@ repository = { workspace = true }
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = "0.22"
 chrono = { workspace = true }
 gcp_auth = "0.12"
 http = { workspace = true }

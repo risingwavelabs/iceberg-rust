@@ -26,7 +26,7 @@ use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
-use crate::RestCatalogConfig;
+use crate::{GCP_CLOUD_PLATFORM_SCOPE, GOOG_USER_PROJECT_HEADER, RestCatalogConfig};
 use crate::types::{ErrorResponse, TokenResponse};
 
 pub(crate) struct HttpClient {
@@ -65,7 +65,7 @@ impl HttpClient {
         // Add x-goog-user-project header if GCP service account is configured
         if let Some(project_id) = cfg.gcp_project_id() {
             extra_headers.insert(
-                HeaderName::from_static("x-goog-user-project"),
+                HeaderName::from_static(GOOG_USER_PROJECT_HEADER),
                 HeaderValue::from_str(&project_id).map_err(|e| {
                     Error::new(
                         ErrorKind::DataInvalid,
@@ -100,7 +100,7 @@ impl HttpClient {
         // Add x-goog-user-project header if GCP service account is configured
         if let Some(project_id) = cfg.gcp_project_id() {
             extra_headers.insert(
-                HeaderName::from_static("x-goog-user-project"),
+                HeaderName::from_static(GOOG_USER_PROJECT_HEADER),
                 HeaderValue::from_str(&project_id).map_err(|e| {
                     Error::new(
                         ErrorKind::DataInvalid,
@@ -229,7 +229,7 @@ impl HttpClient {
             })?;
 
         // Get access token with cloud-platform scope
-        let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
+        let scopes = &[GCP_CLOUD_PLATFORM_SCOPE];
         let token = service_account
             .token(scopes)
             .await
