@@ -21,13 +21,13 @@ use std::fmt::{Debug, Formatter};
 use gcp_auth::TokenProvider;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::types::{ErrorResponse, TokenResponse};
-use crate::{GCP_CLOUD_PLATFORM_SCOPE, GOOG_USER_PROJECT_HEADER, RestCatalogConfig};
+use crate::{GCP_CLOUD_PLATFORM_SCOPE, RestCatalogConfig};
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -60,30 +60,14 @@ impl Debug for HttpClient {
 impl HttpClient {
     /// Create a new http client.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
-        let mut extra_headers = cfg.extra_headers()?;
-
-        // Add x-goog-user-project header if GCP service account is configured
-        if let Some(project_id) = cfg.gcp_project_id() {
-            extra_headers.insert(
-                HeaderName::from_static(GOOG_USER_PROJECT_HEADER),
-                HeaderValue::from_str(&project_id).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid GCP project ID: {project_id}"),
-                    )
-                    .with_source(e)
-                })?,
-            );
-        }
-
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
             token: Mutex::new(cfg.token()),
             token_endpoint: cfg.get_token_endpoint(),
             credential: cfg.credential(),
-            extra_headers,
+            extra_headers: cfg.extra_headers()?,
             extra_oauth_params: cfg.extra_oauth_params(),
-            gcp_service_account: cfg.gcp_service_account(),
+            gcp_service_account: cfg.gcp_credential(),
         })
     }
 
@@ -92,24 +76,10 @@ impl HttpClient {
     /// If cfg carries new value, we will use cfg instead.
     /// Otherwise, we will keep the old value.
     pub fn update_with(self, cfg: &RestCatalogConfig) -> Result<Self> {
-        let mut extra_headers = (!cfg.extra_headers()?.is_empty())
+        let extra_headers = (!cfg.extra_headers()?.is_empty())
             .then(|| cfg.extra_headers())
             .transpose()?
             .unwrap_or(self.extra_headers);
-
-        // Add x-goog-user-project header if GCP service account is configured
-        if let Some(project_id) = cfg.gcp_project_id() {
-            extra_headers.insert(
-                HeaderName::from_static(GOOG_USER_PROJECT_HEADER),
-                HeaderValue::from_str(&project_id).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid GCP project ID: {project_id}"),
-                    )
-                    .with_source(e)
-                })?,
-            );
-        }
 
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
@@ -126,7 +96,7 @@ impl HttpClient {
             } else {
                 self.extra_oauth_params
             },
-            gcp_service_account: cfg.gcp_service_account().or(self.gcp_service_account),
+            gcp_service_account: cfg.gcp_credential().or(self.gcp_service_account),
         })
     }
 

@@ -60,13 +60,6 @@ const PATH_V1: &str = "v1";
 /// E.g. base64::prelude::BASE64_STANDARD.encode(serde_json::to_string(credential).as_bytes())
 pub const GCS_CREDENTIALS_JSON: &str = "gcs.credentials-json";
 
-/// HTTP header name for specifying the GCP project for billing/quota purposes.
-/// Required by BigLake and other GCP APIs.
-pub(crate) const GOOG_USER_PROJECT_HEADER: &str = "x-goog-user-project";
-
-/// JSON field name for extracting project ID from GCP service account JSON.
-pub(crate) const GCP_PROJECT_ID_FIELD: &str = "project_id";
-
 /// OAuth2 scope for Google Cloud Platform API access.
 pub(crate) const GCP_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
@@ -312,7 +305,7 @@ impl RestCatalogConfig {
     ///
     /// Looks for `gcp.service-account` property which should contain the JSON
     /// content of a service account key file, or a base64-encoded JSON string.
-    pub(crate) fn gcp_service_account(&self) -> Option<String> {
+    pub(crate) fn gcp_credential(&self) -> Option<String> {
         let value = self.props.get(GCS_CREDENTIALS_JSON)?;
 
         // Try to decode as base64 first
@@ -329,15 +322,6 @@ impl RestCatalogConfig {
 
         // Fall back to treating it as plain JSON
         Some(value.clone())
-    }
-
-    /// Extract the GCP project ID from the service account JSON.
-    ///
-    /// This is used to populate the `x-goog-user-project` header required by BigLake API.
-    pub(crate) fn gcp_project_id(&self) -> Option<String> {
-        let sa_json = self.gcp_service_account()?;
-        let parsed: serde_json::Value = serde_json::from_str(&sa_json).ok()?;
-        parsed.get(GCP_PROJECT_ID_FIELD)?.as_str().map(String::from)
     }
 
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
@@ -780,9 +764,26 @@ impl Catalog for RestCatalog {
 
         let http_response = context.client.query_catalog(request).await?;
 
-        let response = match http_response.status() {
+        // Debug: Print raw response body
+        let status = http_response.status();
+        let headers = http_response.headers().clone();
+        let body_bytes = http_response.bytes().await?;
+        println!("=== Load Table Response ===");
+        println!("Status: {:?}", status);
+        println!("Headers: {:?}", headers);
+        println!("Body: {}", String::from_utf8_lossy(&body_bytes));
+        println!("=========================");
+
+        let response = match status {
             StatusCode::OK | StatusCode::NOT_MODIFIED => {
-                deserialize_catalog_response::<LoadTableResponse>(http_response).await?
+                serde_json::from_slice::<LoadTableResponse>(&body_bytes).map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to parse response from rest catalog server",
+                    )
+                    .with_context("json", String::from_utf8_lossy(&body_bytes))
+                    .with_source(e)
+                })?
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
@@ -790,7 +791,14 @@ impl Catalog for RestCatalog {
                     "Tried to load a table that does not exist",
                 ));
             }
-            _ => return Err(deserialize_unexpected_catalog_error(http_response).await),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Received response with unexpected status code",
+                )
+                .with_context("status", status.to_string())
+                .with_context("body", String::from_utf8_lossy(&body_bytes)));
+            }
         };
 
         let config = response
