@@ -45,7 +45,7 @@ pub(crate) struct HttpClient {
     /// Extra oauth parameters to be added to each authentication request.
     extra_oauth_params: HashMap<String, String>,
     /// GCP service account JSON for authentication.
-    gcp_service_account: Option<String>,
+    gcp_credential: Option<String>,
 }
 
 impl Debug for HttpClient {
@@ -67,7 +67,7 @@ impl HttpClient {
             credential: cfg.credential(),
             extra_headers: cfg.extra_headers()?,
             extra_oauth_params: cfg.extra_oauth_params(),
-            gcp_service_account: cfg.gcp_credential(),
+            gcp_credential: cfg.gcp_credential(),
         })
     }
 
@@ -96,7 +96,7 @@ impl HttpClient {
             } else {
                 self.extra_oauth_params
             },
-            gcp_service_account: cfg.gcp_credential().or(self.gcp_service_account),
+            gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
         })
     }
 
@@ -180,8 +180,8 @@ impl HttpClient {
     }
 
     /// Exchange GCP service account for access token using gcp_auth library.
-    async fn exchange_gcp_service_account_for_token(&self) -> Result<String> {
-        let service_account_json = self.gcp_service_account.as_ref().ok_or_else(|| {
+    async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
+        let service_account_json = self.gcp_credential.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 "GCP service account must be provided for authentication",
@@ -240,7 +240,7 @@ impl HttpClient {
         // Clone the token from lock without holding the lock for entire function.
         let token = self.token.lock().await.clone();
 
-        if self.credential.is_none() && token.is_none() && self.gcp_service_account.is_none() {
+        if self.credential.is_none() && token.is_none() && self.gcp_credential.is_none() {
             return Ok(());
         }
 
@@ -248,8 +248,8 @@ impl HttpClient {
         let token = match token {
             Some(token) => token,
             None => {
-                let token = if self.gcp_service_account.is_some() {
-                    self.exchange_gcp_service_account_for_token().await?
+                let token = if self.gcp_credential.is_some() {
+                    self.exchange_gcp_credential_for_token().await?
                 } else {
                     self.exchange_credential_for_token().await?
                 };
