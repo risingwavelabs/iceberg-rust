@@ -756,7 +756,6 @@ impl Catalog for RestCatalog {
     /// provided locally to the `RestCatalog` will take precedence.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let context = self.context().await?;
-
         let request = context
             .client
             .request(Method::GET, context.config.table_endpoint(table_ident))
@@ -764,26 +763,9 @@ impl Catalog for RestCatalog {
 
         let http_response = context.client.query_catalog(request).await?;
 
-        // Debug: Print raw response body
-        let status = http_response.status();
-        let headers = http_response.headers().clone();
-        let body_bytes = http_response.bytes().await?;
-        println!("=== Load Table Response ===");
-        println!("Status: {:?}", status);
-        println!("Headers: {:?}", headers);
-        println!("Body: {}", String::from_utf8_lossy(&body_bytes));
-        println!("=========================");
-
-        let response = match status {
+        let response = match http_response.status() {
             StatusCode::OK | StatusCode::NOT_MODIFIED => {
-                serde_json::from_slice::<LoadTableResponse>(&body_bytes).map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to parse response from rest catalog server",
-                    )
-                    .with_context("json", String::from_utf8_lossy(&body_bytes))
-                    .with_source(e)
-                })?
+                deserialize_catalog_response::<LoadTableResponse>(http_response).await?
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
@@ -791,14 +773,7 @@ impl Catalog for RestCatalog {
                     "Tried to load a table that does not exist",
                 ));
             }
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Received response with unexpected status code",
-                )
-                .with_context("status", status.to_string())
-                .with_context("body", String::from_utf8_lossy(&body_bytes)));
-            }
+            _ => return Err(deserialize_unexpected_catalog_error(http_response).await),
         };
 
         let config = response
