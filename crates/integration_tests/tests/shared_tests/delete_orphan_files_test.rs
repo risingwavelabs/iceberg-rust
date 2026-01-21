@@ -99,7 +99,7 @@ fn future_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-        + 3600_000
+        + 3_600_000
 }
 
 /// Creates an orphan file at the given path.
@@ -207,7 +207,7 @@ async fn test_older_than_threshold() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-        - 3600_000;
+        - 3_600_000;
 
     let result = DeleteOrphanFilesAction::new(table.clone())
         .older_than_ms(past_ts)
