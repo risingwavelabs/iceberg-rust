@@ -177,45 +177,12 @@ impl FileIO {
         Ok(op.exists(relative_path).await?)
     }
 
-    /// List files/directories under the given path.
-    ///
-    /// Returns a [`BoxStream`] that yields entries lazily, avoiding loading all
-    /// entries into memory at once. This is memory-efficient for directories
-    /// with many files.
+    /// Lists files and directories under the given path as a stream.
     ///
     /// # Arguments
     ///
     /// * `path`: Absolute path starting with scheme string used to construct [`FileIO`].
     /// * `recursive`: If `true`, list all files recursively; otherwise list only direct children.
-    ///
-    /// # Returns
-    ///
-    /// A stream of [`ListEntry`] where each entry's `path` is an absolute path that can be
-    /// directly passed to other [`FileIO`] methods like `delete()` or `new_input()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the path is invalid or the underlying storage operation fails.
-    /// Individual entries in the stream may also yield errors if listing encounters issues.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use futures::TryStreamExt;
-    ///
-    /// // List direct children only
-    /// let mut stream = file_io.list("s3://bucket/path/", false).await?;
-    /// while let Some(entry) = stream.try_next().await? {
-    ///     println!("{}", entry.path);
-    /// }
-    ///
-    /// // List recursively and collect
-    /// let entries: Vec<ListEntry> = file_io
-    ///     .list("s3://bucket/table/", true)
-    ///     .await?
-    ///     .try_collect()
-    ///     .await?;
-    /// ```
     pub async fn list(
         &self,
         path: impl AsRef<str>,
