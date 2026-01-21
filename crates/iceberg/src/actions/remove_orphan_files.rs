@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Delete orphan files action.
+//! Remove orphan files action.
 //!
 //! Removes files under the table location that are not referenced by any snapshot
 //! or table metadata. Files without a `last_modified` timestamp are skipped to
@@ -42,13 +42,13 @@ const DEFAULT_DELETE_CONCURRENCY: usize = 10;
 /// Action to delete orphan files from a table's location.
 ///
 /// ```ignore
-/// let orphan_files = DeleteOrphanFilesAction::new(table)
+/// let orphan_files = RemoveOrphanFilesAction::new(table)
 ///     .older_than(Duration::from_secs(3600))
 ///     .dry_run(true)
 ///     .execute()
 ///     .await?;
 /// ```
-pub struct DeleteOrphanFilesAction {
+pub struct RemoveOrphanFilesAction {
     table: Table,
     older_than_ms: i64,
     dry_run: bool,
@@ -56,7 +56,7 @@ pub struct DeleteOrphanFilesAction {
     delete_concurrency: usize,
 }
 
-impl DeleteOrphanFilesAction {
+impl RemoveOrphanFilesAction {
     /// Creates a new delete orphan files action for the given table.
     pub fn new(table: Table) -> Self {
         let now_ms = std::time::SystemTime::now()
@@ -140,7 +140,7 @@ impl DeleteOrphanFilesAction {
             return Ok(orphan_files);
         }
 
-        // Delete orphan files concurrently
+        // Remove orphan files concurrently
         stream::iter(&orphan_files)
             .map(|path| {
                 let file_io = file_io.clone();

@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
-use iceberg::actions::DeleteOrphanFilesAction;
+use iceberg::actions::RemoveOrphanFilesAction;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -139,7 +139,7 @@ async fn test_dry_run_and_delete() {
     create_orphan_file(&table, &orphan_path).await;
 
     // Dry run: find but don't delete
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(future_timestamp())
         .dry_run(true)
         .execute()
@@ -157,7 +157,7 @@ async fn test_dry_run_and_delete() {
     );
 
     // Actual delete
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(future_timestamp())
         .dry_run(false)
         .execute()
@@ -209,7 +209,7 @@ async fn test_older_than_threshold() {
         .as_millis() as i64
         - 3_600_000;
 
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(past_ts)
         .dry_run(true)
         .execute()
@@ -222,7 +222,7 @@ async fn test_older_than_threshold() {
     );
 
     // Future threshold: should find orphan
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(future_timestamp())
         .dry_run(true)
         .execute()
@@ -269,7 +269,7 @@ async fn test_preserves_metadata_files() {
         .await
         .unwrap();
 
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(future_timestamp())
         .dry_run(true)
         .execute()
@@ -347,7 +347,7 @@ async fn test_after_expire_snapshots() {
 
     assert_eq!(table.metadata().snapshots().count(), 1);
 
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(future_timestamp())
         .dry_run(true)
         .execute()
@@ -480,7 +480,7 @@ async fn test_after_rewrite() {
         .unwrap();
     table = tx.commit(&catalog).await.unwrap();
 
-    let result = DeleteOrphanFilesAction::new(table.clone())
+    let result = RemoveOrphanFilesAction::new(table.clone())
         .older_than_ms(future_timestamp())
         .dry_run(true)
         .execute()

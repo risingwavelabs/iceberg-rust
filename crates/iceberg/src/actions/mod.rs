@@ -20,6 +20,6 @@
 //! This module provides actions for table maintenance operations that do not
 //! modify table metadata, such as cleaning up orphan files.
 
-mod delete_orphan_files;
+mod remove_orphan_files;
 
-pub use delete_orphan_files::*;
+pub use remove_orphan_files::*;

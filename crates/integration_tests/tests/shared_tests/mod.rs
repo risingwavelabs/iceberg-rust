@@ -27,7 +27,7 @@ mod append_data_file_test;
 mod append_partition_data_file_test;
 mod conflict_commit_test;
 mod datafusion;
-mod delete_orphan_files_test;
+mod remove_orphan_files_test;
 mod merge_append_test;
 mod overwrite_files_test;
 mod read_evolved_schema;
@@ -35,6 +35,7 @@ mod read_positional_deletes;
 mod remove_snapshots_test;
 mod rewrite_files_test;
 mod scan_all_type;
+
 
 pub async fn random_ns() -> Namespace {
     let fixture = get_shared_containers();
