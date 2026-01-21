@@ -41,7 +41,12 @@ async fn write_data_files(
     prefix: &str,
 ) -> Vec<String> {
     let schema: Arc<arrow_schema::Schema> = Arc::new(
-        table.metadata().current_schema().as_ref().try_into().unwrap(),
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
     );
     let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
     let file_name_gen = DefaultFileNameGenerator::new(
@@ -73,10 +78,17 @@ async fn write_data_files(
 
     writer.write(batch).await.unwrap();
     let data_files = writer.close().await.unwrap();
-    let paths: Vec<String> = data_files.iter().map(|f| f.file_path().to_string()).collect();
+    let paths: Vec<String> = data_files
+        .iter()
+        .map(|f| f.file_path().to_string())
+        .collect();
 
     let tx = Transaction::new(table);
-    let tx = tx.fast_append().add_data_files(data_files).apply(tx).unwrap();
+    let tx = tx
+        .fast_append()
+        .add_data_files(data_files)
+        .apply(tx)
+        .unwrap();
     *table = tx.commit(catalog).await.unwrap();
 
     paths
@@ -135,8 +147,14 @@ async fn test_dry_run_and_delete() {
         .unwrap();
 
     assert!(result.contains(&orphan_path), "Should find orphan file");
-    assert!(!result.iter().any(|p| valid_files.contains(p)), "Valid files not orphan");
-    assert!(table.file_io().exists(&orphan_path).await.unwrap(), "Orphan still exists");
+    assert!(
+        !result.iter().any(|p| valid_files.contains(p)),
+        "Valid files not orphan"
+    );
+    assert!(
+        table.file_io().exists(&orphan_path).await.unwrap(),
+        "Orphan still exists"
+    );
 
     // Actual delete
     let result = DeleteOrphanFilesAction::new(table.clone())
@@ -147,9 +165,15 @@ async fn test_dry_run_and_delete() {
         .unwrap();
 
     assert!(result.contains(&orphan_path), "Should have deleted orphan");
-    assert!(!table.file_io().exists(&orphan_path).await.unwrap(), "Orphan deleted");
+    assert!(
+        !table.file_io().exists(&orphan_path).await.unwrap(),
+        "Orphan deleted"
+    );
     for f in &valid_files {
-        assert!(table.file_io().exists(f).await.unwrap(), "Valid file preserved");
+        assert!(
+            table.file_io().exists(f).await.unwrap(),
+            "Valid file preserved"
+        );
     }
 }
 
@@ -192,7 +216,10 @@ async fn test_older_than_threshold() {
         .await
         .unwrap();
 
-    assert!(!result.contains(&orphan_path), "Should not find new orphan with past threshold");
+    assert!(
+        !result.contains(&orphan_path),
+        "Should not find new orphan with past threshold"
+    );
 
     // Future threshold: should find orphan
     let result = DeleteOrphanFilesAction::new(table.clone())
@@ -202,7 +229,10 @@ async fn test_older_than_threshold() {
         .await
         .unwrap();
 
-    assert!(result.contains(&orphan_path), "Should find orphan with future threshold");
+    assert!(
+        result.contains(&orphan_path),
+        "Should find orphan with future threshold"
+    );
 }
 
 #[tokio::test]
@@ -232,7 +262,10 @@ async fn test_preserves_metadata_files() {
     }
 
     let table = catalog
-        .load_table(&iceberg::TableIdent::new(ns.name().clone(), "t3".to_string()))
+        .load_table(&iceberg::TableIdent::new(
+            ns.name().clone(),
+            "t3".to_string(),
+        ))
         .await
         .unwrap();
 
@@ -250,12 +283,18 @@ async fn test_preserves_metadata_files() {
         assert!(!orphan_set.contains(loc), "Current metadata not orphan");
     }
     for log in table.metadata().metadata_log() {
-        assert!(!orphan_set.contains(&log.metadata_file), "Historical metadata not orphan");
+        assert!(
+            !orphan_set.contains(&log.metadata_file),
+            "Historical metadata not orphan"
+        );
     }
 
     // Verify manifest lists NOT orphan
     for snap in table.metadata().snapshots() {
-        assert!(!orphan_set.contains(snap.manifest_list()), "Manifest list not orphan");
+        assert!(
+            !orphan_set.contains(snap.manifest_list()),
+            "Manifest list not orphan"
+        );
     }
 
     // Verify data files NOT orphan
@@ -317,9 +356,16 @@ async fn test_after_expire_snapshots() {
 
     let orphan_set: HashSet<_> = result.into_iter().collect();
 
-    assert!(!orphan_set.contains(&current_ml), "Current manifest list not orphan");
+    assert!(
+        !orphan_set.contains(&current_ml),
+        "Current manifest list not orphan"
+    );
     for ml in &expired_mls {
-        assert!(orphan_set.contains(ml), "Expired manifest list should be orphan: {}", ml);
+        assert!(
+            orphan_set.contains(ml),
+            "Expired manifest list should be orphan: {}",
+            ml
+        );
     }
 }
 
@@ -345,7 +391,12 @@ async fn test_after_rewrite() {
 
     write_data_files(&mut table, &catalog, "initial").await;
 
-    let first_ml = table.metadata().current_snapshot().unwrap().manifest_list().to_string();
+    let first_ml = table
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .manifest_list()
+        .to_string();
     let first_manifest_list = table
         .metadata()
         .current_snapshot()
@@ -372,7 +423,12 @@ async fn test_after_rewrite() {
 
     // Write new files and rewrite
     let schema: Arc<arrow_schema::Schema> = Arc::new(
-        table.metadata().current_schema().as_ref().try_into().unwrap(),
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
     );
     let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
     let file_name_gen = DefaultFileNameGenerator::new(
@@ -434,10 +490,17 @@ async fn test_after_rewrite() {
     let orphan_set: HashSet<_> = result.into_iter().collect();
 
     // First manifest-list should be orphan
-    assert!(orphan_set.contains(&first_ml), "First manifest-list should be orphan");
+    assert!(
+        orphan_set.contains(&first_ml),
+        "First manifest-list should be orphan"
+    );
 
     // First manifests should be orphan
     for m in &first_manifests {
-        assert!(orphan_set.contains(m), "First manifest should be orphan: {}", m);
+        assert!(
+            orphan_set.contains(m),
+            "First manifest should be orphan: {}",
+            m
+        );
     }
 }
