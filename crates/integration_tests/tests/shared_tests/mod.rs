@@ -27,6 +27,7 @@ mod append_data_file_test;
 mod append_partition_data_file_test;
 mod conflict_commit_test;
 mod datafusion;
+mod delete_orphan_files_test;
 mod merge_append_test;
 mod overwrite_files_test;
 mod read_evolved_schema;
@@ -58,7 +59,7 @@ pub async fn random_ns() -> Namespace {
     ns
 }
 
-fn test_schema() -> Schema {
+pub fn test_schema() -> Schema {
     Schema::builder()
         .with_schema_id(1)
         .with_identifier_field_ids(vec![2])

@@ -21,6 +21,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use opendal::Operator;
 use url::Url;
 
@@ -141,6 +142,59 @@ impl FileIO {
     pub async fn exists(&self, path: impl AsRef<str>) -> Result<bool> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.exists(relative_path).await?)
+    }
+
+    /// List files/directories directly under the given path.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    pub async fn list(&self, path: impl AsRef<str>) -> Result<Vec<ListEntry>> {
+        self.list_internal(path, false).await
+    }
+
+    /// Recursively list files/directories under the given path.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    pub async fn list_recursive(&self, path: impl AsRef<str>) -> Result<Vec<ListEntry>> {
+        self.list_internal(path, true).await
+    }
+
+    async fn list_internal(&self, path: impl AsRef<str>, recursive: bool) -> Result<Vec<ListEntry>> {
+        let path_str = path.as_ref();
+        let (op, relative_path) = self.inner.create_operator(&path)?;
+
+        // Calculate the absolute prefix: path_str without the relative_path suffix.
+        // Example: "s3://bucket/data/subdir" - "data/subdir" = "s3://bucket/"
+        let absolute_prefix = &path_str[..path_str.len() - relative_path.len()];
+
+        // Ensure path ends with '/' for directory listing
+        let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
+            relative_path
+        } else {
+            &format!("{}/", relative_path)
+        };
+
+        // OpenDAL's list_with returns Entry objects that already contain metadata
+        // (mode, content_length, last_modified) from the list response.
+        let entries_list = op.list_with(list_path).recursive(recursive).await?;
+
+        Ok(entries_list
+            .into_iter()
+            .map(|entry| {
+                let meta = entry.metadata();
+                ListEntry {
+                    path: format!("{}{}", absolute_prefix, entry.path()),
+                    metadata: FileMetadata {
+                        size: meta.content_length(),
+                        last_modified_ms: meta.last_modified().map(datetime_to_millis),
+                        is_dir: meta.is_dir(),
+                    },
+                }
+            })
+            .collect())
     }
 
     /// Creates input file.
@@ -316,12 +370,22 @@ impl FileIOBuilder {
     }
 }
 
-/// The struct the represents the metadata of a file.
-///
-/// TODO: we can add last modified time, content type, etc. in the future.
+/// The struct that represents the metadata of a file.
 pub struct FileMetadata {
     /// The size of the file.
     pub size: u64,
+    /// The last modified time in milliseconds since Unix epoch.
+    pub last_modified_ms: Option<i64>,
+    /// Whether this entry represents a directory.
+    pub is_dir: bool,
+}
+
+/// A single entry returned by listing operations.
+pub struct ListEntry {
+    /// Absolute path that can be directly passed back to [`FileIO`] operations.
+    pub path: String,
+    /// Metadata associated with the path.
+    pub metadata: FileMetadata,
 }
 
 /// Trait for reading file.
@@ -372,6 +436,8 @@ impl InputFile {
 
         Ok(FileMetadata {
             size: meta.content_length(),
+            last_modified_ms: meta.last_modified().map(datetime_to_millis),
+            is_dir: meta.is_dir(),
         })
     }
 
@@ -504,6 +570,10 @@ impl OutputFile {
         }
         Ok(Box::new(writer.await?))
     }
+}
+
+fn datetime_to_millis(datetime: DateTime<Utc>) -> i64 {
+    datetime.timestamp_millis()
 }
 
 #[cfg(test)]
@@ -673,5 +743,89 @@ mod tests {
         let path = format!("{}/1.txt", TempDir::new().unwrap().path().to_str().unwrap());
         let output_file = io.new_output(&path).unwrap();
         assert_eq!(Some(32 * 1024 * 1024), output_file.chunk_size);
+    }
+
+    #[tokio::test]
+    async fn test_list_recursive_path_format_matches_input() {
+        // This test verifies that list_recursive returns paths in the same format
+        // as they would be stored in manifest entries. This is critical for
+        // delete_orphan_files to correctly identify reachable files.
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().join("table");
+        let data_dir = table_location.join("data");
+        create_dir_all(&data_dir).unwrap();
+
+        // Create test files
+        let file1 = data_dir.join("file1.parquet");
+        let file2 = data_dir.join("file2.parquet");
+        write_to_file("test1", &file1);
+        write_to_file("test2", &file2);
+
+        let file_io = create_local_file_io();
+
+        // Test with path without scheme (like /var/folders/...)
+        let path_without_scheme = table_location.to_str().unwrap().to_string();
+
+        let entries = file_io.list_recursive(&path_without_scheme).await.unwrap();
+
+        // Manifest entries would store paths like: {table_location}/data/file1.parquet
+        let expected_file1 = format!("{}/data/file1.parquet", path_without_scheme);
+        let expected_file2 = format!("{}/data/file2.parquet", path_without_scheme);
+
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+        assert!(
+            paths.contains(&expected_file1.as_str()),
+            "list_recursive should return path '{}' but got {:?}",
+            expected_file1,
+            paths
+        );
+        assert!(
+            paths.contains(&expected_file2.as_str()),
+            "list_recursive should return path '{}' but got {:?}",
+            expected_file2,
+            paths
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_recursive_path_format_with_file_scheme() {
+        // Test that paths work correctly with file:// scheme
+        // Note: The local file system handling normalizes file:// paths
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().join("table");
+        let data_dir = table_location.join("data");
+        create_dir_all(&data_dir).unwrap();
+
+        // Create test file
+        let file1 = data_dir.join("file1.parquet");
+        write_to_file("test1", &file1);
+
+        let file_io = create_local_file_io();
+
+        // Test with file:// scheme
+        let path_with_scheme = format!("file://{}", table_location.to_str().unwrap());
+
+        let entries = file_io.list_recursive(&path_with_scheme).await.unwrap();
+
+        // The returned paths will have file:/ prefix (normalized by opendal)
+        // This test documents the actual behavior
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+        // All returned paths should start with file:/
+        assert!(
+            paths.iter().all(|p| p.starts_with("file:/")),
+            "All paths should start with file:/ but got {:?}",
+            paths
+        );
+
+        // There should be at least one parquet file
+        assert!(
+            paths.iter().any(|p| p.ends_with("file1.parquet")),
+            "Should contain file1.parquet but got {:?}",
+            paths
+        );
     }
 }
