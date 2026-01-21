@@ -21,7 +21,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use opendal::Operator;
 use url::Url;
 
@@ -144,57 +145,93 @@ impl FileIO {
         Ok(op.exists(relative_path).await?)
     }
 
-    /// List files/directories directly under the given path.
+    /// List files/directories under the given path.
+    ///
+    /// Returns a [`BoxStream`] that yields entries lazily, avoiding loading all
+    /// entries into memory at once. This is memory-efficient for directories
+    /// with many files.
     ///
     /// # Arguments
     ///
-    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
-    pub async fn list(&self, path: impl AsRef<str>) -> Result<Vec<ListEntry>> {
-        self.list_internal(path, false).await
-    }
-
-    /// Recursively list files/directories under the given path.
+    /// * `path`: Absolute path starting with scheme string used to construct [`FileIO`].
+    /// * `recursive`: If `true`, list all files recursively; otherwise list only direct children.
     ///
-    /// # Arguments
+    /// # Returns
     ///
-    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
-    pub async fn list_recursive(&self, path: impl AsRef<str>) -> Result<Vec<ListEntry>> {
-        self.list_internal(path, true).await
-    }
-
-    async fn list_internal(&self, path: impl AsRef<str>, recursive: bool) -> Result<Vec<ListEntry>> {
-        let path_str = path.as_ref();
-        let (op, relative_path) = self.inner.create_operator(&path)?;
+    /// A stream of [`ListEntry`] where each entry's `path` is an absolute path that can be
+    /// directly passed to other [`FileIO`] methods like `delete()` or `new_input()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid or the underlying storage operation fails.
+    /// Individual entries in the stream may also yield errors if listing encounters issues.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use futures::TryStreamExt;
+    ///
+    /// // List direct children only
+    /// let mut stream = file_io.list("s3://bucket/path/", false).await?;
+    /// while let Some(entry) = stream.try_next().await? {
+    ///     println!("{}", entry.path);
+    /// }
+    ///
+    /// // List recursively and collect
+    /// let entries: Vec<ListEntry> = file_io
+    ///     .list("s3://bucket/table/", true)
+    ///     .await?
+    ///     .try_collect()
+    ///     .await?;
+    /// ```
+    pub async fn list(
+        &self,
+        path: impl AsRef<str>,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        let path_str: Arc<str> = Arc::from(path.as_ref());
+        let (op, relative_path) = self.inner.create_operator(&path_str)?;
 
         // Calculate the absolute prefix: path_str without the relative_path suffix.
-        // Example: "s3://bucket/data/subdir" - "data/subdir" = "s3://bucket/"
-        let absolute_prefix = &path_str[..path_str.len() - relative_path.len()];
+        let absolute_prefix: Arc<str> =
+            Arc::from(&path_str[..path_str.len() - relative_path.len()]);
 
         // Ensure path ends with '/' for directory listing
         let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
-            relative_path
+            relative_path.to_string()
         } else {
-            &format!("{}/", relative_path)
+            format!("{}/", relative_path)
         };
 
-        // OpenDAL's list_with returns Entry objects that already contain metadata
-        // (mode, content_length, last_modified) from the list response.
-        let entries_list = op.list_with(list_path).recursive(recursive).await?;
+        // OpenDAL's lister_with returns a Lister that implements Stream
+        let lister = op.lister_with(&list_path).recursive(recursive).await?;
 
-        Ok(entries_list
-            .into_iter()
-            .map(|entry| {
-                let meta = entry.metadata();
-                ListEntry {
-                    path: format!("{}{}", absolute_prefix, entry.path()),
-                    metadata: FileMetadata {
-                        size: meta.content_length(),
-                        last_modified_ms: meta.last_modified().map(datetime_to_millis),
-                        is_dir: meta.is_dir(),
-                    },
-                }
+        // Transform the OpenDAL Entry stream into our ListEntry stream
+        let stream = lister
+            .map(move |entry_result| {
+                entry_result
+                    .map_err(|e| {
+                        Error::new(ErrorKind::Unexpected, "Failed to list entry")
+                            .with_context("path", path_str.to_string())
+                            .with_source(e)
+                    })
+                    .map(|entry| {
+                        let meta = entry.metadata();
+                        ListEntry {
+                            path: format!("{}{}", absolute_prefix, entry.path()),
+                            metadata: FileMetadata {
+                                size: meta.content_length(),
+                                last_modified_ms: meta
+                                    .last_modified()
+                                    .map(|dt| dt.timestamp_millis()),
+                                is_dir: meta.is_dir(),
+                            },
+                        }
+                    })
             })
-            .collect())
+            .boxed();
+
+        Ok(stream)
     }
 
     /// Creates input file.
@@ -436,7 +473,7 @@ impl InputFile {
 
         Ok(FileMetadata {
             size: meta.content_length(),
-            last_modified_ms: meta.last_modified().map(datetime_to_millis),
+            last_modified_ms: meta.last_modified().map(|dt| dt.timestamp_millis()),
             is_dir: meta.is_dir(),
         })
     }
@@ -572,10 +609,6 @@ impl OutputFile {
     }
 }
 
-fn datetime_to_millis(datetime: DateTime<Utc>) -> i64 {
-    datetime.timestamp_millis()
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::{File, create_dir_all};
@@ -583,11 +616,11 @@ mod tests {
     use std::path::Path;
 
     use bytes::Bytes;
-    use futures::AsyncReadExt;
     use futures::io::AllowStdIo;
+    use futures::{AsyncReadExt, TryStreamExt};
     use tempfile::TempDir;
 
-    use super::{FileIO, FileIOBuilder};
+    use super::{FileIO, FileIOBuilder, ListEntry};
     use crate::io::IO_CHUNK_SIZE;
 
     fn create_local_file_io() -> FileIO {
@@ -746,86 +779,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_recursive_path_format_matches_input() {
-        // This test verifies that list_recursive returns paths in the same format
-        // as they would be stored in manifest entries. This is critical for
-        // delete_orphan_files to correctly identify reachable files.
-
+    async fn test_list() {
         let tmp_dir = TempDir::new().unwrap();
-        let table_location = tmp_dir.path().join("table");
-        let data_dir = table_location.join("data");
-        create_dir_all(&data_dir).unwrap();
+        let root = tmp_dir.path().join("root");
+        let sub_dir = root.join("subdir");
+        create_dir_all(&sub_dir).unwrap();
 
-        // Create test files
-        let file1 = data_dir.join("file1.parquet");
-        let file2 = data_dir.join("file2.parquet");
-        write_to_file("test1", &file1);
-        write_to_file("test2", &file2);
+        // Create files at different levels
+        let root_file = root.join("root_file.txt");
+        let nested_file = sub_dir.join("nested_file.txt");
+        write_to_file("root", &root_file);
+        write_to_file("nested", &nested_file);
 
         let file_io = create_local_file_io();
+        let root_path = root.to_str().unwrap();
 
-        // Test with path without scheme (like /var/folders/...)
-        let path_without_scheme = table_location.to_str().unwrap().to_string();
-
-        let entries = file_io.list_recursive(&path_without_scheme).await.unwrap();
-
-        // Manifest entries would store paths like: {table_location}/data/file1.parquet
-        let expected_file1 = format!("{}/data/file1.parquet", path_without_scheme);
-        let expected_file2 = format!("{}/data/file2.parquet", path_without_scheme);
-
+        // Non-recursive: should only see direct children
+        let entries: Vec<ListEntry> = file_io
+            .list(root_path, false)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
-        assert!(
-            paths.contains(&expected_file1.as_str()),
-            "list_recursive should return path '{}' but got {:?}",
-            expected_file1,
-            paths
-        );
-        assert!(
-            paths.contains(&expected_file2.as_str()),
-            "list_recursive should return path '{}' but got {:?}",
-            expected_file2,
-            paths
-        );
+        assert!(paths.iter().any(|p| p.ends_with("root_file.txt")));
+        assert!(!paths.iter().any(|p| p.ends_with("nested_file.txt")));
+
+        // Recursive: should see all files with correct absolute paths
+        let entries: Vec<ListEntry> = file_io
+            .list(root_path, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+        // Verify absolute path format (can be passed back to FileIO)
+        let expected_nested = format!("{}/subdir/nested_file.txt", root_path);
+        assert!(paths.contains(&expected_nested.as_str()));
+        assert!(paths.iter().any(|p| p.ends_with("root_file.txt")));
     }
 
     #[tokio::test]
-    async fn test_list_recursive_path_format_with_file_scheme() {
-        // Test that paths work correctly with file:// scheme
-        // Note: The local file system handling normalizes file:// paths
-
+    async fn test_list_with_file_scheme() {
         let tmp_dir = TempDir::new().unwrap();
-        let table_location = tmp_dir.path().join("table");
-        let data_dir = table_location.join("data");
+        let data_dir = tmp_dir.path().join("data");
         create_dir_all(&data_dir).unwrap();
-
-        // Create test file
-        let file1 = data_dir.join("file1.parquet");
-        write_to_file("test1", &file1);
+        write_to_file("test", data_dir.join("file.parquet"));
 
         let file_io = create_local_file_io();
+        let path = format!("file://{}", tmp_dir.path().to_str().unwrap());
 
-        // Test with file:// scheme
-        let path_with_scheme = format!("file://{}", table_location.to_str().unwrap());
-
-        let entries = file_io.list_recursive(&path_with_scheme).await.unwrap();
-
-        // The returned paths will have file:/ prefix (normalized by opendal)
-        // This test documents the actual behavior
+        let entries: Vec<ListEntry> = file_io
+            .list(&path, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
-        // All returned paths should start with file:/
-        assert!(
-            paths.iter().all(|p| p.starts_with("file:/")),
-            "All paths should start with file:/ but got {:?}",
-            paths
-        );
-
-        // There should be at least one parquet file
-        assert!(
-            paths.iter().any(|p| p.ends_with("file1.parquet")),
-            "Should contain file1.parquet but got {:?}",
-            paths
-        );
+        // Returned paths preserve the file:/ scheme prefix
+        assert!(paths.iter().all(|p| p.starts_with("file:/")));
+        assert!(paths.iter().any(|p| p.ends_with("file.parquet")));
     }
 }

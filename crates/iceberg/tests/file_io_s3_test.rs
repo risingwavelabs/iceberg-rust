@@ -23,6 +23,7 @@ mod tests {
 
     use async_trait::async_trait;
     use ctor::{ctor, dtor};
+    use futures::TryStreamExt;
     use iceberg::io::{
         CustomAwsCredentialLoader, FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION,
         S3_SECRET_ACCESS_KEY,
@@ -279,9 +280,12 @@ mod tests {
         let data_partition3 = format!("{base_path}/data/dt=2024-01-02/00003-0-jkl.parquet");
 
         // Multi-level nested partitions (e.g., dt/hour/region)
-        let data_nested1 = format!("{base_path}/data/dt=2024-01-01/hour=10/region=us/00004-0-mno.parquet");
-        let data_nested2 = format!("{base_path}/data/dt=2024-01-01/hour=10/region=eu/00005-0-pqr.parquet");
-        let data_nested3 = format!("{base_path}/data/dt=2024-01-01/hour=11/region=us/00006-0-stu.parquet");
+        let data_nested1 =
+            format!("{base_path}/data/dt=2024-01-01/hour=10/region=us/00004-0-mno.parquet");
+        let data_nested2 =
+            format!("{base_path}/data/dt=2024-01-01/hour=10/region=eu/00005-0-pqr.parquet");
+        let data_nested3 =
+            format!("{base_path}/data/dt=2024-01-01/hour=11/region=us/00006-0-stu.parquet");
 
         // Delete files
         let delete_file = format!("{base_path}/data/dt=2024-01-01/00007-0-del.parquet");
@@ -319,7 +323,13 @@ mod tests {
         }
 
         // List recursively from base path
-        let entries = file_io.list_recursive(base_path).await.unwrap();
+        let entries: Vec<_> = file_io
+            .list(base_path, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         let listed_paths: std::collections::HashSet<String> =
             entries.iter().map(|e| e.path.clone()).collect();
 
@@ -346,8 +356,16 @@ mod tests {
 
         // Verify metadata for each entry
         for entry in &entries {
-            assert!(!entry.metadata.is_dir, "Files should not be directories: {}", entry.path);
-            assert!(entry.metadata.size > 0, "Files should have size > 0: {}", entry.path);
+            assert!(
+                !entry.metadata.is_dir,
+                "Files should not be directories: {}",
+                entry.path
+            );
+            assert!(
+                entry.metadata.size > 0,
+                "Files should have size > 0: {}",
+                entry.path
+            );
             assert!(
                 entry.metadata.last_modified_ms.is_some(),
                 "S3/minio should provide last_modified_ms: {}",
@@ -388,7 +406,13 @@ mod tests {
             .unwrap();
 
         // List files like delete_orphan_files would
-        let entries = file_io.list_recursive(table_location).await.unwrap();
+        let entries: Vec<_> = file_io
+            .list(table_location, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         let listed_paths: std::collections::HashSet<String> =
             entries.into_iter().map(|e| e.path).collect();
 
