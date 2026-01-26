@@ -88,7 +88,7 @@ use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
+use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 
 /// Target size of manifest file when merging manifests.
 pub const MANIFEST_TARGET_SIZE_BYTES: &str = "commit.manifest.target-size-bytes";
@@ -213,10 +213,7 @@ impl Transaction {
             return Ok(self.table);
         }
 
-        let table_props =
-            TableProperties::try_from(self.table.metadata().properties()).map_err(|e| {
-                Error::new(ErrorKind::DataInvalid, "Invalid table properties").with_source(e)
-            })?;
+        let table_props = self.table.metadata().table_properties()?;
 
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
@@ -568,7 +565,7 @@ mod test_row_lineage {
         fn file_with_rows(record_count: u64) -> DataFile {
             DataFileBuilder::default()
                 .content(DataContentType::Data)
-                .file_path(format!("test/{}.parquet", record_count))
+                .file_path(format!("test/{record_count}.parquet"))
                 .file_format(DataFileFormat::Parquet)
                 .file_size_in_bytes(100)
                 .record_count(record_count)

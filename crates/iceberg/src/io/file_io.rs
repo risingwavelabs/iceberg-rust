@@ -24,7 +24,7 @@ use bytes::Bytes;
 use opendal::Operator;
 use url::Url;
 
-use super::storage::Storage;
+use super::storage::OpenDalStorage;
 use crate::{Error, ErrorKind, Result};
 
 /// Configuration property for setting the chunk size for IO write operations.
@@ -80,7 +80,7 @@ pub const IO_RETRY_MAX_DELAY_MS: &str = "io.retry.max-delay-ms";
 pub struct FileIO {
     builder: FileIOBuilder,
 
-    inner: Arc<Storage>,
+    inner: Arc<OpenDalStorage>,
 }
 
 impl FileIO {
@@ -226,10 +226,7 @@ impl FileIO {
                 let parsed_chunk_size = chunk_size.parse::<usize>().map_err(|_err| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!(
-                            "Invalid {}: Cannot parse to unsigned integer.",
-                            IO_CHUNK_SIZE,
-                        ),
+                        format!("Invalid {IO_CHUNK_SIZE}: Cannot parse to unsigned integer.",),
                     )
                 })?;
                 Ok(Some(parsed_chunk_size))
@@ -344,7 +341,7 @@ impl FileIOBuilder {
 
     /// Builds [`FileIO`].
     pub fn build(self) -> Result<FileIO> {
-        let storage = Storage::build(self.clone())?;
+        let storage = OpenDalStorage::build(self.clone())?;
         Ok(FileIO {
             builder: self,
             inner: Arc::new(storage),
@@ -363,7 +360,6 @@ pub struct FileMetadata {
 /// Trait for reading file.
 ///
 /// # TODO
-///
 /// It's possible for us to remove the async_trait, but we need to figure
 /// out how to handle the object safety.
 #[async_trait::async_trait]
@@ -554,10 +550,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{FileIO, FileIOBuilder};
-    use crate::io::{
-        IO_CHUNK_SIZE, IO_MAX_RETRIES, IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS,
-        IO_TIMEOUT_SECONDS,
-    };
+    use crate::io::IO_CHUNK_SIZE;
 
     fn create_local_file_io() -> FileIO {
         FileIOBuilder::new_fs_io().build().unwrap()

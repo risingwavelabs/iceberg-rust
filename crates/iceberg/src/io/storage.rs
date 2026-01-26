@@ -16,6 +16,12 @@
 // under the License.
 
 use std::collections::HashMap;
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-gcs",
+    feature = "storage-oss",
+    feature = "storage-azdls",
+))]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +49,7 @@ use crate::{Error, ErrorKind};
 
 /// The storage carries all supported storage services in iceberg
 #[derive(Debug)]
-pub(crate) enum Storage {
+pub(crate) enum OpenDalStorage {
     #[cfg(feature = "storage-memory")]
     Memory(Operator),
     #[cfg(feature = "storage-fs")]
@@ -75,10 +81,11 @@ pub(crate) enum Storage {
     },
 }
 
-impl Storage {
+impl OpenDalStorage {
     /// Convert iceberg config to opendal config.
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
         let (scheme_str, props, extensions) = file_io_builder.into_parts();
+        let _ = (&props, &extensions);
         let scheme = Self::parse_scheme(&scheme_str)?;
 
         match scheme {
@@ -140,9 +147,10 @@ impl Storage {
         config: &HashMap<String, String>,
     ) -> crate::Result<(Operator, &'a str)> {
         let path = path.as_ref();
+        let _ = path;
         let (operator, relative_path): (Operator, &str) = match self {
             #[cfg(feature = "storage-memory")]
-            Storage::Memory(op) => {
+            OpenDalStorage::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
                     Ok::<_, crate::Error>((op.clone(), stripped))
                 } else {
@@ -150,7 +158,7 @@ impl Storage {
                 }
             }
             #[cfg(feature = "storage-fs")]
-            Storage::LocalFs => {
+            OpenDalStorage::LocalFs => {
                 let op = super::fs_config_build()?;
 
                 if let Some(stripped) = path.strip_prefix("file:/") {
@@ -160,7 +168,7 @@ impl Storage {
                 }
             }
             #[cfg(feature = "storage-s3")]
-            Storage::S3 {
+            OpenDalStorage::S3 {
                 configured_scheme,
                 config,
                 customized_credential_load,
@@ -180,7 +188,7 @@ impl Storage {
                 }
             }
             #[cfg(feature = "storage-gcs")]
-            Storage::Gcs { config } => {
+            OpenDalStorage::Gcs { config } => {
                 let operator = super::gcs_config_build(config, path)?;
                 let prefix = format!("gs://{}/", operator.info().name());
                 if path.starts_with(&prefix) {
@@ -188,7 +196,7 @@ impl Storage {
                 } else {
                     Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Invalid gcs url: {}, should start with {}", path, prefix),
+                        format!("Invalid gcs url: {path}, should start with {prefix}"),
                     ))
                 }
             }
@@ -206,7 +214,7 @@ impl Storage {
                 }
             }
             #[cfg(feature = "storage-oss")]
-            Storage::Oss { config } => {
+            OpenDalStorage::Oss { config } => {
                 let op = super::oss_config_build(config, path)?;
 
                 // Check prefix of oss path.
@@ -216,12 +224,12 @@ impl Storage {
                 } else {
                     Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Invalid oss url: {}, should start with {}", path, prefix),
+                        format!("Invalid oss url: {path}, should start with {prefix}"),
                     ))
                 }
             }
             #[cfg(feature = "storage-azdls")]
-            Storage::Azdls {
+            OpenDalStorage::Azdls {
                 configured_scheme,
                 config,
             } => super::azdls_create_operator(path, config, configured_scheme),
@@ -290,10 +298,7 @@ where T: std::str::FromStr {
             Ok(value) => Ok(Some(value)),
             Err(_) => Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "Invalid {}: '{}' cannot be parsed as a positive integer",
-                    key, value_str
-                ),
+                format!("Invalid {key}: '{value_str}' cannot be parsed as a positive integer"),
             )),
         },
         None => Ok(None),

@@ -54,6 +54,7 @@ pub(crate) struct ManifestFileContext {
     /// filter manifest entries.
     /// Used for different kind of scans, e.g., only scan newly added files without delete files.
     filter_fn: Option<Arc<ManifestEntryFilterFn>>,
+    case_sensitive: bool,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -67,6 +68,7 @@ pub(crate) struct ManifestEntryContext {
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
     pub delete_file_index: DeleteFileIndex,
+    pub case_sensitive: bool,
 }
 
 impl ManifestFileContext {
@@ -83,6 +85,7 @@ impl ManifestFileContext {
             expression_evaluator_cache,
             delete_file_index,
             filter_fn,
+            case_sensitive: _,
         } = self;
         let filter_fn = filter_fn.unwrap_or_else(|| Arc::new(|_| true));
 
@@ -98,6 +101,7 @@ impl ManifestFileContext {
                 bound_predicates: bound_predicates.clone(),
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
+                case_sensitive: self.case_sensitive,
             };
 
             sender
@@ -148,6 +152,7 @@ impl ManifestEntryContext {
             partition_spec: None,
             // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
             name_mapping: None,
+            case_sensitive: self.case_sensitive,
         })
     }
 }
@@ -213,7 +218,7 @@ impl PlanContext {
         delete_file_tx: Sender<ManifestEntryContext>,
     ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
         let mut filter_fn: Option<Arc<ManifestEntryFilterFn>> = None;
-        let manifest_files = {
+        let mut manifest_files = {
             if let Some(to_snapshot_id) = self.to_snapshot_id {
                 // Incremental scan mode:
                 // Get all added files between two snapshots.
@@ -266,6 +271,16 @@ impl PlanContext {
                 manifest_list.entries().to_vec()
             }
         };
+        // Sort manifest files to process delete manifests first.
+        // This avoids a deadlock where the producer blocks on sending data manifest entries
+        // (because the data channel is full) while the delete manifest consumer is waiting
+        // for delete manifest entries (which haven't been produced yet).
+        // By processing delete manifests first, we ensure the delete consumer can finish,
+        // which then allows the data consumer to start draining the data channel.
+        manifest_files.sort_by_key(|m| match m.content {
+            ManifestContentType::Deletes => 0,
+            ManifestContentType::Data => 1,
+        });
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_deletes_mfcs = vec![];
@@ -354,6 +369,7 @@ impl PlanContext {
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
             filter_fn,
+            case_sensitive: self.case_sensitive,
         }
     }
 }

@@ -40,13 +40,50 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
 
+/// A trait that defines how different table operations produce new snapshots.
+///
+/// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
+/// based on the type of operation being performed (e.g., `Append`, `Overwrite`, `Delete`, etc.).
+/// Each operation type implements this trait to specify:
+/// - Which operation type to record in the snapshot summary
+/// - Which existing manifest files should be included in the new snapshot
+/// - Which manifest entries should be marked as deleted
+///
+/// # When it accomplishes
+///
+/// This trait is used during the snapshot creation process in [`SnapshotProducer::commit()`]:
+///
+/// 1. **Operation Type Recording**: The `operation()` method determines which operation type
+///    (e.g., `Operation::Append`, `Operation::Overwrite`) is recorded in the snapshot summary.
+///    This metadata helps track what kind of change was made to the table.
+///
+/// 2. **Manifest File Selection**: The `existing_manifest()` method determines which existing
+///    manifest files from the current snapshot should be carried forward to the new snapshot.
+///    For example:
+///    - An `Append` operation typically includes all existing manifests plus new ones
+///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
+///
+/// 3. **Delete Entry Processing**: The `delete_entries()` method is intended for future delete
+///    operations to specify which manifest entries should be marked as deleted.
 pub(crate) trait SnapshotProduceOperation: Send + Sync {
+    /// Returns the operation type that will be recorded in the snapshot summary.
+    ///
+    /// This determines what kind of operation is being performed (e.g., `Append`, `Overwrite`),
+    /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
     fn delete_entries(
         &self,
         snapshot_produce: &SnapshotProducer,
     ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send;
 
+    /// Returns existing manifest files that should be included in the new snapshot.
+    ///
+    /// This method determines which manifest files from the current snapshot should be
+    /// carried forward to the new snapshot. The selection depends on the operation type:
+    ///
+    /// - **Append operations**: Typically include all existing manifests
+    /// - **Overwrite operations**: May exclude manifests for partitions being overwritten
+    /// - **Delete operations**: May exclude manifests for partitions being deleted
     fn existing_manifest(
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
@@ -163,47 +200,6 @@ impl<'a> SnapshotProducer<'a> {
 
         Ok(())
     }
-
-    // pub(crate) async fn validate_duplicate_files(
-    //     &self,
-    //     added_data_files: &[DataFile],
-    // ) -> Result<()> {
-    //     let new_files: HashSet<&str> = added_data_files
-    //         .iter()
-    //         .map(|df| df.file_path.as_str())
-    //         .collect();
-
-    //     let mut referenced_files = Vec::new();
-    //     if let Some(current_snapshot) = self.table.metadata().snapshot_for_ref(&self.target_branch)
-    //     {
-    //         let manifest_list = current_snapshot
-    //             .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
-    //             .await?;
-    //         for manifest_list_entry in manifest_list.entries() {
-    //             let manifest = manifest_list_entry
-    //                 .load_manifest(self.table.file_io())
-    //                 .await?;
-    //             for entry in manifest.entries() {
-    //                 let file_path = entry.file_path();
-    //                 if new_files.contains(file_path) && entry.is_alive() {
-    //                     referenced_files.push(file_path.to_string());
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     if !referenced_files.is_empty() {
-    //         return Err(Error::new(
-    //             ErrorKind::DataInvalid,
-    //             format!(
-    //                 "Cannot add files that are already referenced by table, files: {}",
-    //                 referenced_files.join(", ")
-    //             ),
-    //         ));
-    //     }
-
-    //     Ok(())
-    // }
 
     pub(crate) fn generate_unique_snapshot_id(table: &Table) -> i64 {
         let generate_random_id = || -> i64 {
@@ -1104,8 +1100,5 @@ pub(crate) fn new_manifest_path(
     manifest_counter: u64,
     format: DataFileFormat,
 ) -> String {
-    format!(
-        "{}/{}/{}-m{}.{}",
-        metadata_location, meta_root_path, commit_uuid, manifest_counter, format
-    )
+    format!("{metadata_location}/{meta_root_path}/{commit_uuid}-m{manifest_counter}.{format}")
 }

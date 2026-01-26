@@ -43,9 +43,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
-env:
-  rust_msrv: "1.87"
-
 jobs:
   check:
     runs-on: ${{ matrix.os }}
@@ -55,7 +52,7 @@ jobs:
           - ubuntu-latest
           - macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -104,7 +101,7 @@ jobs:
           root-reserve-mb: 10240
           temp-reserve-mb: 10240
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -129,7 +126,7 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -142,6 +139,12 @@ jobs:
 
   unit:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-suite:
+          - { name: "default", args: "--all-targets --all-features --workspace" }
+          - { name: "doc", args: "--doc --all-features --workspace" }
+    name: Unit Tests (${{ matrix.test-suite.name }})
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
@@ -154,7 +157,7 @@ jobs:
           root-reserve-mb: 10240
           temp-reserve-mb: 10240
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -166,29 +169,28 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.test-suite.name }}
 
       - name: Test
-        run: cargo test --no-fail-fast --all-targets --all-features --workspace
-
-      - name: Smol Test
-        run: cargo test --no-fail-fast --all-targets --no-default-features --features "smol" --features "storage-all" --workspace
-
-      - name: Doc Test
-        run: cargo test --no-fail-fast --doc --all-features --workspace
+        run: cargo test --no-fail-fast ${{ matrix.test-suite.args }}
 
   msrv:
     name: Verify MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get MSRV
+        id: get-msrv
+        uses: ./.github/actions/get-msrv
       - name: Setup MSRV Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
-          rust-version: ${{ env.rust_msrv }}
+          rust-version: ${{ steps.get-msrv.outputs.msrv }}
       - name: Setup Nightly Rust toolchain
         uses: ./.github/actions/setup-builder
       - name: Check MSRV

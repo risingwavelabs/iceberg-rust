@@ -91,6 +91,9 @@ pub struct FileScanTask {
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
     pub name_mapping: Option<Arc<NameMapping>>,
+
+    /// Whether the scan is case sensitive.
+    pub case_sensitive: bool,
 }
 
 impl FileScanTask {
@@ -161,6 +164,7 @@ impl From<&DeleteFileContext> for FileScanTask {
             partition: Some(ctx.manifest_entry.data_file().partition().clone()),
             partition_spec: None, // TODO: pass through partition spec info
             name_mapping: None,   // TODO: implement name mapping
+            case_sensitive: true, // default to case sensitive
         }
     }
 }

@@ -388,10 +388,10 @@ impl ManifestWriter {
                 self.existing_rows += entry.data_file.record_count;
             }
         }
-        if entry.is_alive() {
-            if let Some(seq_num) = entry.sequence_number {
-                self.min_seq_num = Some(self.min_seq_num.map_or(seq_num, |v| min(v, seq_num)));
-            }
+        if entry.is_alive()
+            && let Some(seq_num) = entry.sequence_number
+        {
+            self.min_seq_num = Some(self.min_seq_num.map_or(seq_num, |v| min(v, seq_num)));
         }
         self.manifest_entries.push(entry);
         Ok(())
@@ -611,7 +611,7 @@ mod tests {
                         lower_bounds: HashMap::new(),
                         upper_bounds: HashMap::new(),
                         key_metadata: Some(Vec::new()),
-                        split_offsets: vec![4],
+                        split_offsets: Some(vec![4]),
                         equality_ids: None,
                         sort_order_id: None,
                         partition_spec_id: 0,
@@ -640,7 +640,7 @@ mod tests {
                         lower_bounds: HashMap::new(),
                         upper_bounds: HashMap::new(),
                         key_metadata: Some(Vec::new()),
-                        split_offsets: vec![4],
+                        split_offsets: Some(vec![4]),
                         equality_ids: None,
                         sort_order_id: None,
                         partition_spec_id: 0,
@@ -669,7 +669,7 @@ mod tests {
                         lower_bounds: HashMap::new(),
                         upper_bounds: HashMap::new(),
                         key_metadata: Some(Vec::new()),
-                        split_offsets: vec![4],
+                        split_offsets: Some(vec![4]),
                         equality_ids: None,
                         sort_order_id: None,
                         partition_spec_id: 0,
@@ -757,7 +757,7 @@ mod tests {
                 lower_bounds: HashMap::new(),
                 upper_bounds: HashMap::new(),
                 key_metadata: None,
-                split_offsets: vec![],
+                split_offsets: None,
                 equality_ids: None,
                 sort_order_id: None,
                 partition_spec_id: 0,

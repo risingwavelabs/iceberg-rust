@@ -475,8 +475,7 @@ mod cleanup_tests {
         let strategy = ReachableFileCleanupStrategy::new(file_io.clone());
         assert_eq!(
             strategy.concurrency_limit, DEFAULT_DELETE_CONCURRENCY_LIMIT,
-            "Default concurrency limit should be {}",
-            DEFAULT_DELETE_CONCURRENCY_LIMIT
+            "Default concurrency limit should be {DEFAULT_DELETE_CONCURRENCY_LIMIT}"
         );
 
         // Test custom concurrency limit

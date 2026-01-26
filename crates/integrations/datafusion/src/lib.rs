@@ -24,5 +24,6 @@ pub use error::*;
 pub mod physical_plan;
 mod schema;
 pub mod table;
+mod task_writer;
 pub use table::table_provider_factory::IcebergTableProviderFactory;
 pub use table::*;

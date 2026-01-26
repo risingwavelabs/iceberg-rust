@@ -158,8 +158,7 @@ impl ManifestFilterManager {
     pub(crate) fn drop_delete_files_older_than(&mut self, sequence_number: i64) {
         assert!(
             sequence_number >= 0,
-            "Invalid minimum data sequence number: {}",
-            sequence_number
+            "Invalid minimum data sequence number: {sequence_number}"
         );
         self.min_sequence_number = sequence_number;
     }
@@ -367,7 +366,7 @@ impl ManifestFilterManager {
                 if !deleted_files.contains(file_path) {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Required delete path missing: {}", file_path),
+                        format!("Required delete path missing: {file_path}"),
                     ));
                 }
             }
@@ -514,7 +513,7 @@ mod tests {
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
             key_metadata: None,
-            split_offsets: vec![],
+            split_offsets: None,
             equality_ids: None,
             sort_order_id: None,
             first_row_id: None,
@@ -947,7 +946,7 @@ mod tests {
             .map(|i| {
                 temp_dir
                     .path()
-                    .join(format!("manifest{}.avro", i))
+                    .join(format!("manifest{i}.avro"))
                     .to_string_lossy()
                     .to_string()
             })
@@ -1104,10 +1103,7 @@ mod tests {
         // Add multiple files for deletion
         for i in 1..=3 {
             manager
-                .delete_file(create_test_data_file(
-                    &format!("/test/batch{}.parquet", i),
-                    0,
-                ))
+                .delete_file(create_test_data_file(&format!("/test/batch{i}.parquet"), 0))
                 .unwrap();
         }
 
@@ -1145,7 +1141,7 @@ mod tests {
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
             key_metadata: None,
-            split_offsets: vec![],
+            split_offsets: None,
             equality_ids: None,
             sort_order_id: None,
             first_row_id: None,

@@ -122,10 +122,10 @@ async fn test_expire_snapshots_by_count() {
         let mut data_file_writer = data_file_writer_builder.clone().build(None).await.unwrap();
         // Create different data for each iteration
         let col1 = StringArray::from(vec![
-            Some(format!("foo_{}", i)),
-            Some(format!("bar_{}", i)),
+            Some(format!("foo_{i}")),
+            Some(format!("bar_{i}")),
             None,
-            Some(format!("baz_{}", i)),
+            Some(format!("baz_{i}")),
         ]);
         let col2 = Int32Array::from(vec![Some(i), Some(i + 1), Some(i + 2), Some(i + 3)]);
         let col3 = BooleanArray::from(vec![
