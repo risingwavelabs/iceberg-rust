@@ -29,6 +29,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::Result;
 use crate::table::Table;
+use crate::utils::{load_manifest_lists, load_manifests};
 
 /// Default time offset for orphan file deletion threshold (1 day in milliseconds).
 const DEFAULT_OLDER_THAN_MS: i64 = 24 * 60 * 60 * 1000;
@@ -203,30 +204,21 @@ impl RemoveOrphanFilesAction {
         let file_io = self.table.file_io();
         let table_metadata = self.table.metadata_ref();
 
-        // Collect all manifest list paths first
-        let snapshots: Vec<_> = table_metadata.snapshots().collect();
+        let snapshots: Vec<_> = table_metadata.snapshots().cloned().collect();
 
-        for snapshot in &snapshots {
+        // Load manifest lists concurrently using shared loader
+        let loaded_lists =
+            load_manifest_lists(file_io, &table_metadata, snapshots, self.load_concurrency).await?;
+
+        // Collect manifest list paths, manifest files, and deduplicate for loading
+        let mut unique_manifest_files = Vec::new();
+        for (snapshot, manifest_list) in loaded_lists {
+            // Record manifest list path as reachable
             let manifest_list_path = snapshot.manifest_list();
             if !manifest_list_path.is_empty() {
                 reachable.insert(manifest_list_path.to_string());
             }
-        }
 
-        // Load manifest lists concurrently
-        let manifest_lists: Vec<_> = stream::iter(snapshots)
-            .map(|snapshot| {
-                let file_io = file_io.clone();
-                let table_metadata = table_metadata.clone();
-                async move { snapshot.load_manifest_list(&file_io, &table_metadata).await }
-            })
-            .buffer_unordered(self.load_concurrency)
-            .try_collect()
-            .await?;
-
-        // Collect manifest files and deduplicate for loading
-        let mut unique_manifest_files = Vec::new();
-        for manifest_list in manifest_lists {
             for manifest_file in manifest_list.entries() {
                 // Only load each manifest once (reachable set handles deduplication)
                 if reachable.insert(manifest_file.manifest_path.clone()) {
@@ -235,25 +227,15 @@ impl RemoveOrphanFilesAction {
             }
         }
 
-        // Load manifests concurrently and collect content files
-        let content_files: Vec<Vec<String>> = stream::iter(unique_manifest_files)
-            .map(|manifest_file| {
-                let file_io = file_io.clone();
-                async move {
-                    let manifest = manifest_file.load_manifest(&file_io).await?;
-                    let paths = manifest
-                        .entries()
-                        .iter()
-                        .map(|entry| entry.data_file().file_path().to_string())
-                        .collect();
-                    Ok::<_, crate::Error>(paths)
-                }
-            })
-            .buffer_unordered(self.load_concurrency)
-            .try_collect()
-            .await?;
+        // Load manifests concurrently using shared loader and collect content files
+        let loaded_manifests =
+            load_manifests(file_io, unique_manifest_files, self.load_concurrency).await?;
 
-        reachable.extend(content_files.into_iter().flatten());
+        for (_, manifest) in loaded_manifests {
+            for entry in manifest.entries() {
+                reachable.insert(entry.data_file().file_path().to_string());
+            }
+        }
 
         Ok(())
     }
