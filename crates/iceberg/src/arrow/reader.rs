@@ -32,7 +32,7 @@ use arrow_schema::{
 use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, try_join};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
@@ -1688,6 +1688,22 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
                 .read(range.start..range.end)
                 .map_err(|err| parquet::errors::ParquetError::External(Box::new(err))),
         )
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        let reader = &self.r;
+        async move {
+            let reads = ranges.into_iter().map(|range| {
+                reader
+                    .read(range.start..range.end)
+                    .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))
+            });
+            try_join_all(reads).await
+        }
+        .boxed()
     }
 
     // TODO: currently we don't respect `ArrowReaderOptions` cause it don't expose any method to access the option field
