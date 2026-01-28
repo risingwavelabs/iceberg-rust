@@ -391,7 +391,7 @@ impl CachingDeleteFileLoader {
                     "deletion vector referenced-data-file property missing",
                 )
             })?
-            .clone();
+            .to_owned();
         let delete_vector = DeleteVector::from_puffin_blob(blob)?;
 
         Ok(HashMap::from([(referenced_data_file, delete_vector)]))

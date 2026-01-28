@@ -91,7 +91,7 @@ impl DeleteVector {
             std::mem::size_of_val(&combined_length)
                 + DELETION_VECTOR_MAGIC_BYTES.len()
                 + serialized_bitmap_size
-                + 4,
+                + 4, // the length of the CRC
         );
 
         data.extend_from_slice(&combined_length.to_be_bytes());
