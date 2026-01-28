@@ -32,7 +32,7 @@ use crate::table::Table;
 use crate::utils::{load_manifest_lists, load_manifests};
 
 /// Default time offset for orphan file deletion threshold (1 day in milliseconds).
-const DEFAULT_OLDER_THAN_MS: i64 = 24 * 60 * 60 * 1000;
+const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /// Default concurrency limit for loading manifests and manifest lists.
 const DEFAULT_LOAD_CONCURRENCY: usize = 16;
