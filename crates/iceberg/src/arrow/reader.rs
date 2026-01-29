@@ -1700,8 +1700,7 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
         async move {
             let concurrency = available_parallelism()
                 .get()
-                .min(MAX_BYTE_RANGE_CONCURRENCY)
-                .max(1);
+                .clamp(1, MAX_BYTE_RANGE_CONCURRENCY);
             let reads = ranges.into_iter().map(|range| {
                 reader
                     .read(range.start..range.end)
