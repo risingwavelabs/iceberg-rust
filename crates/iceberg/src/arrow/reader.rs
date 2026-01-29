@@ -32,8 +32,8 @@ use arrow_schema::{
 use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
-use futures::future::{BoxFuture, try_join_all};
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, try_join};
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream, try_join};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
@@ -58,6 +58,8 @@ use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataContentType, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
+
+const MAX_BYTE_RANGE_CONCURRENCY: usize = 16;
 
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
@@ -1696,12 +1698,19 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let reader = &self.r;
         async move {
+            let concurrency = available_parallelism()
+                .get()
+                .min(MAX_BYTE_RANGE_CONCURRENCY)
+                .max(1);
             let reads = ranges.into_iter().map(|range| {
                 reader
                     .read(range.start..range.end)
                     .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))
             });
-            try_join_all(reads).await
+            stream::iter(reads)
+                .buffered(concurrency)
+                .try_collect()
+                .await
         }
         .boxed()
     }
