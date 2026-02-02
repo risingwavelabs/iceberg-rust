@@ -15,15 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::Future;
 use std::mem::take;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use as_any::AsAny;
 use async_trait::async_trait;
 
+use crate::io::FileIO;
+use crate::spec::TableMetadataRef;
 use crate::table::Table;
 use crate::transaction::Transaction;
 use crate::{Result, TableRequirement, TableUpdate};
+
+/// A boxed async cleanup callback that takes before/after metadata and FileIO.
+pub type PostCommitCleanup = Box<
+    dyn FnOnce(
+            TableMetadataRef,
+            TableMetadataRef,
+            FileIO,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        + Send,
+>;
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
 pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
@@ -81,6 +95,7 @@ impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
 pub struct ActionCommit {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
+    post_commit_cleanup: Option<PostCommitCleanup>,
 }
 
 impl ActionCommit {
@@ -89,7 +104,14 @@ impl ActionCommit {
         Self {
             updates,
             requirements,
+            post_commit_cleanup: None,
         }
+    }
+
+    /// Sets a post-commit cleanup callback that will be executed after successful commit.
+    pub fn with_post_commit_cleanup(mut self, cleanup: PostCommitCleanup) -> Self {
+        self.post_commit_cleanup = Some(cleanup);
+        self
     }
 
     /// Consumes and returns the list of table updates.
@@ -100,6 +122,11 @@ impl ActionCommit {
     /// Consumes and returns the list of table requirements.
     pub fn take_requirements(&mut self) -> Vec<TableRequirement> {
         take(&mut self.requirements)
+    }
+
+    /// Takes the post-commit cleanup callback if one was set.
+    pub fn take_post_commit_cleanup(&mut self) -> Option<PostCommitCleanup> {
+        take(&mut self.post_commit_cleanup)
     }
 }
 

@@ -135,6 +135,7 @@ impl Transaction {
         mut action_commit: ActionCommit,
         existing_updates: &mut Vec<TableUpdate>,
         existing_requirements: &mut Vec<TableRequirement>,
+        post_commit_cleanups: &mut Vec<PostCommitCleanup>,
     ) -> Result<Table> {
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
@@ -147,6 +148,10 @@ impl Transaction {
 
         existing_updates.extend(updates);
         existing_requirements.extend(requirements);
+
+        if let Some(cleanup) = action_commit.take_post_commit_cleanup() {
+            post_commit_cleanups.push(cleanup);
+        }
 
         Ok(updated_table)
     }
@@ -255,9 +260,13 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
+        let before_metadata = self.table.metadata_ref();
+        let file_io = self.table.file_io().clone();
+
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
+        let mut post_commit_cleanups: Vec<PostCommitCleanup> = vec![];
 
         for action in &self.actions {
             let action_commit = Arc::clone(action).commit(&current_table).await?;
@@ -267,6 +276,7 @@ impl Transaction {
                 action_commit,
                 &mut existing_updates,
                 &mut existing_requirements,
+                &mut post_commit_cleanups,
             )?;
         }
 
@@ -276,7 +286,15 @@ impl Transaction {
             .requirements(existing_requirements)
             .build();
 
-        catalog.update_table(table_commit).await
+        let committed_table = catalog.update_table(table_commit).await?;
+
+        // Execute post-commit cleanup callbacks (e.g., file deletion for expired snapshots)
+        let after_metadata = committed_table.metadata_ref();
+        for cleanup in post_commit_cleanups {
+            cleanup(before_metadata.clone(), after_metadata.clone(), file_io.clone()).await?;
+        }
+
+        Ok(committed_table)
     }
 }
 

@@ -318,12 +318,12 @@ impl ReachableFileCleanupStrategy {
         }
     }
 
-    fn collect_expired_snapshots<'a>(
-        &'a self,
-        before_expiration: &'a TableMetadataRef,
-        after_expiration: &'a TableMetadataRef,
-    ) -> (Vec<SnapshotRef>, HashSet<&'a str>) {
-        let mut manifest_lists_to_delete: HashSet<&str> = HashSet::default();
+    fn collect_expired_snapshots(
+        &self,
+        before_expiration: &TableMetadataRef,
+        after_expiration: &TableMetadataRef,
+    ) -> (Vec<SnapshotRef>, HashSet<String>) {
+        let mut manifest_lists_to_delete: HashSet<String> = HashSet::default();
         let mut expired_snapshots = Vec::default();
 
         for snapshot in before_expiration.snapshots() {
@@ -332,7 +332,7 @@ impl ReachableFileCleanupStrategy {
                 .is_none()
             {
                 expired_snapshots.push(snapshot.clone());
-                manifest_lists_to_delete.insert(snapshot.manifest_list());
+                manifest_lists_to_delete.insert(snapshot.manifest_list().to_string());
             }
         }
 
@@ -416,8 +416,7 @@ impl ReachableFileCleanupStrategy {
             }
         }
 
-        self.delete_files(manifest_lists_to_delete.into_iter().map(|s| s.to_string()))
-            .await?;
+        self.delete_files(manifest_lists_to_delete).await?;
 
         Ok(())
     }

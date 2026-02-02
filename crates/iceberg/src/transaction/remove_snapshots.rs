@@ -27,7 +27,7 @@ use crate::error::Result;
 use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadataRef};
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::utils::ancestors_of;
+use crate::utils::{ReachableFileCleanupStrategy, ancestors_of};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// Default value for max snapshot age in milliseconds.
@@ -382,7 +382,22 @@ impl TransactionAction for RemoveSnapshotAction {
             snapshot_id: table_meta.current_snapshot_id(),
         });
 
-        Ok(ActionCommit::new(updates, requirements))
+        let mut action_commit = ActionCommit::new(updates, requirements);
+
+        if self.clear_expire_files {
+            action_commit = action_commit.with_post_commit_cleanup(Box::new(
+                |before_metadata, after_metadata, file_io| {
+                    Box::pin(async move {
+                        let cleanup_strategy = ReachableFileCleanupStrategy::new(file_io);
+                        cleanup_strategy
+                            .clean_files(&before_metadata, &after_metadata)
+                            .await
+                    })
+                },
+            ));
+        }
+
+        Ok(action_commit)
     }
 }
 
