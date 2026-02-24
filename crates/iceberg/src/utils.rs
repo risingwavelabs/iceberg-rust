@@ -416,8 +416,10 @@ impl ReachableFileCleanupStrategy {
             }
         }
 
-        let manifest_list_strings: Vec<String> =
-            manifest_lists_to_delete.into_iter().map(str::to_owned).collect();
+        let manifest_list_strings: Vec<String> = manifest_lists_to_delete
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         self.delete_files(manifest_list_strings).await?;
 
         Ok(())
@@ -601,7 +603,11 @@ mod cleanup_tests {
                 .unwrap()
         };
 
-        let (_, props, _) = table_with_region.file_io().clone().into_builder().into_parts();
+        let (_, props, _) = table_with_region
+            .file_io()
+            .clone()
+            .into_builder()
+            .into_parts();
         assert_eq!(
             props.get(S3_REGION).map(|s| s.as_str()),
             Some(s3_region),
@@ -617,8 +623,11 @@ mod cleanup_tests {
             .build()
             .unwrap();
 
-        let (_, committed_props, _) =
-            table_from_catalog.file_io().clone().into_builder().into_parts();
+        let (_, committed_props, _) = table_from_catalog
+            .file_io()
+            .clone()
+            .into_builder()
+            .into_parts();
         assert!(
             committed_props.get(S3_REGION).is_none(),
             "Catalog-returned table's FileIO should lack the S3 region property"
@@ -626,8 +635,7 @@ mod cleanup_tests {
 
         let restored_table = table_from_catalog.with_file_io(original_file_io);
 
-        let (_, restored_props, _) =
-            restored_table.file_io().clone().into_builder().into_parts();
+        let (_, restored_props, _) = restored_table.file_io().clone().into_builder().into_parts();
         assert_eq!(
             restored_props.get(S3_REGION).map(|s| s.as_str()),
             Some(s3_region),
