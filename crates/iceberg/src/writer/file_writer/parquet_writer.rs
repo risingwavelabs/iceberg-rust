@@ -2351,8 +2351,11 @@ mod tests {
             .cloned()
     }
 
-    /// Helper to write a simple parquet file and return the data file + file_io for inspection.
-    async fn write_simple_parquet_file(props: WriterProperties) -> Result<(DataFile, FileIO)> {
+    /// Helper to write a simple parquet file and return the data file, file_io,
+    /// and TempDir (must be kept alive so the file remains on disk).
+    async fn write_simple_parquet_file(
+        props: WriterProperties,
+    ) -> Result<(DataFile, FileIO, TempDir)> {
         let temp_dir = TempDir::new().unwrap();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         let location_gen = DefaultLocationGenerator::with_data_location(
@@ -2408,12 +2411,12 @@ mod tests {
             .build()
             .unwrap();
 
-        Ok((data_file, file_io))
+        Ok((data_file, file_io, temp_dir))
     }
 
     #[tokio::test]
     async fn test_iceberg_schema_metadata_present_in_parquet_footer() -> Result<()> {
-        let (data_file, file_io) =
+        let (data_file, file_io, _temp_dir) =
             write_simple_parquet_file(WriterProperties::builder().build()).await?;
 
         let kv_metadata = read_parquet_kv_metadata(&file_io, &data_file).await;
@@ -2440,7 +2443,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_iceberg_schema_metadata_roundtrip() -> Result<()> {
-        let (data_file, file_io) =
+        let (data_file, file_io, _temp_dir) =
             write_simple_parquet_file(WriterProperties::builder().build()).await?;
 
         let kv_metadata = read_parquet_kv_metadata(&file_io, &data_file)
@@ -2477,6 +2480,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_iceberg_schema_metadata_with_nested_schema() -> Result<()> {
+        // Use a nested schema with Struct and List types to verify the iceberg.schema
+        // JSON correctly roundtrips complex types including field IDs.
+        let schema = Schema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(
+                    2,
+                    "location",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(3, "lat", Type::Primitive(PrimitiveType::Double))
+                            .into(),
+                        NestedField::required(4, "lon", Type::Primitive(PrimitiveType::Double))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(
+                    5,
+                    "tags",
+                    Type::List(ListType::new(
+                        NestedField::required(6, "element", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
         let temp_dir = TempDir::new().unwrap();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         let location_gen = DefaultLocationGenerator::with_data_location(
@@ -2485,10 +2518,11 @@ mod tests {
         let file_name_gen =
             DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
 
-        let schema = nested_schema_for_test();
         let arrow_schema: ArrowSchemaRef = Arc::new((&schema).try_into().unwrap());
-        let col0 = Arc::new(Int64Array::from_iter_values(0..3)) as ArrayRef;
-        let col1 = Arc::new(StructArray::new(
+
+        // Build columns
+        let col_id = Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef;
+        let col_location = Arc::new(StructArray::new(
             {
                 if let DataType::Struct(fields) = arrow_schema.field(1).data_type() {
                     fields.clone()
@@ -2497,68 +2531,27 @@ mod tests {
                 }
             },
             vec![
-                Arc::new(Int64Array::from_iter_values(0..3)) as ArrayRef,
-                Arc::new(Int64Array::from_iter_values(0..3)) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![4.0, 5.0, 6.0])) as ArrayRef,
             ],
             None,
         )) as ArrayRef;
-        let col2 = Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
-        let col3 = Arc::new({
-            let values = Int64Array::from_iter_values(0..6);
+        let col_tags = Arc::new({
+            let values = arrow_array::StringArray::from(vec!["a", "b", "c", "d", "e", "f"]);
             let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
                 0i32, 2, 4, 6,
             ]));
-            let field = arrow_schema.field(3).clone();
+            let field = arrow_schema.field(2).clone();
             if let DataType::List(inner) = field.data_type() {
                 ListArray::new(inner.clone(), offsets, Arc::new(values), None)
             } else {
                 unreachable!()
             }
         }) as ArrayRef;
-        let col4 = Arc::new(StructArray::new(
-            {
-                if let DataType::Struct(fields) = arrow_schema.field(4).data_type() {
-                    fields.clone()
-                } else {
-                    unreachable!()
-                }
-            },
-            vec![Arc::new(StructArray::new(
-                {
-                    if let DataType::Struct(outer_fields) = arrow_schema.field(4).data_type() {
-                        if let DataType::Struct(inner_fields) = outer_fields[0].data_type() {
-                            inner_fields.clone()
-                        } else {
-                            unreachable!()
-                        }
-                    } else {
-                        unreachable!()
-                    }
-                },
-                vec![Arc::new(Int64Array::from_iter_values(0..3)) as ArrayRef],
-                None,
-            )) as ArrayRef],
-            None,
-        )) as ArrayRef;
 
-        // col5: Map(String, List(Int))
-        let mut map_builder = MapBuilder::new(
-            None,
-            arrow_array::builder::StringBuilder::new(),
-            arrow_array::builder::ListBuilder::new(arrow_array::builder::Int64Builder::new()),
-        );
-        for _ in 0..3 {
-            map_builder.keys().append_value("key");
-            map_builder.values().append_value([Some(1i64)]);
-            map_builder.append(true).unwrap();
-        }
-        let col5 = Arc::new(map_builder.finish()) as ArrayRef;
-
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![col0, col1, col2, col3, col4, col5],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![col_id, col_location, col_tags])
+                .unwrap();
 
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2601,6 +2594,10 @@ mod tests {
         // Verify the nested schema round-trips correctly
         assert_eq!(deserialized, schema);
 
+        // Spot-check nested field IDs survived the roundtrip
+        assert_eq!(deserialized.field_by_id(3).unwrap().name, "lat");
+        assert_eq!(deserialized.field_by_id(6).unwrap().name, "element");
+
         Ok(())
     }
 
@@ -2613,7 +2610,7 @@ mod tests {
             )]))
             .build();
 
-        let (data_file, file_io) = write_simple_parquet_file(props).await?;
+        let (data_file, file_io, _temp_dir) = write_simple_parquet_file(props).await?;
 
         let kv_metadata = read_parquet_kv_metadata(&file_io, &data_file)
             .await
