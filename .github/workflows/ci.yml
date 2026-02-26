@@ -101,7 +101,7 @@ jobs:
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
-          root-reserve-mb: 4096
+          root-reserve-mb: 10240
 
       - uses: actions/checkout@v5
 
@@ -150,7 +150,7 @@ jobs:
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
-          root-reserve-mb: 4096
+          root-reserve-mb: 10240
 
       - uses: actions/checkout@v5
 
