@@ -32,6 +32,7 @@ runs:
         RUST_VERSION: ${{ inputs.rust-version }}
       run: |
         echo "Installing ${RUST_VERSION}"
+        rustup set profile minimal
         rustup toolchain install ${RUST_VERSION}
         rustup override set ${RUST_VERSION}
         rustup component add rustfmt clippy
@@ -40,6 +41,7 @@ runs:
       if: ${{ inputs.rust-version == '' }}
       run: |
         echo "Installing toolchain according to rust-toolchain.toml"
+        rustup set profile minimal
         rustup show
         rustup component add rustfmt clippy
     - name: Fixup git permissions
