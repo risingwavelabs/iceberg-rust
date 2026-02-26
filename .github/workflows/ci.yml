@@ -55,6 +55,17 @@ jobs:
           - ubuntu-latest
           - macos-latest
     steps:
+      - name: Maximize build space (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          root-reserve-mb: 10240
+
       - uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
@@ -94,7 +105,7 @@ jobs:
     steps:
       - name: Maximize build space (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        uses: easimon/maximize-build-space@master
+        uses: easimon/maximize-build-space@v10
         with:
           remove-dotnet: "true"
           remove-android: "true"
@@ -102,7 +113,6 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
           root-reserve-mb: 10240
-          temp-reserve-mb: 10240
 
       - uses: actions/checkout@v5
 
@@ -144,15 +154,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Maximize build space
-        uses: easimon/maximize-build-space@master
+        uses: easimon/maximize-build-space@v10
         with:
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
-          root-reserve-mb: 10240
-          temp-reserve-mb: 10240
+          root-reserve-mb: 8192
 
       - uses: actions/checkout@v5
 
@@ -180,6 +189,16 @@ jobs:
     name: Verify MSRV
     runs-on: ubuntu-latest
     steps:
+      - name: Maximize build space (Ubuntu)
+        uses: easimon/maximize-build-space@v10
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          root-reserve-mb: 10240
+
       - uses: actions/checkout@v5
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -189,7 +208,5 @@ jobs:
         uses: ./.github/actions/setup-builder
         with:
           rust-version: ${{ env.rust_msrv }}
-      - name: Setup Nightly Rust toolchain
-        uses: ./.github/actions/setup-builder
       - name: Check MSRV
         run: make check-msrv
