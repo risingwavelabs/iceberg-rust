@@ -102,7 +102,6 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
           root-reserve-mb: 4096
-          temp-reserve-mb: 4096
 
       - uses: actions/checkout@v5
 
@@ -152,7 +151,6 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
           root-reserve-mb: 4096
-          temp-reserve-mb: 4096
 
       - uses: actions/checkout@v5
 
