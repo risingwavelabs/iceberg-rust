@@ -41,9 +41,9 @@ runs:
       if: ${{ inputs.rust-version == '' }}
       run: |
         echo "Installing toolchain according to rust-toolchain.toml"
-        rustup set profile minimal
-        rustup show
-        rustup component add rustfmt clippy
+        RUST_TOOLCHAIN="$(awk -F'\"' '/^channel/ {print $2}' rust-toolchain.toml)"
+        rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component rustfmt --component clippy
+        rustup override set "${RUST_TOOLCHAIN}"
     - name: Fixup git permissions
       # https://github.com/actions/checkout/issues/766
       shell: bash
