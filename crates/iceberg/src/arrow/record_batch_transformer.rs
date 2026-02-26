@@ -568,6 +568,13 @@ impl RecordBatchTransformer {
                 let vals: Vec<Option<i64>> = vec![None; num_rows];
                 Arc::new(Int64Array::from(vals))
             }
+            (DataType::Timestamp(_, _), Some(PrimitiveLiteral::Long(value))) => {
+                cast(&Int64Array::from(vec![*value; num_rows]), target_type)?
+            }
+            (DataType::Timestamp(_, _), None) => {
+                let vals: Vec<Option<i64>> = vec![None; num_rows];
+                cast(&Int64Array::from(vals), target_type)?
+            }
             (DataType::Float32, Some(PrimitiveLiteral::Float(value))) => {
                 Arc::new(Float32Array::from(vec![value.0; num_rows]))
             }
@@ -629,7 +636,7 @@ mod test {
 
     use arrow_array::{
         Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        StringArray, TimestampMicrosecondArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -758,6 +765,58 @@ mod test {
         assert!(date_column.is_null(0));
         assert!(date_column.is_null(1));
         assert!(date_column.is_null(2));
+    }
+
+    #[test]
+    fn schema_evolution_adds_timestamp_column_with_nulls() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "ts_col", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let projected_iceberg_field_ids = [1, 2];
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+                .build();
+
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "id",
+            DataType::Int32,
+            false,
+            "1",
+        )]));
+
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+
+        let id_column = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_column.values(), &[1, 2, 3]);
+
+        let ts_column = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(ts_column.is_null(0));
+        assert!(ts_column.is_null(1));
+        assert!(ts_column.is_null(2));
     }
 
     #[test]
