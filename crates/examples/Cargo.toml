@@ -25,9 +25,13 @@ rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+parquet = { workspace = true }
+reqwest = { workspace = true, features = ["native-tls"] }
 tokio = { workspace = true, features = ["full"] }
 
 [[example]]
@@ -37,6 +41,10 @@ path = "src/rest_catalog_namespace.rs"
 [[example]]
 name = "rest-catalog-table"
 path = "src/rest_catalog_table.rs"
+
+[[example]]
+name = "r2dc-iceberg-schema-test"
+path = "src/r2dc_iceberg_schema_test.rs"
 
 [[example]]
 name = "oss-backend"

@@ -506,20 +506,26 @@ mod tests {
             )])),
         ]));
 
-        let batch_one = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1])),
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"])),
-            Arc::new(Int32Array::from(vec![INSERT_OP; 7])),
-        ])?;
+        let batch_one = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"])),
+                Arc::new(Int32Array::from(vec![INSERT_OP; 7])),
+            ],
+        )?;
         delta_writer.write(batch_one).await?;
 
-        let batch_two = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-            Arc::new(StringArray::from(vec!["a", "b", "k", "l"])),
-            Arc::new(Int32Array::from(vec![
-                DELETE_OP, DELETE_OP, DELETE_OP, INSERT_OP,
-            ])),
-        ])?;
+        let batch_two = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "k", "l"])),
+                Arc::new(Int32Array::from(vec![
+                    DELETE_OP, DELETE_OP, DELETE_OP, INSERT_OP,
+                ])),
+            ],
+        )?;
         delta_writer.write(batch_two).await?;
 
         let data_files = delta_writer.close().await?;
@@ -547,12 +553,15 @@ mod tests {
             .unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         let res = concat_batches(&data_schema, &batches).unwrap();
-        let expected_batches = RecordBatch::try_new(data_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1, 4])),
-            Arc::new(StringArray::from(vec![
-                "a", "b", "c", "d", "e", "f", "g", "l",
-            ])),
-        ])?;
+        let expected_batches = RecordBatch::try_new(
+            data_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1, 4])),
+                Arc::new(StringArray::from(vec![
+                    "a", "b", "c", "d", "e", "f", "g", "l",
+                ])),
+            ],
+        )?;
         assert_eq!(expected_batches, res);
 
         let position_delete_file = data_files
@@ -569,13 +578,16 @@ mod tests {
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         let position_schema = Arc::new(position_delete_arrow_schema());
         let res = concat_batches(&position_schema, &batches).unwrap();
-        let expected_batches = RecordBatch::try_new(position_schema.clone(), vec![
-            Arc::new(StringArray::from(vec![
-                data_file_path.clone(),
-                data_file_path.clone(),
-            ])),
-            Arc::new(Int64Array::from(vec![0, 1])),
-        ])?;
+        let expected_batches = RecordBatch::try_new(
+            position_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    data_file_path.clone(),
+                    data_file_path.clone(),
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1])),
+            ],
+        )?;
         assert_eq!(expected_batches, res);
 
         let equality_delete_file = data_files
@@ -595,10 +607,13 @@ mod tests {
         )?);
         let equality_arrow_schema = Arc::new(schema_to_arrow_schema(&equality_schema)?);
         let res = concat_batches(&equality_arrow_schema, &batches).unwrap();
-        let expected_batches = RecordBatch::try_new(equality_arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![3])),
-            Arc::new(StringArray::from(vec!["k"])),
-        ])?;
+        let expected_batches = RecordBatch::try_new(
+            equality_arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["k"])),
+            ],
+        )?;
         assert_eq!(expected_batches, res);
 
         Ok(())

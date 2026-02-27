@@ -98,11 +98,14 @@ async fn test_overwrite_data_files() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let data_file = data_file_writer.close().await.unwrap();
@@ -298,11 +301,14 @@ async fn test_multiple_file_overwrite() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let data_file1 = data_file_writer.close().await.unwrap();
@@ -384,11 +390,14 @@ async fn test_overwrite_nonexistent_file() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let valid_data_file = data_file_writer.close().await.unwrap();
@@ -454,11 +463,14 @@ async fn test_sequence_number_in_manifest_entry() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let data_file1 = data_file_writer.close().await.unwrap();
@@ -556,11 +568,14 @@ async fn test_partition_spec_id_in_manifest() {
         let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
         let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
         let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(col1) as ArrayRef,
-            Arc::new(col2) as ArrayRef,
-            Arc::new(col3) as ArrayRef,
-        ])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(col1) as ArrayRef,
+                Arc::new(col2) as ArrayRef,
+                Arc::new(col3) as ArrayRef,
+            ],
+        )
         .unwrap();
         data_file_writer.write(batch.clone()).await.unwrap();
         data_file_writer.close().await.unwrap()[0].clone()
@@ -655,11 +670,14 @@ async fn test_overwrite_files_to_branch() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let original_files = data_file_writer.close().await.unwrap();
@@ -790,11 +808,14 @@ async fn test_branch_snapshot_isolation() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let data_files = data_file_writer.close().await.unwrap();
@@ -891,11 +912,14 @@ async fn test_overwrite_files_with_sequence_number_from_branch() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1) as ArrayRef,
-        Arc::new(col2) as ArrayRef,
-        Arc::new(col3) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1) as ArrayRef,
+            Arc::new(col2) as ArrayRef,
+            Arc::new(col3) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let original_files = data_file_writer.close().await.unwrap();
@@ -986,11 +1010,14 @@ async fn test_multiple_branches_isolation() {
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(col1.clone()) as ArrayRef,
-        Arc::new(col2.clone()) as ArrayRef,
-        Arc::new(col3.clone()) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(col1.clone()) as ArrayRef,
+            Arc::new(col2.clone()) as ArrayRef,
+            Arc::new(col3.clone()) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     let original_files = data_file_writer.close().await.unwrap();
@@ -1008,11 +1035,14 @@ async fn test_multiple_branches_isolation() {
     // Create branch2 with modified data
     let mut data_file_writer = data_file_writer_builder.build(None).await.unwrap();
     let modified_col1 = StringArray::from(vec![Some("modified"), Some("data"), None, Some("here")]);
-    let modified_batch = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(modified_col1) as ArrayRef,
-        Arc::new(col2.clone()) as ArrayRef,
-        Arc::new(col3.clone()) as ArrayRef,
-    ])
+    let modified_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(modified_col1) as ArrayRef,
+            Arc::new(col2.clone()) as ArrayRef,
+            Arc::new(col3.clone()) as ArrayRef,
+        ],
+    )
     .unwrap();
     data_file_writer
         .write(modified_batch.clone())

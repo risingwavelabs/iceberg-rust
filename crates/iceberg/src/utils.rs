@@ -94,7 +94,9 @@ pub mod bin {
         }
 
         pub fn pack<F>(&self, items: Vec<T>, weight_func: F) -> Vec<Vec<T>>
-        where F: Fn(&T) -> u32 {
+        where
+            F: Fn(&T) -> u32,
+        {
             let mut bins: Vec<Bin<T>> = vec![];
             for item in items {
                 let cur_weight = weight_func(&item);
@@ -354,7 +356,9 @@ impl ReachableFileCleanupStrategy {
 
     /// Deletes files concurrently with the configured concurrency limit.
     async fn delete_files<I>(&self, paths: I) -> Result<()>
-    where I: IntoIterator<Item = String> {
+    where
+        I: IntoIterator<Item = String>,
+    {
         stream::iter(paths)
             .map(|path| {
                 let file_io = self.file_io.clone();

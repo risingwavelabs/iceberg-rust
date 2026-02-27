@@ -284,7 +284,9 @@ impl Storage {
 }
 
 fn parse_config<T>(config: &HashMap<String, String>, key: &str) -> crate::Result<Option<T>>
-where T: std::str::FromStr {
+where
+    T: std::str::FromStr,
+{
     match config.get(key) {
         Some(value_str) => match value_str.parse::<T>() {
             Ok(value) => Ok(Some(value)),

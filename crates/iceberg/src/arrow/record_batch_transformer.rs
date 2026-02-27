@@ -702,14 +702,17 @@ mod test {
             simple_field("name", DataType::Utf8, true, "2"),
         ]));
 
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                Some("Charlie"),
-            ])),
-        ])
+        let file_batch = RecordBatch::try_new(
+            file_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    Some("Alice"),
+                    Some("Bob"),
+                    Some("Charlie"),
+                ])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
@@ -780,27 +783,30 @@ mod test {
     }
 
     pub fn expected_record_batch_migration_required() -> RecordBatch {
-        RecordBatch::try_new(arrow_schema_already_same_as_target(), vec![
-            Arc::new(StringArray::from(Vec::<Option<String>>::from([
-                None, None, None,
-            ]))), // a
-            Arc::new(Int64Array::from(vec![Some(1001), Some(1002), Some(1003)])), // b
-            Arc::new(Float64Array::from(vec![
-                Some(12.125),
-                Some(23.375),
-                Some(34.875),
-            ])), // c
-            Arc::new(StringArray::from(vec![
-                Some("Apache"),
-                Some("Iceberg"),
-                Some("Rocks"),
-            ])), // e (d skipped by projection)
-            Arc::new(StringArray::from(vec![
-                Some("(╯°□°）╯"),
-                Some("(╯°□°）╯"),
-                Some("(╯°□°）╯"),
-            ])), // f
-        ])
+        RecordBatch::try_new(
+            arrow_schema_already_same_as_target(),
+            vec![
+                Arc::new(StringArray::from(Vec::<Option<String>>::from([
+                    None, None, None,
+                ]))), // a
+                Arc::new(Int64Array::from(vec![Some(1001), Some(1002), Some(1003)])), // b
+                Arc::new(Float64Array::from(vec![
+                    Some(12.125),
+                    Some(23.375),
+                    Some(34.875),
+                ])), // c
+                Arc::new(StringArray::from(vec![
+                    Some("Apache"),
+                    Some("Iceberg"),
+                    Some("Rocks"),
+                ])), // e (d skipped by projection)
+                Arc::new(StringArray::from(vec![
+                    Some("(╯°□°）╯"),
+                    Some("(╯°□°）╯"),
+                    Some("(╯°□°）╯"),
+                ])), // f
+            ],
+        )
         .unwrap()
     }
 
@@ -918,10 +924,13 @@ mod test {
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
 
         // Create a Parquet RecordBatch with data for: name="John Doe", subdept="communications"
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(StringArray::from(vec!["John Doe"])),
-            Arc::new(StringArray::from(vec!["communications"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["John Doe"])),
+                Arc::new(StringArray::from(vec!["communications"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1047,10 +1056,13 @@ mod test {
 
         // Create a Parquet RecordBatch with actual data
         // The id column MUST be read from here, not treated as a constant
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200, 300])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1165,10 +1177,13 @@ mod test {
                 .with_partition(partition_spec, partition_data)
                 .build();
 
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1282,10 +1297,13 @@ mod test {
 
         // Create a Parquet RecordBatch with actual data
         // Despite column rename, data should be read via field_id=1
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200, 300])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1384,10 +1402,13 @@ mod test {
                 .with_partition(partition_spec, partition_data)
                 .build();
 
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200])),
-            Arc::new(StringArray::from(vec!["value1", "value2"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["value1", "value2"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
