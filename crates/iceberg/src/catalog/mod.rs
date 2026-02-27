@@ -774,9 +774,7 @@ pub(super) mod _serde {
     pub(super) fn deserialize_snapshot<'de, D>(
         deserializer: D,
     ) -> std::result::Result<Snapshot, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let buf = CatalogSnapshot::deserialize(deserializer)?;
         Ok(buf.into())
     }
@@ -997,9 +995,7 @@ mod _serde_set_statistics {
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<StatisticsFile, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let SetStatistics {
             snapshot_id,
             statistics,

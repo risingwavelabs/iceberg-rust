@@ -74,14 +74,11 @@ async fn write_new_data_file(table: &Table) -> Vec<DataFile> {
     let col1 = StringArray::from(vec![Some("foo"); 100]);
     let col2 = Int32Array::from(vec![Some(1); 100]);
     let col3 = BooleanArray::from(vec![Some(true); 100]);
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(col1) as ArrayRef,
-            Arc::new(col2) as ArrayRef,
-            Arc::new(col3) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(schema.clone(), vec![
+        Arc::new(col1) as ArrayRef,
+        Arc::new(col2) as ArrayRef,
+        Arc::new(col3) as ArrayRef,
+    ])
     .unwrap();
     data_file_writer.write(batch.clone()).await.unwrap();
     data_file_writer.close().await.unwrap()

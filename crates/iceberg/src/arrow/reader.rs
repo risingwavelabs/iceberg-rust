@@ -2017,30 +2017,27 @@ message schema {
     async fn test_predicate_cast_literal() {
         let predicates = vec![
             // a == 'foo'
-            (
-                Reference::new("a").equal_to(Datum::string("foo")),
-                vec![Some("foo".to_string())],
-            ),
+            (Reference::new("a").equal_to(Datum::string("foo")), vec![
+                Some("foo".to_string()),
+            ]),
             // a != 'foo'
             (
                 Reference::new("a").not_equal_to(Datum::string("foo")),
                 vec![Some("bar".to_string())],
             ),
             // STARTS_WITH(a, 'foo')
-            (
-                Reference::new("a").starts_with(Datum::string("f")),
-                vec![Some("foo".to_string())],
-            ),
+            (Reference::new("a").starts_with(Datum::string("f")), vec![
+                Some("foo".to_string()),
+            ]),
             // NOT STARTS_WITH(a, 'foo')
             (
                 Reference::new("a").not_starts_with(Datum::string("f")),
                 vec![Some("bar".to_string())],
             ),
             // a < 'foo'
-            (
-                Reference::new("a").less_than(Datum::string("foo")),
-                vec![Some("bar".to_string())],
-            ),
+            (Reference::new("a").less_than(Datum::string("foo")), vec![
+                Some("bar".to_string()),
+            ]),
             // a <= 'foo'
             (
                 Reference::new("a").less_than_or_equal_to(Datum::string("foo")),
@@ -2355,20 +2352,17 @@ message schema {
         let file_path = format!("{}/multi_row_group.parquet", &table_location);
 
         // Force each batch into its own row group for testing byte range filtering.
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (0..100).collect::<Vec<i32>>(),
+        ))])
         .unwrap();
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from((100..200).collect::<Vec<i32>>()))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (100..200).collect::<Vec<i32>>(),
+        ))])
         .unwrap();
-        let batch3 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from((200..300).collect::<Vec<i32>>()))],
-        )
+        let batch3 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (200..300).collect::<Vec<i32>>(),
+        ))])
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -2679,16 +2673,14 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{}/data.parquet", &table_location);
 
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=100),
+        )])
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(101..=200),
+        )])
         .unwrap();
 
         // Force each batch into its own row group
@@ -2727,13 +2719,10 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(
-            delete_schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-                Arc::new(Int64Array::from_iter_values(vec![199i64])),
-            ],
-        )
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+            Arc::new(Int64Array::from_iter_values(vec![199i64])),
+        ])
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -2897,16 +2886,14 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{}/data.parquet", &table_location);
 
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=100),
+        )])
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(101..=200),
+        )])
         .unwrap();
 
         // Force each batch into its own row group
@@ -2945,13 +2932,10 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(
-            delete_schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-                Arc::new(Int64Array::from_iter_values(vec![199i64])),
-            ],
-        )
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+            Arc::new(Int64Array::from_iter_values(vec![199i64])),
+        ])
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -3143,16 +3127,14 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{}/data.parquet", &table_location);
 
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=100),
+        )])
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(101..=200),
+        )])
         .unwrap();
 
         // Force each batch into its own row group
@@ -3191,13 +3173,10 @@ message schema {
         ]));
 
         // Delete row at position 0 (0-indexed, so it's the first row: id=1)
-        let delete_batch = RecordBatch::try_new(
-            delete_schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-                Arc::new(Int64Array::from_iter_values(vec![0i64])),
-            ],
-        )
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+            Arc::new(Int64Array::from_iter_values(vec![0i64])),
+        ])
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -3437,10 +3416,9 @@ message schema {
         let col3_data = Arc::new(StringArray::from(vec!["c", "d"])) as ArrayRef;
         let col4_data = Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![col1_data, col2_data, col3_data, col4_data],
-        )
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            col1_data, col2_data, col3_data, col4_data,
+        ])
         .unwrap();
 
         let props = WriterProperties::builder()

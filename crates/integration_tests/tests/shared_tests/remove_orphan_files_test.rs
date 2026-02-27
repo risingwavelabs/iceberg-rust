@@ -69,14 +69,11 @@ async fn write_data_files(
         .await
         .unwrap();
 
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
+    ])
     .unwrap();
 
     writer.write(batch).await.unwrap();
@@ -454,14 +451,11 @@ async fn test_after_rewrite() {
         .await
         .unwrap();
 
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
-            Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
+    ])
     .unwrap();
 
     writer.write(batch).await.unwrap();

@@ -276,9 +276,7 @@ impl PrimitiveType {
 
 impl Serialize for Type {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         let type_serde = _serde::SerdeType::from(self);
         type_serde.serialize(serializer)
     }
@@ -286,9 +284,7 @@ impl Serialize for Type {
 
 impl<'de> Deserialize<'de> for Type {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let type_serde = _serde::SerdeType::deserialize(deserializer)?;
         Ok(Type::from(type_serde))
     }
@@ -296,9 +292,7 @@ impl<'de> Deserialize<'de> for Type {
 
 impl<'de> Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let s = String::deserialize(deserializer)?;
         if s.starts_with("decimal") {
             deserialize_decimal(s.into_deserializer())
@@ -312,9 +306,7 @@ impl<'de> Deserialize<'de> for PrimitiveType {
 
 impl Serialize for PrimitiveType {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         match self {
             PrimitiveType::Decimal { precision, scale } => {
                 serialize_decimal(precision, scale, serializer)
@@ -326,9 +318,7 @@ impl Serialize for PrimitiveType {
 }
 
 fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
-where
-    D: Deserializer<'de>,
-{
+where D: Deserializer<'de> {
     let s = String::deserialize(deserializer)?;
     let (precision, scale) = s
         .trim_start_matches(r"decimal(")
@@ -354,9 +344,7 @@ where
 }
 
 fn deserialize_fixed<'de, D>(deserializer: D) -> std::result::Result<PrimitiveType, D::Error>
-where
-    D: Deserializer<'de>,
-{
+where D: Deserializer<'de> {
     let fixed = String::deserialize(deserializer)?
         .trim_start_matches(r"fixed[")
         .trim_end_matches(']')
@@ -369,9 +357,7 @@ where
 }
 
 fn serialize_fixed<S>(value: &u64, serializer: S) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
+where S: Serializer {
     serializer.serialize_str(&format!("fixed[{value}]"))
 }
 
@@ -415,9 +401,7 @@ pub struct StructType {
 
 impl<'de> Deserialize<'de> for StructType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "lowercase")]
         enum Field {
@@ -435,9 +419,7 @@ impl<'de> Deserialize<'de> for StructType {
             }
 
             fn visit_map<V>(self, mut map: V) -> std::result::Result<StructType, V::Error>
-            where
-                V: MapAccess<'de>,
-            {
+            where V: MapAccess<'de> {
                 let mut fields = None;
                 while let Some(key) = map.next_key()? {
                     match key {

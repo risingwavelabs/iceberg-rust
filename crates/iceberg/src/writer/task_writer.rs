@@ -353,14 +353,11 @@ mod tests {
         let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
         let mut task_writer = TaskWriter::new(writer_builder, false, schema, partition_spec);
 
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["US", "EU", "US"])) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["US", "EU", "US"])) as ArrayRef,
+        ])?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;
@@ -428,14 +425,11 @@ mod tests {
             Some(partition_splitter),
         );
 
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])) as ArrayRef,
+        ])?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;
@@ -472,15 +466,12 @@ mod tests {
             Arc::new(partition_values) as ArrayRef,
         )]);
 
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])) as ArrayRef,
-                Arc::new(partition_struct) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])) as ArrayRef,
+            Arc::new(partition_struct) as ArrayRef,
+        ])?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;
@@ -517,15 +508,12 @@ mod tests {
             Arc::new(partition_values) as ArrayRef,
         )]);
 
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["ASIA", "ASIA", "EU", "EU"])) as ArrayRef,
-                Arc::new(partition_struct) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["ASIA", "ASIA", "EU", "EU"])) as ArrayRef,
+            Arc::new(partition_struct) as ArrayRef,
+        ])?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;

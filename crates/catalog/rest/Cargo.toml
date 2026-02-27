@@ -36,7 +36,7 @@ gcp_auth = "0.12"
 http = { workspace = true }
 iceberg = { workspace = true }
 itertools = { workspace = true }
-reqwest = { workspace = true, features = ["native-tls"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
