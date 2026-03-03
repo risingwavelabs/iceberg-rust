@@ -27,6 +27,32 @@ use crate::runtime::spawn;
 use crate::scan::{DeleteFileContext, FileScanTask};
 use crate::spec::{DataContentType, DataFile, Struct};
 
+// Iceberg field id for the `file_path` column in position delete files.
+//
+// See Iceberg spec (position deletes) and our `POSITION_DELETE_SCHEMA` in
+// `writer/base_writer/position_delete_file_writer.rs`.
+const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2147483546;
+
+fn try_infer_single_referenced_data_file_from_bounds(delete_file: &DataFile) -> Option<String> {
+    // Match Iceberg Java's `DeleteFileUtil.referencedDataFile(DeleteFile)` heuristic:
+    // if lower and upper bounds for PATH_ID are present and equal, the delete file
+    // targets a single data file.
+    let lower = delete_file
+        .lower_bounds
+        .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH)?;
+    let upper = delete_file
+        .upper_bounds
+        .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH)?;
+
+    if lower != upper {
+        return None;
+    }
+
+    let bytes = lower.to_bytes().ok()?;
+    let path = std::str::from_utf8(bytes.as_ref()).ok()?;
+    Some(path.to_string())
+}
+
 /// Index of delete files
 #[derive(Debug, Clone)]
 pub(crate) struct DeleteFileIndex {
@@ -175,7 +201,7 @@ impl PopulatedDeleteFileIndex {
             .filter(|&(delete, _)| {
                 seq_num
                     .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
-                    .unwrap_or_else(|| true)
+                    .unwrap_or(true)
             })
             .for_each(|(_, task)| results.push(task.clone()));
 
@@ -186,25 +212,42 @@ impl PopulatedDeleteFileIndex {
                 .filter(|&(delete, _)| {
                     seq_num
                         .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
-                        .unwrap_or_else(|| true)
+                        .unwrap_or(true)
                         && data_file.partition_spec_id == delete.partition_spec_id
                 })
                 .for_each(|(_, task)| results.push(task.clone()));
         }
 
-        // TODO: the spec states that:
-        //     "The data file's file_path is equal to the delete file's referenced_data_file if it is non-null".
-        //     we're not yet doing that here. The referenced data file's name will also be present in the positional
-        //     delete file's file path column.
+        // Per the spec, position deletes with a non-null `referenced_data_file` apply only to the
+        // matching data file (exact match against the data file's `file_path`).
+        //
+        // Note: if `referenced_data_file` is null, a position delete file may contain deletes for
+        // multiple data files. In that case, additional filtering must happen when reading the
+        // position delete file contents (using the `file_path` column).
+        //
+        // Iceberg Java additionally derives an implicit referenced data file from
+        // `lower_bounds`/`upper_bounds` for the position delete's `file_path` column when those
+        // bounds indicate a single value. We apply the same pruning here.
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
             deletes
                 .iter()
                 // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
                 .filter(|&(delete, _)| {
+                    let delete_data_file = delete.manifest_entry.data_file();
+
+                    let referenced_data_file_matches = match delete_data_file.referenced_data_file.as_deref() {
+                        Some(referenced_data_file) => referenced_data_file == data_file.file_path(),
+                        None => match try_infer_single_referenced_data_file_from_bounds(delete_data_file) {
+                            Some(referenced_data_file) => referenced_data_file == data_file.file_path(),
+                            None => true,
+                        },
+                    };
+
                     seq_num
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
-                        .unwrap_or_else(|| true)
+                        .unwrap_or(true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                        && referenced_data_file_matches
                 })
                 .for_each(|(_, task)| results.push(task.clone()));
         }
@@ -219,8 +262,8 @@ mod tests {
 
     use super::*;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus,
-        Schema, Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
+        ManifestStatus, Schema, Struct,
     };
 
     #[test]
@@ -445,12 +488,326 @@ mod tests {
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::PositionDeletes)
             .record_count(1)
-            .referenced_data_file(Some("/some-data-file.parquet".to_string()))
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_pos_deletes_referenced_data_file_filters_to_single_data_file() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+
+        let data_a_path = "s3://bucket/data-a.parquet".to_string();
+        let data_b_path = "s3://bucket/data-b.parquet".to_string();
+
+        let data_a = DataFileBuilder::default()
+            .file_path(data_a_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let data_b = DataFileBuilder::default()
+            .file_path(data_b_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let pos_delete_a = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-a.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(Some(data_a_path.clone()))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let pos_delete_b = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-b.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(Some(data_b_path.clone()))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let pos_delete_any = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-any.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(None)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let deletes: Vec<ManifestEntry> = vec![
+            build_added_manifest_entry(10, &pos_delete_a),
+            build_added_manifest_entry(10, &pos_delete_b),
+            build_added_manifest_entry(10, &pos_delete_any),
+        ];
+
+        let delete_contexts: Vec<DeleteFileContext> = deletes
+            .into_iter()
+            .map(|entry| DeleteFileContext {
+                manifest_entry: entry.into(),
+                partition_spec_id: spec_id,
+                snapshot_schema: Arc::new(
+                    Schema::builder().with_schema_id(1).build().unwrap(),
+                ), // hack
+                field_ids: Arc::new(vec![]), // hack
+            })
+            .collect();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        let deletes_for_a = delete_file_index.get_deletes_for_data_file(&data_a, Some(0));
+        let mut delete_paths_for_a: Vec<String> = deletes_for_a
+            .into_iter()
+            .map(|task| task.data_file_path.clone())
+            .collect();
+        delete_paths_for_a.sort();
+
+        assert_eq!(
+            delete_paths_for_a,
+            vec![
+                "s3://bucket/pos-delete-a.parquet".to_string(),
+                "s3://bucket/pos-delete-any.parquet".to_string(),
+            ]
+        );
+
+        let deletes_for_b = delete_file_index.get_deletes_for_data_file(&data_b, Some(0));
+        let mut delete_paths_for_b: Vec<String> = deletes_for_b
+            .into_iter()
+            .map(|task| task.data_file_path.clone())
+            .collect();
+        delete_paths_for_b.sort();
+
+        assert_eq!(
+            delete_paths_for_b,
+            vec![
+                "s3://bucket/pos-delete-any.parquet".to_string(),
+                "s3://bucket/pos-delete-b.parquet".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pos_deletes_bounds_single_file_prunes_like_referenced_data_file() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+
+        let data_a_path = "s3://bucket/data-a.parquet".to_string();
+        let data_b_path = "s3://bucket/data-b.parquet".to_string();
+
+        let data_a = DataFileBuilder::default()
+            .file_path(data_a_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let data_b = DataFileBuilder::default()
+            .file_path(data_b_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        // referenced_data_file is null, but bounds indicate only a single file_path value.
+        let pos_delete_a = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-a.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(None)
+            .lower_bounds(HashMap::from([(
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(data_a_path.clone()),
+            )]))
+            .upper_bounds(HashMap::from([(
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(data_a_path.clone()),
+            )]))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        // unconstrained (no bounds, no referenced_data_file)
+        let pos_delete_any = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-any.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(None)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let deletes: Vec<ManifestEntry> = vec![
+            build_added_manifest_entry(10, &pos_delete_a),
+            build_added_manifest_entry(10, &pos_delete_any),
+        ];
+
+        let delete_contexts: Vec<DeleteFileContext> = deletes
+            .into_iter()
+            .map(|entry| DeleteFileContext {
+                manifest_entry: entry.into(),
+                partition_spec_id: spec_id,
+                snapshot_schema: Arc::new(Schema::builder().with_schema_id(1).build().unwrap()),
+                field_ids: Arc::new(vec![]),
+            })
+            .collect();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        let mut deletes_for_a: Vec<String> = delete_file_index
+            .get_deletes_for_data_file(&data_a, Some(0))
+            .into_iter()
+            .map(|task| task.data_file_path.clone())
+            .collect();
+        deletes_for_a.sort();
+
+        assert_eq!(
+            deletes_for_a,
+            vec![
+                "s3://bucket/pos-delete-a.parquet".to_string(),
+                "s3://bucket/pos-delete-any.parquet".to_string(),
+            ]
+        );
+
+        let mut deletes_for_b: Vec<String> = delete_file_index
+            .get_deletes_for_data_file(&data_b, Some(0))
+            .into_iter()
+            .map(|task| task.data_file_path.clone())
+            .collect();
+        deletes_for_b.sort();
+
+        assert_eq!(
+            deletes_for_b,
+            vec!["s3://bucket/pos-delete-any.parquet".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_pos_deletes_bounds_range_does_not_prune() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+
+        let data_a_path = "s3://bucket/data-a.parquet".to_string();
+        let data_b_path = "s3://bucket/data-b.parquet".to_string();
+
+        let data_a = DataFileBuilder::default()
+            .file_path(data_a_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let data_b = DataFileBuilder::default()
+            .file_path(data_b_path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::Data)
+            .record_count(100)
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        // Bounds indicate multiple file_path values (lower != upper), so we should not prune.
+        let pos_delete_range = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-range.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(None)
+            .lower_bounds(HashMap::from([(
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(data_a_path.clone()),
+            )]))
+            .upper_bounds(HashMap::from([(
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(data_b_path.clone()),
+            )]))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let deletes: Vec<ManifestEntry> = vec![build_added_manifest_entry(10, &pos_delete_range)];
+
+        let delete_contexts: Vec<DeleteFileContext> = deletes
+            .into_iter()
+            .map(|entry| DeleteFileContext {
+                manifest_entry: entry.into(),
+                partition_spec_id: spec_id,
+                snapshot_schema: Arc::new(Schema::builder().with_schema_id(1).build().unwrap()),
+                field_ids: Arc::new(vec![]),
+            })
+            .collect();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(delete_contexts);
+
+        let deletes_for_a = delete_file_index.get_deletes_for_data_file(&data_a, Some(0));
+        assert_eq!(deletes_for_a.len(), 1);
+
+        let deletes_for_b = delete_file_index.get_deletes_for_data_file(&data_b, Some(0));
+        assert_eq!(deletes_for_b.len(), 1);
+    }
+
+    #[test]
+    fn test_try_infer_referenced_data_file_missing_bounds_returns_none() {
+        let pos_delete = DataFileBuilder::default()
+            .file_path("s3://bucket/pos-delete-missing-bounds.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(None)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        assert!(try_infer_single_referenced_data_file_from_bounds(&pos_delete).is_none());
     }
 
     fn build_unpartitioned_data_file() -> DataFile {
