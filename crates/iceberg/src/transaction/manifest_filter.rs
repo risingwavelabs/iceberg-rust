@@ -946,7 +946,7 @@ mod tests {
             .map(|i| {
                 temp_dir
                     .path()
-                    .join(format!("manifest{}.avro", i))
+                    .join(format!("manifest{i}.avro"))
                     .to_string_lossy()
                     .to_string()
             })
@@ -1103,10 +1103,7 @@ mod tests {
         // Add multiple files for deletion
         for i in 1..=3 {
             manager
-                .delete_file(create_test_data_file(
-                    &format!("/test/batch{}.parquet", i),
-                    0,
-                ))
+                .delete_file(create_test_data_file(&format!("/test/batch{i}.parquet"), 0))
                 .unwrap();
         }
 

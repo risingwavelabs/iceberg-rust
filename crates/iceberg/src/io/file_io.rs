@@ -799,7 +799,7 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
         // Verify absolute path format (can be passed back to FileIO)
-        let expected_nested = format!("{}/subdir/nested_file.txt", root_path);
+        let expected_nested = format!("{root_path}/subdir/nested_file.txt");
         assert!(paths.contains(&expected_nested.as_str()));
         assert!(paths.iter().any(|p| p.ends_with("root_file.txt")));
     }
