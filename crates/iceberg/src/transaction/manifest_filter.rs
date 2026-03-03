@@ -158,8 +158,7 @@ impl ManifestFilterManager {
     pub(crate) fn drop_delete_files_older_than(&mut self, sequence_number: i64) {
         assert!(
             sequence_number >= 0,
-            "Invalid minimum data sequence number: {}",
-            sequence_number
+            "Invalid minimum data sequence number: {sequence_number}",
         );
         self.min_sequence_number = sequence_number;
     }
@@ -367,7 +366,7 @@ impl ManifestFilterManager {
                 if !deleted_files.contains(file_path) {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Required delete path missing: {}", file_path),
+                        format!("Required delete path missing: {file_path}"),
                     ));
                 }
             }

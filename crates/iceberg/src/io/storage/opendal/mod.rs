@@ -452,10 +452,7 @@ where T: std::str::FromStr {
             Ok(value) => Ok(Some(value)),
             Err(_) => Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "Invalid {}: '{}' cannot be parsed as a positive integer",
-                    key, value_str
-                ),
+                format!("Invalid {key}: '{value_str}' cannot be parsed as a positive integer"),
             )),
         },
         None => Ok(None),
