@@ -49,7 +49,7 @@ pub(crate) struct ManifestFileContext {
     object_cache: Arc<ObjectCache>,
     snapshot_schema: SchemaRef,
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
-    delete_file_index: DeleteFileIndex,
+    delete_file_index: Option<DeleteFileIndex>,
 
     /// filter manifest entries.
     /// Used for different kind of scans, e.g., only scan newly added files without delete files.
@@ -66,7 +66,7 @@ pub(crate) struct ManifestEntryContext {
     pub bound_predicates: Option<Arc<BoundPredicates>>,
     pub partition_spec_id: i32,
     pub snapshot_schema: SchemaRef,
-    pub delete_file_index: DeleteFileIndex,
+    pub delete_file_index: Option<DeleteFileIndex>,
 }
 
 impl ManifestFileContext {
@@ -114,13 +114,16 @@ impl ManifestEntryContext {
     /// consume this `ManifestEntryContext`, returning a `FileScanTask`
     /// created from it
     pub(crate) async fn into_file_scan_task(self) -> Result<FileScanTask> {
-        let deletes = self
-            .delete_file_index
-            .get_deletes_for_data_file(
-                self.manifest_entry.data_file(),
-                self.manifest_entry.sequence_number(),
-            )
-            .await;
+        let deletes = if let Some(ref delete_file_index) = self.delete_file_index {
+            delete_file_index
+                .get_deletes_for_data_file(
+                    self.manifest_entry.data_file(),
+                    self.manifest_entry.sequence_number(),
+                )
+                .await
+        } else {
+            vec![]
+        };
 
         Ok(FileScanTask {
             start: 0,
@@ -209,7 +212,7 @@ impl PlanContext {
         &self,
         manifest_list: Arc<ManifestList>,
         tx_data: Sender<ManifestEntryContext>,
-        delete_file_idx: DeleteFileIndex,
+        delete_file_idx: Option<DeleteFileIndex>,
         delete_file_tx: Sender<ManifestEntryContext>,
     ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
         let mut filter_fn: Option<Arc<ManifestEntryFilterFn>> = None;
@@ -329,7 +332,7 @@ impl PlanContext {
         manifest_file: &ManifestFile,
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
-        delete_file_index: DeleteFileIndex,
+        delete_file_index: Option<DeleteFileIndex>,
         filter_fn: Option<Arc<ManifestEntryFilterFn>>,
     ) -> ManifestFileContext {
         let bound_predicates =
