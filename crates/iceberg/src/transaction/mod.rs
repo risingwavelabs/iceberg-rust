@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 
 pub use append::FastAppendAction;
+pub use rewrite_manifests::RewriteManifestsAction;
 pub use update_schema::UpdateSchemaAction;
 mod manifest_filter;
 
@@ -63,6 +64,7 @@ pub use manifest_filter::*;
 mod overwrite_files;
 mod remove_snapshots;
 mod rewrite_files;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -206,6 +208,14 @@ impl Transaction {
         OverwriteFilesAction::new()
     }
 
+    /// Creates a rewrite manifests action.
+    ///
+    /// This action reorganizes manifest files without changing the underlying data.
+    /// It can consolidate small manifests or re-cluster entries.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
+    }
+
     /// Commit transaction.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
@@ -289,8 +299,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     use crate::catalog::MockCatalog;
     use crate::io::FileIOBuilder;

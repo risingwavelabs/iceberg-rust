@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -27,11 +27,11 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
-    ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot, SnapshotReference,
-    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
-    UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
+    update_snapshot_summaries, DataContentType, DataFile, DataFileFormat, FormatVersion,
+    ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus,
+    ManifestWriter, ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot,
+    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
+    TableProperties, MAIN_BRANCH, UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
@@ -787,6 +787,11 @@ partition_struct: {:?}, partition_type: {:?}",
     /// Set the new data file sequence number for this snapshot
     pub fn set_new_data_file_sequence_number(&mut self, new_data_file_sequence_number: i64) {
         self.new_data_file_sequence_number = Some(new_data_file_sequence_number);
+    }
+
+    /// Replace snapshot properties, overriding any previously set values.
+    pub(crate) fn set_snapshot_properties(&mut self, properties: HashMap<String, String>) {
+        self.snapshot_properties = properties;
     }
 
     /// Set the target branch for this snapshot
