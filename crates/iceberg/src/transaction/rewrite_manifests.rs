@@ -95,6 +95,11 @@ impl RewriteManifestsAction {
 
     /// Manually add a manifest to the snapshot. The manifest must not contain
     /// any added or deleted file entries.
+    ///
+    /// Manifests with unknown (None) file counts — such as V1 manifests — are
+    /// rejected because the Iceberg spec treats None as "assumed non-zero",
+    /// which conflicts with the requirement that added and deleted counts be
+    /// zero.
     pub fn add_manifest(mut self, manifest: ManifestFile) -> Self {
         self.added_manifests.push(manifest);
         self
@@ -298,8 +303,8 @@ impl TransactionAction for RewriteManifestsAction {
         // Validate added manifests don't already exist in the current snapshot
         // (unless they are also being deleted — i.e. swapped) and don't have
         // added/deleted files.
-        // `None` counts mean unknown (e.g. V1 manifests) and must be treated as
-        // permissive — only reject when the count is definitively > 0.
+        // `None` counts (e.g. V1 manifests) are treated as non-zero per the
+        // Iceberg spec, so manifests with unknown counts are rejected.
         for manifest in &self.added_manifests {
             if current_manifests_by_path.contains_key(manifest.manifest_path.as_str())
                 && !deleted_paths.contains(manifest.manifest_path.as_str())
@@ -312,7 +317,7 @@ impl TransactionAction for RewriteManifestsAction {
                     ),
                 ));
             }
-            if manifest.added_files_count.is_some_and(|c| c > 0) {
+            if manifest.has_added_files() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
@@ -321,7 +326,7 @@ impl TransactionAction for RewriteManifestsAction {
                     ),
                 ));
             }
-            if manifest.deleted_files_count.is_some_and(|c| c > 0) {
+            if manifest.has_deleted_files() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
@@ -468,5 +473,111 @@ impl TransactionAction for RewriteManifestsAction {
         snapshot_producer
             .commit(operation, DefaultManifestProcess)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::spec::{ManifestContentType, ManifestFile};
+    use crate::table::Table;
+    use crate::transaction::rewrite_manifests::RewriteManifestsAction;
+    use crate::transaction::tests::make_v2_minimal_table;
+    use crate::transaction::TransactionAction;
+
+    fn test_manifest(
+        path: &str,
+        added: Option<u32>,
+        existing: Option<u32>,
+        deleted: Option<u32>,
+    ) -> ManifestFile {
+        ManifestFile {
+            manifest_path: path.to_string(),
+            manifest_length: 1000,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 0,
+            added_files_count: added,
+            existing_files_count: existing,
+            deleted_files_count: deleted,
+            added_rows_count: Some(0),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    /// Helper to commit an action and assert it returns an error containing the expected message.
+    async fn assert_commit_err(action: RewriteManifestsAction, table: &Table, expected_msg: &str) {
+        let action = Arc::new(action);
+        let result = action.commit(table).await;
+        match result {
+            Ok(_) => panic!("expected error containing '{expected_msg}', but commit succeeded"),
+            Err(e) => assert!(
+                e.to_string().contains(expected_msg),
+                "expected error containing '{expected_msg}', got: {e}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_rejects_added_files_count_some_positive() {
+        let table = make_v2_minimal_table();
+        let manifest = test_manifest("s3://bucket/manifest-1.avro", Some(5), Some(0), Some(0));
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(action, &table, "Cannot add manifest with added files").await;
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_rejects_deleted_files_count_some_positive() {
+        let table = make_v2_minimal_table();
+        let manifest = test_manifest("s3://bucket/manifest-1.avro", Some(0), Some(0), Some(3));
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(action, &table, "Cannot add manifest with deleted files").await;
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_rejects_none_added_files_count() {
+        let table = make_v2_minimal_table();
+        // None means "assumed non-zero" per Iceberg spec — should be rejected.
+        let manifest = test_manifest("s3://bucket/manifest-v1.avro", None, Some(10), None);
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(action, &table, "Cannot add manifest with added files").await;
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_rejects_none_deleted_files_count() {
+        let table = make_v2_minimal_table();
+        // added_files_count is known-zero, but deleted_files_count is None → rejected.
+        let manifest = test_manifest("s3://bucket/manifest-v1.avro", Some(0), Some(10), None);
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(action, &table, "Cannot add manifest with deleted files").await;
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_accepts_zero_counts() {
+        let table = make_v2_minimal_table();
+        // Both added and deleted are known-zero — should pass the validation.
+        // (It will fail later during snapshot commit because there is no matching
+        // deleted manifest, but the add_manifest validation itself should succeed.)
+        let manifest = test_manifest("s3://bucket/manifest-ok.avro", Some(0), Some(5), Some(0));
+        let action = Arc::new(RewriteManifestsAction::new().add_manifest(manifest));
+        let result = action.commit(&table).await;
+        // The error, if any, should NOT be about added/deleted files.
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string()
+                    .contains("Cannot add manifest with added files")
+                    && !e
+                        .to_string()
+                        .contains("Cannot add manifest with deleted files"),
+                "unexpected rejection for zero-count manifest: {e}"
+            );
+        }
     }
 }
