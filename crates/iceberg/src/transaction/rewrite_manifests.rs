@@ -94,7 +94,8 @@ impl RewriteManifestsAction {
     }
 
     /// Manually add a manifest to the snapshot. The manifest must not contain
-    /// any added or deleted file entries.
+    /// any added or deleted file entries, and its `partition_spec_id` must
+    /// reference a partition spec that exists in the table metadata.
     ///
     /// Manifests with unknown (None) file counts — such as V1 manifests — are
     /// rejected because the Iceberg spec treats None as "assumed non-zero",
@@ -306,6 +307,18 @@ impl TransactionAction for RewriteManifestsAction {
         // `None` counts (e.g. V1 manifests) are treated as non-zero per the
         // Iceberg spec, so manifests with unknown counts are rejected.
         for manifest in &self.added_manifests {
+            if metadata_ref
+                .partition_spec_by_id(manifest.partition_spec_id)
+                .is_none()
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot add manifest with unknown partition spec id {}: {}",
+                        manifest.partition_spec_id, manifest.manifest_path
+                    ),
+                ));
+            }
             if current_manifests_by_path.contains_key(manifest.manifest_path.as_str())
                 && !deleted_paths.contains(manifest.manifest_path.as_str())
             {
@@ -523,6 +536,21 @@ mod tests {
                 "expected error containing '{expected_msg}', got: {e}"
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_rejects_unknown_partition_spec_id() {
+        let table = make_v2_minimal_table();
+        // The minimal table only has partition spec id 0.
+        let mut manifest = test_manifest(
+            "s3://bucket/manifest-bad-spec.avro",
+            Some(0),
+            Some(5),
+            Some(0),
+        );
+        manifest.partition_spec_id = 9999;
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(action, &table, "unknown partition spec id 9999").await;
     }
 
     #[tokio::test]
