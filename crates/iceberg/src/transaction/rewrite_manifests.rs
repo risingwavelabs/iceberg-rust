@@ -24,6 +24,7 @@ use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, Snapshot
 use crate::error::Result;
 use crate::spec::{
     DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
+    MIN_FORMAT_VERSION_ROW_LINEAGE,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -202,6 +203,24 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
 #[async_trait::async_trait]
 impl TransactionAction for RewriteManifestsAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        // Reject rewrite_manifests for tables with row lineage (V3+).
+        // Rewriting manifests creates new ManifestFiles with first_row_id unset,
+        // causing ManifestListWriter to assign fresh row IDs and advance
+        // next_row_id even though no new rows were added. This breaks row lineage
+        // semantics. Until a strategy to preserve row IDs through manifest rewrites
+        // is implemented, this operation is unsupported for V3 tables.
+        if table.metadata().format_version() >= MIN_FORMAT_VERSION_ROW_LINEAGE {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "rewrite_manifests is not supported for tables with row lineage \
+                     (format version >= {MIN_FORMAT_VERSION_ROW_LINEAGE}). Rewriting \
+                     manifests would incorrectly advance next_row_id without adding \
+                     new rows.",
+                ),
+            ));
+        }
+
         let commit_uuid = self.commit_uuid.unwrap_or_else(Uuid::now_v7);
 
         // Build a SnapshotProducer. Since rewrite_manifests doesn't add or remove
@@ -496,7 +515,7 @@ mod tests {
     use crate::spec::{ManifestContentType, ManifestFile};
     use crate::table::Table;
     use crate::transaction::rewrite_manifests::RewriteManifestsAction;
-    use crate::transaction::tests::make_v2_minimal_table;
+    use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table};
     use crate::transaction::TransactionAction;
 
     fn test_manifest(
@@ -536,6 +555,29 @@ mod tests {
                 "expected error containing '{expected_msg}', got: {e}"
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_manifests_rejects_v3_table() {
+        let table = make_v3_minimal_table();
+        // Even a no-op rewrite should be rejected for V3 tables.
+        let action = RewriteManifestsAction::new();
+        assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_manifests_rejects_v3_table_with_cluster_by() {
+        let table = make_v3_minimal_table();
+        let action = RewriteManifestsAction::new().cluster_by(Box::new(|_| "default".to_string()));
+        assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_manifests_rejects_v3_table_with_add_manifest() {
+        let table = make_v3_minimal_table();
+        let manifest = test_manifest("s3://bucket/manifest-ok.avro", Some(0), Some(5), Some(0));
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
     }
 
     #[tokio::test]
