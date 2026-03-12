@@ -24,9 +24,9 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use itertools::Itertools;
+use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
-use parquet::arrow::AsyncArrowWriter;
 use parquet::file::metadata::{KeyValue, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
@@ -36,14 +36,14 @@ use thrift::protocol::TOutputProtocol;
 
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::{
-    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, ArrowFileReader, FieldMatchMode,
-    NanValueCountVisitor, DEFAULT_MAP_FIELD_NAME,
+    ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
+    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
 };
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
-    visit_schema, DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal,
-    MapType, NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor,
-    Struct, StructType, TableMetadata, Type,
+    DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
+    NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
+    StructType, TableMetadata, Type, visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
@@ -540,7 +540,19 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+            let arrow_schema: ArrowSchemaRef = {
+                let mut schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+                // Embed the Iceberg schema JSON in the Arrow schema metadata so it
+                // is written into the Parquet `ARROW:schema` IPC section. Some
+                // downstream readers (e.g. Snowflake) expect the `iceberg.schema`
+                // key here in addition to the Parquet footer key-value metadata.
+                let iceberg_schema_json = serde_json::to_string(self.schema.as_ref())
+                    .expect("Iceberg schema serialization should not fail");
+                let mut metadata = schema.metadata.clone();
+                metadata.insert(ICEBERG_SCHEMA_KEY.to_string(), iceberg_schema_json);
+                schema.metadata = metadata;
+                Arc::new(schema)
+            };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
@@ -784,17 +796,21 @@ mod tests {
                 NestedField::required(
                     4,
                     "col4",
-                    Type::Struct(StructType::new(vec![NestedField::required(
-                        8,
-                        "col_4_8",
-                        Type::Struct(StructType::new(vec![NestedField::required(
-                            9,
-                            "col_4_8_9",
-                            Type::Primitive(PrimitiveType::Long),
+                    Type::Struct(StructType::new(vec![
+                        NestedField::required(
+                            8,
+                            "col_4_8",
+                            Type::Struct(StructType::new(vec![
+                                NestedField::required(
+                                    9,
+                                    "col_4_8_9",
+                                    Type::Primitive(PrimitiveType::Long),
+                                )
+                                .into(),
+                            ])),
                         )
-                        .into()])),
-                    )
-                    .into()])),
+                        .into(),
+                    ])),
                 )
                 .into(),
                 NestedField::required(
@@ -1063,10 +1079,9 @@ mod tests {
                 ordered,
             )
         }) as ArrayRef;
-        let to_write = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![col0, col1, col2, col3, col4, col5],
-        )
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            col0, col1, col2, col3, col4, col5,
+        ])
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -1253,13 +1268,10 @@ mod tests {
                 .with_precision_and_scale(38, 5)
                 .unwrap(),
         ) as ArrayRef;
-        let to_write = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12,
-                col13, col14, col15, col16,
-            ],
-        )
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13,
+            col14, col15, col16,
+        ])
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -1287,10 +1299,12 @@ mod tests {
         // check data file
         assert_eq!(data_file.record_count(), 4);
         assert!(data_file.value_counts().iter().all(|(_, &v)| { v == 4 }));
-        assert!(data_file
-            .null_value_counts()
-            .iter()
-            .all(|(_, &v)| { v == 1 }));
+        assert!(
+            data_file
+                .null_value_counts()
+                .iter()
+                .all(|(_, &v)| { v == 1 })
+        );
         assert_eq!(
             *data_file.lower_bounds(),
             HashMap::from([
@@ -1394,15 +1408,17 @@ mod tests {
         // test 1.1 and 2.2
         let schema = Arc::new(
             Schema::builder()
-                .with_fields(vec![NestedField::optional(
-                    0,
-                    "decimal",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 28,
-                        scale: 10,
-                    }),
-                )
-                .into()])
+                .with_fields(vec![
+                    NestedField::optional(
+                        0,
+                        "decimal",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 28,
+                            scale: 10,
+                        }),
+                    )
+                    .into(),
+                ])
                 .build()
                 .unwrap(),
         );
@@ -1444,15 +1460,17 @@ mod tests {
         // test -1.1 and -2.2
         let schema = Arc::new(
             Schema::builder()
-                .with_fields(vec![NestedField::optional(
-                    0,
-                    "decimal",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 28,
-                        scale: 10,
-                    }),
-                )
-                .into()])
+                .with_fields(vec![
+                    NestedField::optional(
+                        0,
+                        "decimal",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 28,
+                            scale: 10,
+                        }),
+                    )
+                    .into(),
+                ])
                 .build()
                 .unwrap(),
         );
@@ -1497,15 +1515,17 @@ mod tests {
         assert_eq!(decimal_max.scale(), decimal_min.scale());
         let schema = Arc::new(
             Schema::builder()
-                .with_fields(vec![NestedField::optional(
-                    0,
-                    "decimal",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 38,
-                        scale: decimal_max.scale(),
-                    }),
-                )
-                .into()])
+                .with_fields(vec![
+                    NestedField::optional(
+                        0,
+                        "decimal",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 38,
+                            scale: decimal_max.scale(),
+                        }),
+                    )
+                    .into(),
+                ])
                 .build()
                 .unwrap(),
         );
@@ -1765,29 +1785,31 @@ mod tests {
         let file_name_gen =
             DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
 
-        let schema_struct_float_fields =
-            Fields::from(vec![Field::new("col4", DataType::Float32, false)
-                .with_metadata(HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    "4".to_string(),
-                )]))]);
+        let schema_struct_float_fields = Fields::from(vec![
+            Field::new("col4", DataType::Float32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "4".to_string(),
+            )])),
+        ]);
 
-        let schema_struct_nested_float_fields =
-            Fields::from(vec![Field::new("col7", DataType::Float32, false)
-                .with_metadata(HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    "7".to_string(),
-                )]))]);
+        let schema_struct_nested_float_fields = Fields::from(vec![
+            Field::new("col7", DataType::Float32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "7".to_string(),
+            )])),
+        ]);
 
-        let schema_struct_nested_fields = Fields::from(vec![Field::new(
-            "col6",
-            arrow_schema::DataType::Struct(schema_struct_nested_float_fields.clone()),
-            false,
-        )
-        .with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "6".to_string(),
-        )]))]);
+        let schema_struct_nested_fields = Fields::from(vec![
+            Field::new(
+                "col6",
+                arrow_schema::DataType::Struct(schema_struct_nested_float_fields.clone()),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "6".to_string(),
+            )])),
+        ]);
 
         // prepare data
         let arrow_schema = {
@@ -1835,10 +1857,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![struct_float_field_col, struct_nested_float_field_col],
-        )
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            struct_float_field_col,
+            struct_nested_float_field_col,
+        ])
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -1913,15 +1935,11 @@ mod tests {
                 "4".to_string(),
             )]));
 
-        let schema_struct_list_field = Fields::from(vec![Field::new_list(
-            "col2",
-            schema_struct_list_float_field.clone(),
-            true,
-        )
-        .with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "3".to_string(),
-        )]))]);
+        let schema_struct_list_field = Fields::from(vec![
+            Field::new_list("col2", schema_struct_list_float_field.clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+            ),
+        ]);
 
         let arrow_schema = {
             let fields = vec![
@@ -1997,14 +2015,11 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                list_float_field_col,
-                struct_list_float_field_col,
-                // large_list_float_field_col,
-            ],
-        )
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            list_float_field_col,
+            struct_list_float_field_col,
+            // large_list_float_field_col,
+        ])
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2132,18 +2147,20 @@ mod tests {
                 [(PARQUET_FIELD_ID_META_KEY.to_string(), "7".to_string())],
             ));
 
-        let schema_struct_map_field = Fields::from(vec![Field::new_map(
-            "col3",
-            DEFAULT_MAP_FIELD_NAME,
-            struct_map_key_field_schema.clone(),
-            struct_map_value_field_schema.clone(),
-            false,
-            false,
-        )
-        .with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "5".to_string(),
-        )]))]);
+        let schema_struct_map_field = Fields::from(vec![
+            Field::new_map(
+                "col3",
+                DEFAULT_MAP_FIELD_NAME,
+                struct_map_key_field_schema.clone(),
+                struct_map_value_field_schema.clone(),
+                false,
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "5".to_string(),
+            )])),
+        ]);
 
         let arrow_schema = {
             let fields = vec![
@@ -2180,10 +2197,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![map_array, struct_list_float_field_col],
-        )
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            map_array,
+            struct_list_float_field_col,
+        ])
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2275,13 +2292,11 @@ mod tests {
             Arc::new(
                 Schema::builder()
                     .with_schema_id(1)
-                    .with_fields(vec![NestedField::required(
-                        0,
-                        "col",
-                        Type::Primitive(PrimitiveType::Long),
-                    )
-                    .with_id(0)
-                    .into()])
+                    .with_fields(vec![
+                        NestedField::required(0, "col", Type::Primitive(PrimitiveType::Long))
+                            .with_id(0)
+                            .into(),
+                    ])
                     .build()
                     .expect("Failed to create schema"),
             ),
@@ -2302,13 +2317,11 @@ mod tests {
         let schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
-                .with_fields(vec![NestedField::required(
-                    0,
-                    "col",
-                    Type::Primitive(PrimitiveType::Int),
-                )
-                .with_id(0)
-                .into()])
+                .with_fields(vec![
+                    NestedField::required(0, "col", Type::Primitive(PrimitiveType::Int))
+                        .with_id(0)
+                        .into(),
+                ])
                 .build()
                 .expect("Failed to create schema"),
         );
@@ -2437,6 +2450,40 @@ mod tests {
             !schema_json.is_empty(),
             "iceberg.schema JSON should not be empty"
         );
+
+        Ok(())
+    }
+
+    /// Verify that the `iceberg.schema` JSON is embedded in the Arrow schema
+    /// metadata (the `ARROW:schema` IPC section), not just the Parquet footer
+    /// key-value metadata.  Downstream readers such as Snowflake resolve the
+    /// Iceberg schema from this location.
+    #[tokio::test]
+    async fn test_iceberg_schema_in_arrow_schema_metadata() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (data_file, file_io, _temp_dir) =
+            write_simple_parquet_file(WriterProperties::builder().build()).await?;
+
+        let input_file = file_io.new_input(data_file.file_path.clone()).unwrap();
+        let input_content = input_file.read().await.unwrap();
+        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(input_content).unwrap();
+
+        // `.schema()` returns the Arrow schema decoded from the ARROW:schema
+        // IPC metadata in the Parquet file.
+        let arrow_schema = reader_builder.schema();
+        let schema_json = arrow_schema
+            .metadata()
+            .get(ICEBERG_SCHEMA_KEY)
+            .expect("Arrow schema metadata must contain 'iceberg.schema' key");
+
+        // Deserialize and verify basic roundtrip
+        let deserialized: Schema = serde_json::from_str(schema_json)
+            .expect("iceberg.schema JSON in Arrow metadata should be valid");
+        assert_eq!(deserialized.schema_id(), 1);
+        assert_eq!(deserialized.as_struct().fields().len(), 2);
+        assert_eq!(deserialized.field_by_id(0).expect("field 0").name, "id");
+        assert_eq!(deserialized.field_by_id(1).expect("field 1").name, "name");
 
         Ok(())
     }
