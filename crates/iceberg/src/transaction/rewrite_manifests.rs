@@ -326,6 +326,15 @@ impl TransactionAction for RewriteManifestsAction {
         // `None` counts (e.g. V1 manifests) are treated as non-zero per the
         // Iceberg spec, so manifests with unknown counts are rejected.
         for manifest in &self.added_manifests {
+            if manifest.content == ManifestContentType::Deletes {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot add a delete-type manifest via rewrite_manifests: {}",
+                        manifest.manifest_path
+                    ),
+                ));
+            }
             if metadata_ref
                 .partition_spec_by_id(manifest.partition_spec_id)
                 .is_none()
@@ -478,7 +487,7 @@ impl TransactionAction for RewriteManifestsAction {
         let mut rewrite_properties = self.snapshot_properties.clone();
         rewrite_properties.insert(
             CREATED_MANIFESTS_COUNT.to_string(),
-            new_manifests.len().to_string(),
+            (new_manifests.len() + self.added_manifests.len()).to_string(),
         );
         rewrite_properties.insert(
             KEPT_MANIFESTS_COUNT.to_string(),
@@ -486,7 +495,7 @@ impl TransactionAction for RewriteManifestsAction {
         );
         rewrite_properties.insert(
             REPLACED_MANIFESTS_COUNT.to_string(),
-            rewritten_manifests.len().to_string(),
+            (rewritten_manifests.len() + self.deleted_manifests.len()).to_string(),
         );
         rewrite_properties.insert(PROCESSED_ENTRY_COUNT.to_string(), entry_count.to_string());
         snapshot_producer.set_snapshot_properties(rewrite_properties);
@@ -578,6 +587,21 @@ mod tests {
         let manifest = test_manifest("s3://bucket/manifest-ok.avro", Some(0), Some(5), Some(0));
         let action = RewriteManifestsAction::new().add_manifest(manifest);
         assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
+    }
+
+    #[tokio::test]
+    async fn test_add_manifest_rejects_delete_type_manifest() {
+        let table = make_v2_minimal_table();
+        let mut manifest =
+            test_manifest("s3://bucket/manifest-del.avro", Some(0), Some(5), Some(0));
+        manifest.content = ManifestContentType::Deletes;
+        let action = RewriteManifestsAction::new().add_manifest(manifest);
+        assert_commit_err(
+            action,
+            &table,
+            "Cannot add a delete-type manifest via rewrite_manifests",
+        )
+        .await;
     }
 
     #[tokio::test]
