@@ -235,10 +235,17 @@ impl PopulatedDeleteFileIndex {
                 .filter(|&(delete, _)| {
                     let delete_data_file = delete.manifest_entry.data_file();
 
-                    let referenced_data_file_matches = match delete_data_file.referenced_data_file.as_deref() {
+                    let referenced_data_file_matches = match delete_data_file
+                        .referenced_data_file
+                        .as_deref()
+                    {
                         Some(referenced_data_file) => referenced_data_file == data_file.file_path(),
-                        None => match try_infer_single_referenced_data_file_from_bounds(delete_data_file) {
-                            Some(referenced_data_file) => referenced_data_file == data_file.file_path(),
+                        None => match try_infer_single_referenced_data_file_from_bounds(
+                            delete_data_file,
+                        ) {
+                            Some(referenced_data_file) => {
+                                referenced_data_file == data_file.file_path()
+                            }
                             None => true,
                         },
                     };
@@ -574,9 +581,7 @@ mod tests {
             .map(|entry| DeleteFileContext {
                 manifest_entry: entry.into(),
                 partition_spec_id: spec_id,
-                snapshot_schema: Arc::new(
-                    Schema::builder().with_schema_id(1).build().unwrap(),
-                ), // hack
+                snapshot_schema: Arc::new(Schema::builder().with_schema_id(1).build().unwrap()), // hack
                 field_ids: Arc::new(vec![]), // hack
                 case_sensitive: false,
             })
@@ -591,13 +596,10 @@ mod tests {
             .collect();
         delete_paths_for_a.sort();
 
-        assert_eq!(
-            delete_paths_for_a,
-            vec![
-                "s3://bucket/pos-delete-a.parquet".to_string(),
-                "s3://bucket/pos-delete-any.parquet".to_string(),
-            ]
-        );
+        assert_eq!(delete_paths_for_a, vec![
+            "s3://bucket/pos-delete-a.parquet".to_string(),
+            "s3://bucket/pos-delete-any.parquet".to_string(),
+        ]);
 
         let deletes_for_b = delete_file_index.get_deletes_for_data_file(&data_b, Some(0));
         let mut delete_paths_for_b: Vec<String> = deletes_for_b
@@ -606,13 +608,10 @@ mod tests {
             .collect();
         delete_paths_for_b.sort();
 
-        assert_eq!(
-            delete_paths_for_b,
-            vec![
-                "s3://bucket/pos-delete-any.parquet".to_string(),
-                "s3://bucket/pos-delete-b.parquet".to_string(),
-            ]
-        );
+        assert_eq!(delete_paths_for_b, vec![
+            "s3://bucket/pos-delete-any.parquet".to_string(),
+            "s3://bucket/pos-delete-b.parquet".to_string(),
+        ]);
     }
 
     #[test]
@@ -704,13 +703,10 @@ mod tests {
             .collect();
         deletes_for_a.sort();
 
-        assert_eq!(
-            deletes_for_a,
-            vec![
-                "s3://bucket/pos-delete-a.parquet".to_string(),
-                "s3://bucket/pos-delete-any.parquet".to_string(),
-            ]
-        );
+        assert_eq!(deletes_for_a, vec![
+            "s3://bucket/pos-delete-a.parquet".to_string(),
+            "s3://bucket/pos-delete-any.parquet".to_string(),
+        ]);
 
         let mut deletes_for_b: Vec<String> = delete_file_index
             .get_deletes_for_data_file(&data_b, Some(0))
@@ -719,10 +715,9 @@ mod tests {
             .collect();
         deletes_for_b.sort();
 
-        assert_eq!(
-            deletes_for_b,
-            vec!["s3://bucket/pos-delete-any.parquet".to_string(),]
-        );
+        assert_eq!(deletes_for_b, vec![
+            "s3://bucket/pos-delete-any.parquet".to_string(),
+        ]);
     }
 
     #[test]
