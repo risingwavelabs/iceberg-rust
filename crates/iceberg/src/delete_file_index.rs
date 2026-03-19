@@ -578,6 +578,7 @@ mod tests {
                     Schema::builder().with_schema_id(1).build().unwrap(),
                 ), // hack
                 field_ids: Arc::new(vec![]), // hack
+                case_sensitive: false,
             })
             .collect();
 
@@ -690,6 +691,7 @@ mod tests {
                 partition_spec_id: spec_id,
                 snapshot_schema: Arc::new(Schema::builder().with_schema_id(1).build().unwrap()),
                 field_ids: Arc::new(vec![]),
+                case_sensitive: false,
             })
             .collect();
 
@@ -783,6 +785,7 @@ mod tests {
                 partition_spec_id: spec_id,
                 snapshot_schema: Arc::new(Schema::builder().with_schema_id(1).build().unwrap()),
                 field_ids: Arc::new(vec![]),
+                case_sensitive: false,
             })
             .collect();
 
