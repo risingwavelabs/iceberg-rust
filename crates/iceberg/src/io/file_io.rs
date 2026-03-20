@@ -554,10 +554,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{FileIO, FileIOBuilder};
-    use crate::io::{
-        IO_CHUNK_SIZE, IO_MAX_RETRIES, IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS,
-        IO_TIMEOUT_SECONDS,
-    };
+    use crate::io::IO_CHUNK_SIZE;
 
     fn create_local_file_io() -> FileIO {
         FileIOBuilder::new_fs_io().build().unwrap()

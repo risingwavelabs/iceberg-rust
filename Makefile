@@ -27,13 +27,13 @@ check-clippy:
 	cargo  clippy --all-targets --all-features --workspace -- -D warnings
 
 install-cargo-machete:
-	cargo install cargo-machete@0.7.0
+	cargo install --locked cargo-machete@0.7.0
 
 cargo-machete: install-cargo-machete
 	cargo machete
 
 install-taplo-cli:
-	cargo install taplo-cli@0.9.3
+	cargo install --locked taplo-cli@0.9.3
 
 fix-toml: install-taplo-cli
 	taplo fmt
