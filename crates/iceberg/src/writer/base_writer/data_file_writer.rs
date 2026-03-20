@@ -41,7 +41,10 @@ where
 {
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
-        Self { inner, sort_order_id: None }
+        Self {
+            inner,
+            sort_order_id: None,
+        }
     }
 
     /// Set sort order id for data files.
