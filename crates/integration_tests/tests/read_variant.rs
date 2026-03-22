@@ -22,6 +22,7 @@
 //! `VARIANT` column containing three rows of JSON data.
 
 use arrow_schema::DataType;
+use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use futures::TryStreamExt;
 use iceberg::spec::Type;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
@@ -76,6 +77,17 @@ async fn test_variant_arrow_schema() {
     let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
 
     assert!(!batches.is_empty(), "expected at least one record batch");
+    assert_eq!(
+        batches[0]
+            .schema()
+            .field_with_name("v")
+            .unwrap()
+            .metadata()
+            .get(EXTENSION_TYPE_NAME_KEY)
+            .map(String::as_str),
+        Some("arrow.parquet.variant"),
+        "variant field must carry Arrow extension metadata"
+    );
 
     // Variant column must be a struct with exactly two binary sub-fields
     let v_col = batches[0]
@@ -142,6 +154,17 @@ async fn test_variant_projected_with_primitive_columns() {
     assert!(!batches.is_empty(), "expected at least one record batch");
 
     let first_batch = &batches[0];
+    assert_eq!(
+        first_batch
+            .schema()
+            .field_with_name("v")
+            .unwrap()
+            .metadata()
+            .get(EXTENSION_TYPE_NAME_KEY)
+            .map(String::as_str),
+        Some("arrow.parquet.variant"),
+        "projected variant field must carry Arrow extension metadata"
+    );
 
     // Both columns must be present — the variant must not be silently dropped.
     assert!(

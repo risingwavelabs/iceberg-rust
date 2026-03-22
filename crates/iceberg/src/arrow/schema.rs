@@ -26,6 +26,7 @@ use arrow_array::{
     FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, Scalar, StringArray,
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
+use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::statistics::Statistics;
@@ -240,6 +241,7 @@ pub fn arrow_type_to_type(ty: &DataType) -> Result<Type> {
 }
 
 const ARROW_FIELD_DOC_KEY: &str = "doc";
+const PARQUET_VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
 
 pub(super) fn get_field_id_from_metadata(field: &Field) -> Result<i32> {
     if let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
@@ -493,6 +495,24 @@ enum ArrowSchemaOrFieldOrType {
     Schema(ArrowSchema),
     Field(Field),
     Type(DataType),
+    TypeWithMetadata(DataType, HashMap<String, String>),
+}
+
+impl ArrowSchemaOrFieldOrType {
+    fn into_field(self) -> Field {
+        match self {
+            ArrowSchemaOrFieldOrType::Field(field) => field,
+            _ => unreachable!(),
+        }
+    }
+
+    fn into_type(self) -> (DataType, HashMap<String, String>) {
+        match self {
+            ArrowSchemaOrFieldOrType::Type(ty) => (ty, HashMap::new()),
+            ArrowSchemaOrFieldOrType::TypeWithMetadata(ty, metadata) => (ty, metadata),
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl SchemaVisitor for ToArrowSchemaConverter {
@@ -503,8 +523,15 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         _schema: &crate::spec::Schema,
         value: ArrowSchemaOrFieldOrType,
     ) -> crate::Result<ArrowSchemaOrFieldOrType> {
-        let struct_type = match value {
-            ArrowSchemaOrFieldOrType::Type(DataType::Struct(fields)) => fields,
+        let (data_type, metadata) = value.into_type();
+        if !metadata.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Top-level Arrow schema type must not carry field metadata",
+            ));
+        }
+        let struct_type = match data_type {
+            DataType::Struct(fields) => fields,
             _ => unreachable!(),
         };
         Ok(ArrowSchemaOrFieldOrType::Schema(ArrowSchema::new(
@@ -517,11 +544,8 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         field: &crate::spec::NestedFieldRef,
         value: ArrowSchemaOrFieldOrType,
     ) -> crate::Result<ArrowSchemaOrFieldOrType> {
-        let ty = match value {
-            ArrowSchemaOrFieldOrType::Type(ty) => ty,
-            _ => unreachable!(),
-        };
-        let metadata = if let Some(doc) = &field.doc {
+        let (ty, type_metadata) = value.into_type();
+        let mut metadata = if let Some(doc) = &field.doc {
             HashMap::from([
                 (PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string()),
                 (ARROW_FIELD_DOC_KEY.to_string(), doc.clone()),
@@ -529,6 +553,7 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         } else {
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string())])
         };
+        metadata.extend(type_metadata);
         Ok(ArrowSchemaOrFieldOrType::Field(
             Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata),
         ))
@@ -541,10 +566,7 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     ) -> crate::Result<ArrowSchemaOrFieldOrType> {
         let fields = results
             .into_iter()
-            .map(|result| match result {
-                ArrowSchemaOrFieldOrType::Field(field) => field,
-                _ => unreachable!(),
-            })
+            .map(ArrowSchemaOrFieldOrType::into_field)
             .collect();
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(fields)))
     }
@@ -554,25 +576,7 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         list: &crate::spec::ListType,
         value: ArrowSchemaOrFieldOrType,
     ) -> crate::Result<Self::T> {
-        let field = match self.field(&list.element_field, value)? {
-            ArrowSchemaOrFieldOrType::Field(field) => field,
-            _ => unreachable!(),
-        };
-        let meta = if let Some(doc) = &list.element_field.doc {
-            HashMap::from([
-                (
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    list.element_field.id.to_string(),
-                ),
-                (ARROW_FIELD_DOC_KEY.to_string(), doc.clone()),
-            ])
-        } else {
-            HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                list.element_field.id.to_string(),
-            )])
-        };
-        let field = field.with_metadata(meta);
+        let field = self.field(&list.element_field, value)?.into_field();
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::List(Arc::new(
             field,
         ))))
@@ -584,14 +588,8 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         key_value: ArrowSchemaOrFieldOrType,
         value: ArrowSchemaOrFieldOrType,
     ) -> crate::Result<ArrowSchemaOrFieldOrType> {
-        let key_field = match self.field(&map.key_field, key_value)? {
-            ArrowSchemaOrFieldOrType::Field(field) => field,
-            _ => unreachable!(),
-        };
-        let value_field = match self.field(&map.value_field, value)? {
-            ArrowSchemaOrFieldOrType::Field(field) => field,
-            _ => unreachable!(),
-        };
+        let key_field = self.field(&map.key_field, key_value)?.into_field();
+        let value_field = self.field(&map.value_field, value)?.into_field();
         let field = Field::new(
             DEFAULT_MAP_FIELD_NAME,
             DataType::Struct(vec![key_field, value_field].into()),
@@ -695,9 +693,13 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         // Uses Binary (not LargeBinary) matching the Parquet BINARY primitive directly.
         let metadata_field = Field::new("metadata", DataType::Binary, false);
         let value_field = Field::new("value", DataType::Binary, false);
-        Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(
-            vec![metadata_field, value_field].into(),
-        )))
+        Ok(ArrowSchemaOrFieldOrType::TypeWithMetadata(
+            DataType::Struct(vec![metadata_field, value_field].into()),
+            HashMap::from([(
+                EXTENSION_TYPE_NAME_KEY.to_string(),
+                PARQUET_VARIANT_EXTENSION_NAME.to_string(),
+            )]),
+        ))
     }
 }
 
@@ -714,7 +716,9 @@ pub fn schema_to_arrow_schema(schema: &crate::spec::Schema) -> crate::Result<Arr
 pub fn type_to_arrow_type(ty: &crate::spec::Type) -> crate::Result<DataType> {
     let mut converter = ToArrowSchemaConverter;
     match crate::spec::visit_type(ty, &mut converter)? {
-        ArrowSchemaOrFieldOrType::Type(ty) => Ok(ty),
+        ArrowSchemaOrFieldOrType::Type(ty) | ArrowSchemaOrFieldOrType::TypeWithMetadata(ty, _) => {
+            Ok(ty)
+        }
         _ => unreachable!(),
     }
 }
@@ -1322,6 +1326,19 @@ mod tests {
         )]))
     }
 
+    fn simple_field_with_metadata(
+        name: &str,
+        ty: DataType,
+        nullable: bool,
+        value: &str,
+        extra_metadata: impl IntoIterator<Item = (String, String)>,
+    ) -> Field {
+        let mut metadata =
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), value.to_string())]);
+        metadata.extend(extra_metadata);
+        Field::new(name, ty, nullable).with_metadata(metadata)
+    }
+
     fn arrow_schema_for_arrow_schema_to_schema_test() -> ArrowSchema {
         let fields = Fields::from(vec![
             simple_field("key", DataType::Int32, false, "28"),
@@ -1707,7 +1724,7 @@ mod tests {
             simple_field("map", map, false, "16"),
             simple_field("struct", r#struct, false, "17"),
             simple_field("uuid", DataType::FixedSizeBinary(16), false, "30"),
-            simple_field(
+            simple_field_with_metadata(
                 "v",
                 DataType::Struct(Fields::from(vec![
                     Field::new("metadata", DataType::Binary, false),
@@ -1715,6 +1732,10 @@ mod tests {
                 ])),
                 true,
                 "31",
+                [(
+                    EXTENSION_TYPE_NAME_KEY.to_string(),
+                    PARQUET_VARIANT_EXTENSION_NAME.to_string(),
+                )],
             ),
         ])
     }
@@ -1920,6 +1941,52 @@ mod tests {
         let schema = iceberg_schema_for_schema_to_arrow_schema();
         let converted_arrow_schema = schema_to_arrow_schema(&schema).unwrap();
         assert_eq!(converted_arrow_schema, arrow_schema);
+        assert_eq!(
+            converted_arrow_schema
+                .field_with_name("v")
+                .unwrap()
+                .metadata()
+                .get(EXTENSION_TYPE_NAME_KEY)
+                .map(String::as_str),
+            Some(PARQUET_VARIANT_EXTENSION_NAME)
+        );
+    }
+
+    #[test]
+    fn test_schema_to_arrow_schema_nested_variant_metadata() {
+        let schema_json = r#"{
+            "type":"struct",
+            "schema-id":0,
+            "fields":[
+                {
+                    "id":1,
+                    "name":"variants",
+                    "required":false,
+                    "type":{
+                        "type":"list",
+                        "element-id":2,
+                        "element":"variant",
+                        "element-required":true
+                    }
+                }
+            ],
+            "identifier-field-ids":[]
+        }"#;
+
+        let schema: Schema = serde_json::from_str(schema_json).unwrap();
+        let converted_arrow_schema = schema_to_arrow_schema(&schema).unwrap();
+        let field = converted_arrow_schema.field_with_name("variants").unwrap();
+        let DataType::List(element) = field.data_type() else {
+            panic!("Expected list field, got {:?}", field.data_type());
+        };
+
+        assert_eq!(
+            element
+                .metadata()
+                .get(EXTENSION_TYPE_NAME_KEY)
+                .map(String::as_str),
+            Some(PARQUET_VARIANT_EXTENSION_NAME)
+        );
     }
 
     #[test]
