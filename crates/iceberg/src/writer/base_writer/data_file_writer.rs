@@ -30,6 +30,7 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Debug)]
 pub struct DataFileWriterBuilder<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
     inner: RollingFileWriterBuilder<B, L, F>,
+    sort_order_id: Option<i32>,
 }
 
 impl<B, L, F> DataFileWriterBuilder<B, L, F>
@@ -40,7 +41,16 @@ where
 {
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            sort_order_id: None,
+        }
+    }
+
+    /// Set sort order id for data files.
+    pub fn sort_order_id(mut self, sort_order_id: Option<i32>) -> Self {
+        self.sort_order_id = sort_order_id;
+        self
     }
 }
 
@@ -57,6 +67,7 @@ where
         Ok(DataFileWriter {
             inner: Some(self.inner.build()),
             partition_key,
+            sort_order_id: self.sort_order_id,
         })
     }
 }
@@ -66,6 +77,7 @@ where
 pub struct DataFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
     inner: Option<RollingFileWriter<B, L, F>>,
     partition_key: Option<PartitionKey>,
+    sort_order_id: Option<i32>,
 }
 
 #[async_trait::async_trait]
@@ -97,6 +109,9 @@ where
                     if let Some(pk) = self.partition_key.as_ref() {
                         res.partition(pk.data().clone());
                         res.partition_spec_id(pk.spec().spec_id());
+                    }
+                    if let Some(sort_order_id) = self.sort_order_id {
+                        res.sort_order_id(sort_order_id);
                     }
                     res.build().map_err(|e| {
                         Error::new(
@@ -326,6 +341,61 @@ mod test {
             .map(|col| col.name())
             .collect();
         assert_eq!(field_names, vec!["id", "name"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_with_sort_order_id() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = Schema::builder()
+            .with_schema_id(3)
+            .with_fields(vec![
+                NestedField::required(3, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(4, "bar", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()?;
+
+        let pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(schema));
+
+        let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            pw,
+            file_io,
+            location_gen,
+            file_name_gen,
+        );
+
+        let mut data_file_writer = DataFileWriterBuilder::new(rolling_file_writer_builder)
+            .sort_order_id(Some(7))
+            .build(None)
+            .await?;
+
+        let arrow_schema = arrow_schema::Schema::new(vec![
+            Field::new("foo", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                3.to_string(),
+            )])),
+            Field::new("bar", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                4.to_string(),
+            )])),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+        ])?;
+        data_file_writer.write(batch).await?;
+
+        let data_files = data_file_writer.close().await?;
+        assert_eq!(data_files.len(), 1);
+        assert_eq!(data_files[0].sort_order_id(), Some(7));
 
         Ok(())
     }
