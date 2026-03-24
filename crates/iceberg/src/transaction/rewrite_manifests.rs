@@ -23,8 +23,8 @@ use uuid::Uuid;
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::error::Result;
 use crate::spec::{
-    DataFile, MIN_FORMAT_VERSION_ROW_LINEAGE, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestWriter, Operation,
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
+    MIN_FORMAT_VERSION_ROW_LINEAGE,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -301,18 +301,14 @@ impl TransactionAction for RewriteManifestsAction {
                 None => {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!(
-                            "Deleted manifest does not exist in the current snapshot: {}",
-                            path
-                        ),
+                        format!("Deleted manifest does not exist in the current snapshot: {path}",),
                     ));
                 }
                 Some(current) if current.content == ManifestContentType::Deletes => {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         format!(
-                            "Cannot delete a delete-type manifest via rewrite_manifests: {}",
-                            path
+                            "Cannot delete a delete-type manifest via rewrite_manifests: {path}",
                         ),
                     ));
                 }
@@ -402,11 +398,11 @@ impl TransactionAction for RewriteManifestsAction {
                 }
 
                 // Check predicate
-                if let Some(ref predicate) = self.manifest_predicate {
-                    if !predicate(manifest_file) {
-                        kept_manifests.push(manifest_file.clone());
-                        continue;
-                    }
+                if let Some(ref predicate) = self.manifest_predicate
+                    && !predicate(manifest_file)
+                {
+                    kept_manifests.push(manifest_file.clone());
+                    continue;
                 }
 
                 // Rewrite this manifest
@@ -469,16 +465,15 @@ impl TransactionAction for RewriteManifestsAction {
         let replaced_count = active_files_count(&rewritten_manifests)
             .and_then(|a| active_files_count(&self.deleted_manifests).map(|b| a + b));
 
-        if let (Some(created), Some(replaced)) = (created_count, replaced_count) {
-            if created != replaced {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Rewrite manifests file count mismatch: created {} files but replaced {} files",
-                        created, replaced
-                    ),
-                ));
-            }
+        if let (Some(created), Some(replaced)) = (created_count, replaced_count)
+            && created != replaced
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Rewrite manifests file count mismatch: created {created} files but replaced {replaced} files",
+                ),
+            ));
         }
 
         // Inject rewrite-specific summary properties so they appear in the snapshot.
@@ -523,9 +518,9 @@ mod tests {
 
     use crate::spec::{ManifestContentType, ManifestFile};
     use crate::table::Table;
-    use crate::transaction::TransactionAction;
     use crate::transaction::rewrite_manifests::RewriteManifestsAction;
     use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table};
+    use crate::transaction::TransactionAction;
 
     fn test_manifest(
         path: &str,
