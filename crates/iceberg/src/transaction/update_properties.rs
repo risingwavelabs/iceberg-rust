@@ -110,10 +110,10 @@ mod tests {
 
     use as_any::Downcast;
 
+    use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::update_properties::UpdatePropertiesAction;
-    use crate::transaction::Transaction;
 
     #[test]
     fn test_update_table_property() {

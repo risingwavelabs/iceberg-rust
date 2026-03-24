@@ -23,8 +23,8 @@ use uuid::Uuid;
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::error::Result;
 use crate::spec::{
-    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
-    MIN_FORMAT_VERSION_ROW_LINEAGE,
+    DataFile, MIN_FORMAT_VERSION_ROW_LINEAGE, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestWriter, Operation,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -523,9 +523,9 @@ mod tests {
 
     use crate::spec::{ManifestContentType, ManifestFile};
     use crate::table::Table;
+    use crate::transaction::TransactionAction;
     use crate::transaction::rewrite_manifests::RewriteManifestsAction;
     use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table};
-    use crate::transaction::TransactionAction;
 
     fn test_manifest(
         path: &str,

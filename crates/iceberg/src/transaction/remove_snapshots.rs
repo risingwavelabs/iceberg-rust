@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use itertools::Itertools;
 
 use crate::error::Result;
-use crate::spec::{SnapshotReference, SnapshotRetention, TableMetadataRef, MAIN_BRANCH};
+use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadataRef};
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::utils::ancestors_of;
@@ -392,7 +392,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::io::FileIOBuilder;
-    use crate::spec::{TableMetadata, MAIN_BRANCH};
+    use crate::spec::{MAIN_BRANCH, TableMetadata};
     use crate::table::Table;
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableIdent, TableRequirement};

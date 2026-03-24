@@ -113,9 +113,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::table::Table;
+    use crate::transaction::Transaction;
     use crate::transaction::action::{ActionCommit, ApplyTransactionAction, TransactionAction};
     use crate::transaction::tests::make_v2_table;
-    use crate::transaction::Transaction;
     use crate::{Result, TableRequirement, TableUpdate};
 
     struct TestAction;
