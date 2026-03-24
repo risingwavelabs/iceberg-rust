@@ -19,8 +19,8 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
 use common::{random_ns, test_schema};
@@ -29,11 +29,11 @@ use iceberg::spec::DataFile;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, TableCreation};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
@@ -334,9 +334,8 @@ async fn test_rewrite_manifests_multi_cluster_keys() {
     // Should have at most 2 manifests (two cluster keys), at least 1
     let num_manifests = manifest_list.entries().len();
     assert!(
-        num_manifests >= 1 && num_manifests <= 2,
-        "expected 1 or 2 manifests from 2 cluster keys, got {}",
-        num_manifests
+        (1..=2).contains(&num_manifests),
+        "expected 1 or 2 manifests from 2 cluster keys, got {num_manifests}",
     );
 
     // Total data file entries across all manifests should be 4
@@ -392,8 +391,7 @@ async fn test_rewrite_manifests_delete_nonexistent_manifest() {
     let err_msg = format!("{}", commit_result.unwrap_err());
     assert!(
         err_msg.contains("does not exist in the current snapshot"),
-        "unexpected error: {}",
-        err_msg
+        "unexpected error: {err_msg}",
     );
 }
 
