@@ -155,13 +155,11 @@ mod tests {
         let action = (*tx.actions[0])
             .downcast_ref::<UpdateStatisticsAction>()
             .unwrap();
-        assert!(
-            action
-                .statistics_to_set
-                .get(&statistics_file_1.snapshot_id)
-                .unwrap()
-                .is_none()
-        ); // stats1 should have been removed
+        assert!(action
+            .statistics_to_set
+            .get(&statistics_file_1.snapshot_id)
+            .unwrap()
+            .is_none()); // stats1 should have been removed
         assert_eq!(
             action
                 .statistics_to_set

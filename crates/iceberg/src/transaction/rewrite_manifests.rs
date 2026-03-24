@@ -242,11 +242,9 @@ impl TransactionAction for RewriteManifestsAction {
             snapshot_producer.set_target_branch(branch.clone());
         }
 
-        let target_branch = snapshot_producer.target_branch().to_string();
+        let target_branch = snapshot_producer.target_branch();
         let metadata_ref = table.metadata_ref();
-      let target_branch = snapshot_producer.target_branch();
-let metadata_ref = table.metadata_ref();
-let parent_snapshot = metadata_ref.snapshot_for_ref(target_branch);
+        let parent_snapshot = metadata_ref.snapshot_for_ref(target_branch);
 
         // Load current manifests from the parent snapshot
         let current_manifests = if let Some(snapshot) = parent_snapshot {

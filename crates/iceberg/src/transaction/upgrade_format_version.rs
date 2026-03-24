@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::TableUpdate::UpgradeFormatVersion;
 use crate::spec::FormatVersion;
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
+use crate::TableUpdate::UpgradeFormatVersion;
 use crate::{Error, ErrorKind, Result};
 
 /// A transaction action to upgrade a table's format version.
@@ -85,9 +85,9 @@ mod tests {
     use as_any::Downcast;
 
     use crate::spec::FormatVersion;
-    use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
+    use crate::transaction::Transaction;
 
     #[test]
     fn test_upgrade_format_version() {

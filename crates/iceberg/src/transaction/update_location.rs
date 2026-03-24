@@ -80,10 +80,10 @@ impl TransactionAction for UpdateLocationAction {
 mod tests {
     use as_any::Downcast;
 
-    use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::update_location::UpdateLocationAction;
+    use crate::transaction::Transaction;
 
     #[test]
     fn test_set_location() {

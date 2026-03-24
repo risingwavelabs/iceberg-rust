@@ -16,8 +16,8 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -797,12 +797,10 @@ mod tests {
         let result = manager.validate_required_deletes(&manifests);
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Required delete path missing")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Required delete path missing"));
     }
 
     #[tokio::test]
@@ -1024,16 +1022,12 @@ mod tests {
         assert_eq!(deleted_count, 1);
 
         // Verify cache and tracking
-        assert!(
-            manager
-                .filtered_manifests
-                .contains_key(&input_manifests[0].manifest_path)
-        );
-        assert!(
-            manager
-                .filtered_manifest_to_deleted_files
-                .contains_key(&filtered_manifests[0].manifest_path)
-        );
+        assert!(manager
+            .filtered_manifests
+            .contains_key(&input_manifests[0].manifest_path));
+        assert!(manager
+            .filtered_manifest_to_deleted_files
+            .contains_key(&filtered_manifests[0].manifest_path));
     }
 
     #[test]
@@ -1087,11 +1081,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result1.manifest_path, result2.manifest_path);
-        assert!(
-            manager
-                .filtered_manifests
-                .contains_key(&manifest.manifest_path)
-        );
+        assert!(manager
+            .filtered_manifests
+            .contains_key(&manifest.manifest_path));
     }
 
     #[test]

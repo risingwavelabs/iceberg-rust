@@ -299,8 +299,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::catalog::MockCatalog;
     use crate::io::FileIOBuilder;

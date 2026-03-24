@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -27,11 +27,11 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{
-    update_snapshot_summaries, DataContentType, DataFile, DataFileFormat, FormatVersion,
-    ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus,
-    ManifestWriter, ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, MAIN_BRANCH, UNASSIGNED_SEQUENCE_NUMBER,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
+    ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
+    ManifestWriterBuilder, Operation, PrimitiveLiteral, Snapshot, SnapshotReference,
+    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
+    UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
