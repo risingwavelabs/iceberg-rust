@@ -21,28 +21,85 @@
 //! The Spark 4.0 provisioner creates `rest.default.test_variant_column` with a
 //! `VARIANT` column containing three rows of JSON data.
 
+use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use futures::TryStreamExt;
 use iceberg::spec::Type;
+use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_integration_tests::get_test_fixture;
 
-/// Verifies that a table written by Spark with a VARIANT column has its schema
-/// parsed into `Type::Variant` by the Rust iceberg implementation.
-#[tokio::test]
-async fn test_variant_schema_is_parsed() {
+async fn load_variant_table() -> Table {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
 
-    let table = rest_catalog
+    rest_catalog
         .load_table(&TableIdent::from_strs(["default", "test_variant_column"]).unwrap())
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Asserts that the variant field "v" in the batch carries extension metadata and
+/// has the expected `Struct(metadata: Binary, value: Binary)` layout.
+fn assert_variant_column(batch: &RecordBatch) {
+    assert_eq!(
+        batch
+            .schema()
+            .field_with_name("v")
+            .unwrap()
+            .metadata()
+            .get(EXTENSION_TYPE_NAME_KEY)
+            .map(String::as_str),
+        Some("arrow.parquet.variant"),
+        "variant field must carry Arrow extension metadata"
+    );
+
+    let v_col = batch
+        .column_by_name("v")
+        .expect("column 'v' not found in batch");
+
+    let DataType::Struct(fields) = v_col.data_type() else {
+        panic!(
+            "Expected variant column to be DataType::Struct, got {:?}",
+            v_col.data_type()
+        );
+    };
+
+    assert_eq!(
+        fields.len(),
+        2,
+        "variant struct must have exactly 2 sub-fields"
+    );
+    assert_eq!(
+        fields
+            .iter()
+            .find(|f| f.name() == "metadata")
+            .expect("sub-field 'metadata' not found")
+            .data_type(),
+        &DataType::Binary,
+        "'metadata' sub-field must be DataType::Binary"
+    );
+    assert_eq!(
+        fields
+            .iter()
+            .find(|f| f.name() == "value")
+            .expect("sub-field 'value' not found")
+            .data_type(),
+        &DataType::Binary,
+        "'value' sub-field must be DataType::Binary"
+    );
+}
+
+/// Verifies that a table written by Spark with a VARIANT column has its schema
+/// parsed into `Type::Variant` by the Rust iceberg implementation.
+#[tokio::test]
+async fn test_variant_schema_is_parsed() {
+    let table = load_variant_table().await;
 
     let schema = table.metadata().current_schema();
     let variant_field = schema
@@ -61,71 +118,14 @@ async fn test_variant_schema_is_parsed() {
 /// matching the Parquet physical layout (§3.3 of the Parquet Variant spec).
 #[tokio::test]
 async fn test_variant_arrow_schema() {
-    let fixture = get_test_fixture();
-    let rest_catalog = RestCatalogBuilder::default()
-        .load("rest", fixture.catalog_config.clone())
-        .await
-        .unwrap();
-
-    let table = rest_catalog
-        .load_table(&TableIdent::from_strs(["default", "test_variant_column"]).unwrap())
-        .await
-        .unwrap();
+    let table = load_variant_table().await;
 
     let scan = table.scan().build().unwrap();
     let batch_stream = scan.to_arrow().await.unwrap();
     let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
 
     assert!(!batches.is_empty(), "expected at least one record batch");
-    assert_eq!(
-        batches[0]
-            .schema()
-            .field_with_name("v")
-            .unwrap()
-            .metadata()
-            .get(EXTENSION_TYPE_NAME_KEY)
-            .map(String::as_str),
-        Some("arrow.parquet.variant"),
-        "variant field must carry Arrow extension metadata"
-    );
-
-    // Variant column must be a struct with exactly two binary sub-fields
-    let v_col = batches[0]
-        .column_by_name("v")
-        .expect("column 'v' not found in batch");
-
-    let DataType::Struct(fields) = v_col.data_type() else {
-        panic!(
-            "Expected variant column to be DataType::Struct, got {:?}",
-            v_col.data_type()
-        );
-    };
-
-    assert_eq!(
-        fields.len(),
-        2,
-        "variant struct must have exactly 2 sub-fields"
-    );
-
-    let metadata_field = fields
-        .iter()
-        .find(|f| f.name() == "metadata")
-        .expect("sub-field 'metadata' not found");
-    let value_field = fields
-        .iter()
-        .find(|f| f.name() == "value")
-        .expect("sub-field 'value' not found");
-
-    assert_eq!(
-        metadata_field.data_type(),
-        &DataType::Binary,
-        "'metadata' sub-field must be DataType::Binary"
-    );
-    assert_eq!(
-        value_field.data_type(),
-        &DataType::Binary,
-        "'value' sub-field must be DataType::Binary"
-    );
+    assert_variant_column(&batches[0]);
 }
 
 /// Verifies that a variant column is NOT silently dropped when it is projected
@@ -134,16 +134,7 @@ async fn test_variant_arrow_schema() {
 /// excluded from `column_map`, causing the whole variant group to be omitted).
 #[tokio::test]
 async fn test_variant_projected_with_primitive_columns() {
-    let fixture = get_test_fixture();
-    let rest_catalog = RestCatalogBuilder::default()
-        .load("rest", fixture.catalog_config.clone())
-        .await
-        .unwrap();
-
-    let table = rest_catalog
-        .load_table(&TableIdent::from_strs(["default", "test_variant_column"]).unwrap())
-        .await
-        .unwrap();
+    let table = load_variant_table().await;
 
     // Explicitly select only the two columns — this exercises the projection path
     // that was previously broken for variant types.
@@ -154,46 +145,12 @@ async fn test_variant_projected_with_primitive_columns() {
     assert!(!batches.is_empty(), "expected at least one record batch");
 
     let first_batch = &batches[0];
-    assert_eq!(
-        first_batch
-            .schema()
-            .field_with_name("v")
-            .unwrap()
-            .metadata()
-            .get(EXTENSION_TYPE_NAME_KEY)
-            .map(String::as_str),
-        Some("arrow.parquet.variant"),
-        "projected variant field must carry Arrow extension metadata"
-    );
+    assert_variant_column(first_batch);
 
     // Both columns must be present — the variant must not be silently dropped.
     assert!(
         first_batch.column_by_name("id").is_some(),
         "column 'id' not found in projected batch"
-    );
-    let v_col = first_batch
-        .column_by_name("v")
-        .expect("column 'v' was silently dropped from projected scan — projection bug regression");
-
-    // The variant column must still be a struct with the expected sub-fields.
-    let DataType::Struct(fields) = v_col.data_type() else {
-        panic!(
-            "Expected variant column to be DataType::Struct after projection, got {:?}",
-            v_col.data_type()
-        );
-    };
-    assert_eq!(
-        fields.len(),
-        2,
-        "projected variant struct must have exactly 2 sub-fields"
-    );
-    assert!(
-        fields.iter().any(|f| f.name() == "metadata"),
-        "projected variant struct must have a 'metadata' sub-field"
-    );
-    assert!(
-        fields.iter().any(|f| f.name() == "value"),
-        "projected variant struct must have a 'value' sub-field"
     );
 
     // All three seeded rows must be readable.
