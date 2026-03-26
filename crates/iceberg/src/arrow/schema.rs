@@ -275,6 +275,9 @@ struct ArrowSchemaConverter {
     /// Required because `ReassignFieldIds` builds an old-to-new ID mapping
     /// that expects unique input IDs.
     next_field_id: i32,
+    /// Tracks the current Arrow field being visited so extension metadata can influence
+    /// type conversion for nested fields like variant values in lists and maps.
+    field_stack: Vec<Field>,
 }
 
 impl ArrowSchemaConverter {
@@ -282,6 +285,7 @@ impl ArrowSchemaConverter {
         Self {
             reassign_field_ids_from: None,
             next_field_id: 0,
+            field_stack: Vec::new(),
         }
     }
 
@@ -289,6 +293,7 @@ impl ArrowSchemaConverter {
         Self {
             reassign_field_ids_from: Some(start_from),
             next_field_id: 0,
+            field_stack: Vec::new(),
         }
     }
 
@@ -330,11 +335,65 @@ impl ArrowSchemaConverter {
         }
         Ok(results)
     }
+
+    fn current_field_is_variant(&self) -> bool {
+        self.field_stack
+            .last()
+            .and_then(|field| field.metadata().get(EXTENSION_TYPE_NAME_KEY))
+            .is_some_and(|extension_name| extension_name == PARQUET_VARIANT_EXTENSION_NAME)
+    }
+
+    fn push_field(&mut self, field: &Field) {
+        self.field_stack.push(field.clone());
+    }
+
+    fn pop_field(&mut self) -> Result<()> {
+        self.field_stack
+            .pop()
+            .map(|_| ())
+            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "Field stack underflow"))
+    }
 }
 
 impl ArrowSchemaVisitor for ArrowSchemaConverter {
     type T = Type;
     type U = Schema;
+
+    fn before_field(&mut self, field: &Field) -> Result<()> {
+        self.push_field(field);
+        Ok(())
+    }
+
+    fn after_field(&mut self, _field: &Field) -> Result<()> {
+        self.pop_field()
+    }
+
+    fn before_list_element(&mut self, field: &Field) -> Result<()> {
+        self.push_field(field);
+        Ok(())
+    }
+
+    fn after_list_element(&mut self, _field: &Field) -> Result<()> {
+        self.pop_field()
+    }
+
+    fn before_map_key(&mut self, field: &Field) -> Result<()> {
+        self.push_field(field);
+        Ok(())
+    }
+
+    fn after_map_key(&mut self, _field: &Field) -> Result<()> {
+        self.pop_field()
+    }
+
+    fn before_map_value(&mut self, field: &Field) -> Result<()> {
+        self.push_field(field);
+        Ok(())
+    }
+
+    fn after_map_value(&mut self, _field: &Field) -> Result<()> {
+        self.pop_field()
+    }
 
     fn schema(&mut self, schema: &ArrowSchema, values: Vec<Self::T>) -> Result<Self::U> {
         let fields = self.convert_fields(schema.fields(), &values)?;
@@ -346,6 +405,10 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
     }
 
     fn r#struct(&mut self, fields: &Fields, results: Vec<Self::T>) -> Result<Self::T> {
+        if self.current_field_is_variant() {
+            return Ok(Type::Variant(VariantType));
+        }
+
         let fields = self.convert_fields(fields, &results)?;
         Ok(Type::Struct(StructType::new(fields)))
     }

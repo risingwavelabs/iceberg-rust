@@ -26,9 +26,7 @@ use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kl
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::{
-    ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
-};
+use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
@@ -696,6 +694,104 @@ impl ArrowReader {
         }
     }
 
+    fn collect_variant_leaf_indices(
+        fields: &arrow_schema::Fields,
+        iceberg_schema_of_task: &Schema,
+        selected_leaf_field_ids: &HashSet<i32>,
+    ) -> HashMap<usize, i32> {
+        let mut variant_leaf_indices = HashMap::new();
+        let mut next_leaf_idx = 0;
+
+        for field in fields {
+            Self::collect_variant_leaf_indices_for_field(
+                field,
+                iceberg_schema_of_task,
+                selected_leaf_field_ids,
+                None,
+                &mut next_leaf_idx,
+                &mut variant_leaf_indices,
+            );
+        }
+
+        variant_leaf_indices
+    }
+
+    fn collect_variant_leaf_indices_for_field(
+        field: &arrow_schema::FieldRef,
+        iceberg_schema_of_task: &Schema,
+        selected_leaf_field_ids: &HashSet<i32>,
+        current_variant_field_id: Option<i32>,
+        next_leaf_idx: &mut usize,
+        variant_leaf_indices: &mut HashMap<usize, i32>,
+    ) {
+        let variant_field_id = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|field_id| i32::from_str(field_id).ok())
+            .filter(|field_id| selected_leaf_field_ids.contains(field_id))
+            .and_then(|field_id| {
+                iceberg_schema_of_task
+                    .field_by_id(field_id)
+                    .filter(|field| matches!(field.field_type.as_ref(), Type::Variant(_)))
+                    .map(|_| field_id)
+            })
+            .or(current_variant_field_id);
+
+        // Keep this traversal in lock-step with `arrow_schema::Fields::filter_leaves`, which
+        // defines the leaf indices used by Arrow projection masks.
+        let data_type = match field.data_type() {
+            DataType::Dictionary(_, value_type) => value_type.as_ref(),
+            DataType::RunEndEncoded(_, values_field) => values_field.data_type(),
+            other => other,
+        };
+
+        match data_type {
+            DataType::Struct(fields) => {
+                for child in fields {
+                    Self::collect_variant_leaf_indices_for_field(
+                        child,
+                        iceberg_schema_of_task,
+                        selected_leaf_field_ids,
+                        variant_field_id,
+                        next_leaf_idx,
+                        variant_leaf_indices,
+                    );
+                }
+            }
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => {
+                Self::collect_variant_leaf_indices_for_field(
+                    field,
+                    iceberg_schema_of_task,
+                    selected_leaf_field_ids,
+                    variant_field_id,
+                    next_leaf_idx,
+                    variant_leaf_indices,
+                );
+            }
+            DataType::Union(fields, _) => {
+                for (_type_id, child) in fields.iter() {
+                    Self::collect_variant_leaf_indices_for_field(
+                        child,
+                        iceberg_schema_of_task,
+                        selected_leaf_field_ids,
+                        variant_field_id,
+                        next_leaf_idx,
+                        variant_leaf_indices,
+                    );
+                }
+            }
+            _ => {
+                if let Some(variant_field_id) = variant_field_id {
+                    variant_leaf_indices.insert(*next_leaf_idx, variant_field_id);
+                }
+                *next_leaf_idx += 1;
+            }
+        }
+    }
+
     fn get_arrow_projection_mask(
         field_ids: &[i32],
         iceberg_schema_of_task: &Schema,
@@ -771,68 +867,46 @@ impl ArrowReader {
         let fields = arrow_schema.fields();
         // HashSet for O(1) membership checks instead of O(n) slice scans.
         let leaf_field_id_set: HashSet<i32> = leaf_field_ids.iter().copied().collect();
-
-        // Variant fields are an Iceberg leaf type but a Parquet GROUP.  Their
-        // sub-fields (metadata, value) carry no embedded field IDs — only the
-        // parent group has the field ID. filter_leaves therefore never finds
-        // them via the standard field-ID scan below.
-        //
-        // Java's PruneColumns.variant() simply returns the group as-is with no
-        // type-compatibility check (isStruct() also short-circuits on isVariantType()).
-        // We replicate that here: pre-scan top-level Arrow struct fields whose
-        // field ID resolves to Type::Variant and record all their sub-fields so
-        // the second filter_leaves can include them directly.
-        let mut variant_sub_fields: HashMap<FieldRef, i32> = HashMap::new();
-        for top_field in fields.iter() {
-            let Some(field_id) = top_field
-                .metadata()
-                .get(PARQUET_FIELD_ID_META_KEY)
-                .and_then(|s| i32::from_str(s).ok())
-            else {
-                continue;
-            };
-            if !leaf_field_id_set.contains(&field_id) {
-                continue;
-            }
-            let Some(iceberg_field) = iceberg_schema_of_task.field_by_id(field_id) else {
-                continue;
-            };
-            if let Type::Variant(_) = iceberg_field.field_type.as_ref()
-                && let DataType::Struct(sub_fields) = top_field.data_type()
-            {
-                for sub_field in sub_fields {
-                    variant_sub_fields.insert(sub_field.clone(), field_id);
-                }
-            }
-        }
+        let variant_leaf_indices =
+            Self::collect_variant_leaf_indices(fields, iceberg_schema_of_task, &leaf_field_id_set);
 
         // Pre-project only the fields that have been selected, possibly avoiding converting
         // some Arrow types that are not yet supported.
-        let mut projected_fields: HashMap<FieldRef, i32> = HashMap::new();
+        let mut projected_field_ids: HashMap<usize, i32> = HashMap::new();
         let projected_arrow_schema = ArrowSchema::new_with_metadata(
-            fields.filter_leaves(|_, f| {
-                f.metadata()
+            fields.filter_leaves(|idx, field| {
+                if let Some(&field_id) = variant_leaf_indices.get(&idx) {
+                    projected_field_ids.insert(idx, field_id);
+                    return true;
+                }
+
+                field
+                    .metadata()
                     .get(PARQUET_FIELD_ID_META_KEY)
                     .and_then(|field_id| i32::from_str(field_id).ok())
                     .is_some_and(|field_id| {
-                        projected_fields.insert((*f).clone(), field_id);
-                        leaf_field_id_set.contains(&field_id)
+                        if leaf_field_id_set.contains(&field_id) {
+                            projected_field_ids.insert(idx, field_id);
+                            true
+                        } else {
+                            false
+                        }
                     })
             }),
             arrow_schema.metadata().clone(),
         );
         let iceberg_schema = arrow_schema_to_schema(&projected_arrow_schema)?;
 
-        fields.filter_leaves(|idx, field| {
-            // Variant sub-fields: parent group carries the field ID, not the leaf.
-            // Skip type-promotion check — Type::Variant is not a primitive type
-            // (matches Java's PruneColumns.variant() which returns the group unchanged).
-            if let Some(&variant_field_id) = variant_sub_fields.get(field) {
+        fields.filter_leaves(|idx, _field| {
+            // Variant fields are treated as leaf projections in Iceberg Java. Their Parquet
+            // sub-fields do not carry field IDs, so any leaf under a selected variant group must
+            // be projected without applying primitive type promotion checks.
+            if let Some(&variant_field_id) = variant_leaf_indices.get(&idx) {
                 column_map.entry(variant_field_id).or_default().push(idx);
                 return true;
             }
 
-            let Some(field_id) = projected_fields.get(field).cloned() else {
+            let Some(field_id) = projected_field_ids.get(&idx).copied() else {
                 return false;
             };
 
@@ -1893,6 +1967,7 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, StringArray};
+    use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
@@ -1914,8 +1989,8 @@ mod tests {
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskStream};
     use crate::spec::{
-        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef,
-        Type, VariantType,
+        DataContentType, DataFileFormat, Datum, MapType, NestedField, PrimitiveType, Schema,
+        SchemaRef, Type, VariantType,
     };
 
     fn table_schema_simple() -> SchemaRef {
@@ -2132,10 +2207,13 @@ message schema {
                 ])),
                 false,
             )
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )])),
+            .with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
+                (
+                    EXTENSION_TYPE_NAME_KEY.to_string(),
+                    "arrow.parquet.variant".to_string(),
+                ),
+            ])),
         ]));
 
         // Parquet message: c1 is leaf 0; variant sub-fields metadata=leaf 1, value=leaf 2.
@@ -2190,6 +2268,156 @@ message schema {
             mask_primitive_only,
             ProjectionMask::leaves(&parquet_schema, vec![0]),
         );
+    }
+
+    /// Nested variant values inside Parquet maps must project the entire variant group instead of
+    /// selecting only the map key leaf. Otherwise Parquet will reject the partial MapArray
+    /// projection.
+    #[test]
+    fn test_arrow_projection_mask_map_with_variant_value() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(
+                        1,
+                        "m",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(2, Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::map_value_element(3, Type::Variant(VariantType), true)
+                                .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "m",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        DataType::Struct(arrow_schema::Fields::from(vec![
+                            Arc::new(Field::new("key", DataType::Utf8, false).with_metadata(
+                                HashMap::from([(
+                                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                                    "2".to_string(),
+                                )]),
+                            )),
+                            Arc::new(
+                                Field::new(
+                                    "value",
+                                    DataType::Struct(arrow_schema::Fields::from(vec![
+                                        Arc::new(Field::new("metadata", DataType::Binary, false)),
+                                        Arc::new(Field::new("value", DataType::Binary, false)),
+                                    ])),
+                                    true,
+                                )
+                                .with_metadata(HashMap::from([
+                                    (PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string()),
+                                    (
+                                        EXTENSION_TYPE_NAME_KEY.to_string(),
+                                        "arrow.parquet.variant".to_string(),
+                                    ),
+                                ])),
+                            ),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let message_type = "
+message schema {
+  required group m (MAP) = 1 {
+    repeated group key_value {
+      required binary key (STRING) = 2;
+      optional group value = 3 {
+        required binary metadata;
+        required binary value;
+      }
+    }
+  }
+}
+";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("projection mask for map<string, variant>");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn test_arrow_projection_mask_dictionary_wrapped_variant() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "v",
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Struct(arrow_schema::Fields::from(vec![
+                        Arc::new(Field::new("metadata", DataType::Binary, false)),
+                        Arc::new(Field::new("value", DataType::Binary, false)),
+                    ]))),
+                ),
+                false,
+            )
+            .with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                (
+                    EXTENSION_TYPE_NAME_KEY.to_string(),
+                    "arrow.parquet.variant".to_string(),
+                ),
+            ])),
+        ]));
+
+        let message_type = "
+message schema {
+  required group v = 1 {
+    required binary metadata;
+    required binary value;
+  }
+}
+";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("projection mask for dictionary-wrapped variant");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1]));
     }
 
     #[tokio::test]
