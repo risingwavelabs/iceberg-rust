@@ -335,6 +335,7 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use rand::prelude::IteratorRandom;
     use tempfile::TempDir;
+    use tokio::time::{Duration, timeout};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -725,6 +726,64 @@ mod tests {
         tx1.send(()).unwrap();
         tx0.send(()).unwrap();
 
+        let data_files = writer.close().await?;
+        let mut record_counts: Vec<u64> = data_files
+            .into_iter()
+            .map(|file| file.build().unwrap().record_count())
+            .collect();
+        record_counts.sort_unstable();
+
+        assert_eq!(record_counts, vec![0, 1, 2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_waiting_for_pending_close_can_resume_rolling() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_string_lossy().into_owned(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let (tx0, rx0) = oneshot::channel();
+
+        let builder = RollingFileWriterBuilder::new(
+            MockFileWriterBuilder::new(vec![
+                CloseBehavior::Wait(rx0),
+                CloseBehavior::Ok,
+                CloseBehavior::Ok,
+            ]),
+            16,
+            file_io,
+            location_gen,
+            file_name_gen,
+        )
+        .with_max_concurrent_closes(1);
+
+        let mut writer = builder.build();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])?;
+
+        writer.write(&None, &batch).await?;
+        writer.write(&None, &batch).await?;
+
+        let batch_for_task = batch.clone();
+        let mut blocked_write = tokio::spawn(async move {
+            writer.write(&None, &batch_for_task).await?;
+            Ok::<RollingFileWriter<MockFileWriterBuilder, _, _>, Error>(writer)
+        });
+
+        assert!(timeout(Duration::from_millis(50), &mut blocked_write).await.is_err());
+
+        tx0.send(()).unwrap();
+
+        let writer = blocked_write.await.unwrap()?;
         let data_files = writer.close().await?;
         let mut record_counts: Vec<u64> = data_files
             .into_iter()
