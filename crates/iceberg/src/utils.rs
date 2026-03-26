@@ -250,7 +250,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::error::Result;
 use crate::io::FileIO;
-use crate::spec::{Manifest, ManifestFile, ManifestList, Snapshot};
+use crate::spec::{Manifest, ManifestFile, ManifestList, ManifestStatus, Snapshot};
 
 pub(crate) const DEFAULT_DELETE_CONCURRENCY_LIMIT: usize = 10;
 pub(crate) const DEFAULT_LOAD_CONCURRENCY_LIMIT: usize = 16;
@@ -453,6 +453,11 @@ impl ReachableFileCleanupStrategy {
     }
 
     /// Finds data files that can be safely deleted.
+    ///
+    /// Collects all data file paths from the manifests being deleted, then removes
+    /// any that are still actively referenced (status `Added` or `Existing`) by
+    /// surviving manifests. Files with `Deleted` status in surviving manifests are
+    /// tombstone entries and do not protect the underlying data files from deletion.
     async fn find_files_to_delete(
         &self,
         manifest_files: &HashSet<ManifestFile>,
@@ -483,9 +488,14 @@ impl ReachableFileCleanupStrategy {
         let loaded_referenced =
             load_manifests(&self.file_io, referenced_vec, self.load_concurrency).await?;
 
+        // Only protect files that are actively referenced (Added or Existing).
+        // Entries with Deleted status are tombstones — they indicate the file was
+        // removed from the table and should not prevent its deletion from storage.
         for (_, manifest) in loaded_referenced {
             for entry in manifest.entries() {
-                files_to_delete.remove(entry.data_file().file_path());
+                if entry.status() != ManifestStatus::Deleted {
+                    files_to_delete.remove(entry.data_file().file_path());
+                }
             }
         }
 
