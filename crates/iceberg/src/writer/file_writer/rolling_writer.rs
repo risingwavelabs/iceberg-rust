@@ -335,8 +335,8 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use rand::prelude::IteratorRandom;
     use tempfile::TempDir;
-    use tokio::time::{Duration, timeout};
     use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
 
     use super::*;
     use crate::io::{FileIOBuilder, OutputFile};
@@ -779,7 +779,11 @@ mod tests {
             Ok::<RollingFileWriter<MockFileWriterBuilder, _, _>, Error>(writer)
         });
 
-        assert!(timeout(Duration::from_millis(50), &mut blocked_write).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), &mut blocked_write)
+                .await
+                .is_err()
+        );
 
         tx0.send(()).unwrap();
 
