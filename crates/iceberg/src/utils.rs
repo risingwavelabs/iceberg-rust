@@ -245,8 +245,8 @@ pub fn ancestors_between(
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
+use futures::stream::{self, StreamExt};
 
 use crate::error::Result;
 use crate::io::FileIO;
@@ -511,10 +511,10 @@ mod cleanup_tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::TableIdent;
     use crate::io::FileIOBuilder;
     use crate::spec::TableMetadata;
     use crate::table::Table;
-    use crate::TableIdent;
 
     #[cfg(test)]
     fn make_v2_table_with_multi_snapshot() -> Table {
