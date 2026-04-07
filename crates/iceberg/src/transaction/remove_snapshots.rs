@@ -24,10 +24,10 @@ use async_trait::async_trait;
 use itertools::Itertools;
 
 use crate::error::Result;
-use crate::spec::{SnapshotReference, SnapshotRetention, TableMetadataRef, MAIN_BRANCH};
+use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadataRef};
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::utils::{ancestors_of, load_manifest_lists, DEFAULT_LOAD_CONCURRENCY_LIMIT};
+use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, ancestors_of, load_manifest_lists};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// Default value for max snapshot age in milliseconds.
@@ -401,7 +401,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::io::FileIOBuilder;
-    use crate::spec::{TableMetadata, MAIN_BRANCH};
+    use crate::spec::{MAIN_BRANCH, TableMetadata};
     use crate::table::Table;
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableIdent, TableRequirement};
