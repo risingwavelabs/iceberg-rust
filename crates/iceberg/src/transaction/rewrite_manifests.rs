@@ -18,21 +18,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use futures::stream::{self, StreamExt};
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::error::Result;
 use crate::spec::{
-    DataFile, MIN_FORMAT_VERSION_ROW_LINEAGE, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestWriter, Operation,
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
+    MIN_FORMAT_VERSION_ROW_LINEAGE,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::utils::{load_manifests, DEFAULT_LOAD_CONCURRENCY_LIMIT};
 use crate::{Error, ErrorKind};
-
-/// Maximum number of manifest files to load concurrently from object storage.
-const MANIFEST_LOAD_CONCURRENCY: usize = 64;
 
 const KEPT_MANIFESTS_COUNT: &str = "manifests-kept";
 const CREATED_MANIFESTS_COUNT: &str = "manifests-created";
@@ -413,24 +410,16 @@ impl TransactionAction for RewriteManifestsAction {
             }
 
             // Load all manifests to rewrite concurrently.
-            let file_io = table.file_io().clone();
-            let loaded_manifests: Vec<_> = stream::iter(manifests_to_rewrite)
-                .map(|manifest_file| {
-                    let file_io = file_io.clone();
-                    async move {
-                        let spec_id = manifest_file.partition_spec_id;
-                        let manifest = manifest_file.load_manifest(&file_io).await?;
-                        Ok::<_, crate::Error>((spec_id, manifest))
-                    }
-                })
-                .buffer_unordered(MANIFEST_LOAD_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
+            let loaded_manifests = load_manifests(
+                table.file_io(),
+                manifests_to_rewrite,
+                DEFAULT_LOAD_CONCURRENCY_LIMIT,
+            )
+            .await?;
 
             // Route entries to writers (sequential — writers are stateful).
-            for (spec_id, manifest) in &loaded_manifests {
+            for (manifest_file, manifest) in &loaded_manifests {
+                let spec_id = &manifest_file.partition_spec_id;
                 for entry in manifest.entries() {
                     if !entry.is_alive() {
                         continue;
@@ -538,9 +527,9 @@ mod tests {
 
     use crate::spec::{ManifestContentType, ManifestFile};
     use crate::table::Table;
-    use crate::transaction::TransactionAction;
     use crate::transaction::rewrite_manifests::RewriteManifestsAction;
     use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table};
+    use crate::transaction::TransactionAction;
 
     fn test_manifest(
         path: &str,
