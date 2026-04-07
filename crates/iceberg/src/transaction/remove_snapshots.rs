@@ -315,7 +315,7 @@ impl TransactionAction for RemoveSnapshotAction {
 
         if self.clear_expired_meta_data {
             let mut reachable_specs = HashSet::new();
-            reachable_specs.insert(table_meta.current_schema_id());
+            reachable_specs.insert(table_meta.default_partition_spec_id());
             let mut reachable_schemas = HashSet::new();
             reachable_schemas.insert(table_meta.current_schema_id());
 
