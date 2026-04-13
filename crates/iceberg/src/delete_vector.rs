@@ -45,7 +45,6 @@ pub struct DeleteVector {
 
 impl DeleteVector {
     /// Creates a delete vector from an existing roaring treemap.
-    #[allow(unused)]
     pub fn new(roaring_treemap: RoaringTreemap) -> DeleteVector {
         DeleteVector {
             inner: roaring_treemap,
@@ -72,7 +71,6 @@ impl DeleteVector {
     /// # Errors
     ///
     /// Returns an error if the precondition is not met.
-    #[allow(dead_code)]
     pub fn insert_positions(&mut self, positions: &[u64]) -> Result<usize> {
         if let Err(err) = self.inner.append(positions.iter().copied()) {
             return Err(Error::new(
@@ -84,8 +82,12 @@ impl DeleteVector {
         Ok(positions.len())
     }
 
+    /// Returns `true` if there are no deleted positions in this vector.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     /// Returns the number of deleted row positions in the vector.
-    #[allow(unused)]
     pub fn len(&self) -> u64 {
         self.inner.len()
     }
