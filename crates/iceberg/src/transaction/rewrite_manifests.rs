@@ -18,17 +18,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::error::Result;
 use crate::spec::{
-    DataFile, MIN_FORMAT_VERSION_ROW_LINEAGE, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestWriter, Operation,
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
+    MIN_FORMAT_VERSION_ROW_LINEAGE,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
+use crate::utils::{load_manifests, DEFAULT_LOAD_CONCURRENCY_LIMIT};
 use crate::{Error, ErrorKind};
 
 const KEPT_MANIFESTS_COUNT: &str = "manifests-kept";
@@ -42,6 +43,26 @@ type ClusterByFunc = Box<dyn Fn(&DataFile) -> String + Send + Sync>;
 
 /// Predicate function to select which manifests to rewrite.
 type ManifestPredicate = Box<dyn Fn(&ManifestFile) -> bool + Send + Sync>;
+
+/// Cached state from a previous clustering pass, reused across retry attempts
+/// to avoid redundant I/O when the manifests that were rewritten are still
+/// present in the current snapshot (i.e. no conflicting concurrent commit
+/// modified those manifests).
+///
+/// This mirrors the retry-on-conflict pattern from the Java
+/// `BaseRewriteManifests`: on each `apply()` call the implementation checks
+/// whether the previously rewritten manifests still exist in the current
+/// snapshot. If they do, only the kept-manifest list is refreshed. If any
+/// rewritten manifest is missing (a concurrent commit changed the table), the
+/// cache is discarded and a full re-rewrite is performed.
+struct CachedRewriteState {
+    /// Paths of the manifests that were consumed (rewritten) during clustering.
+    rewritten_manifest_paths: HashSet<String>,
+    /// New manifest files produced by clustering.
+    new_manifests: Vec<ManifestFile>,
+    /// Number of entries processed during clustering.
+    entry_count: usize,
+}
 
 /// Transaction action for rewriting manifest files.
 ///
@@ -61,6 +82,11 @@ pub struct RewriteManifestsAction {
     manifest_predicate: Option<ManifestPredicate>,
     added_manifests: Vec<ManifestFile>,
     deleted_manifests: Vec<ManifestFile>,
+
+    /// Cached results from a previous clustering pass, protected by a mutex
+    /// so that the action (behind `Arc`) can be retried by the transaction
+    /// commit loop without requiring `&mut self`.
+    cached_state: Mutex<Option<CachedRewriteState>>,
 }
 
 impl RewriteManifestsAction {
@@ -77,6 +103,7 @@ impl RewriteManifestsAction {
             manifest_predicate: None,
             added_manifests: Vec::new(),
             deleted_manifests: Vec::new(),
+            cached_state: Mutex::new(None),
         }
     }
 
@@ -261,10 +288,12 @@ impl TransactionAction for RewriteManifestsAction {
         };
 
         // Map paths to the actual ManifestFile in the snapshot for content-type checks
-        // and existence lookups.
-        let current_manifests_by_path: HashMap<&str, &ManifestFile> = current_manifests
+        // and existence lookups. We use owned keys so the map does not borrow
+        // `current_manifests`, allowing `current_manifests` to be consumed later
+        // during the clustering / kept-manifest pass.
+        let current_manifests_by_path: HashMap<String, ManifestFile> = current_manifests
             .iter()
-            .map(|m| (m.manifest_path.as_str(), m))
+            .map(|m| (m.manifest_path.clone(), m.clone()))
             .collect();
 
         let deleted_paths: HashSet<&str> = self
@@ -381,70 +410,134 @@ impl TransactionAction for RewriteManifestsAction {
         let mut entry_count: usize = 0;
 
         if let Some(cluster_func) = &self.cluster_by_func {
-            // Writers keyed by (cluster_key, partition_spec_id).
-            // BTreeMap ensures deterministic manifest ordering across runs.
-            let mut writers: BTreeMap<(String, i32), ManifestWriter> = BTreeMap::new();
-
-            // Filter out deleted manifests, then process remaining
-            let remaining_manifests: Vec<ManifestFile> = current_manifests
-                .into_iter()
-                .filter(|m| !deleted_paths.contains(m.manifest_path.as_str()))
+            // Check whether a previous clustering pass can be reused.
+            // This implements the retry-on-conflict pattern from the Java
+            // BaseRewriteManifests: if all previously rewritten manifests are
+            // still in the current snapshot, we skip re-clustering and only
+            // refresh the kept-manifests list. If any rewritten manifest is
+            // missing (a concurrent commit modified the table), we discard
+            // the cache and re-cluster from scratch.
+            let current_manifest_paths: HashSet<&str> = current_manifests_by_path
+                .keys()
+                .map(|k| k.as_str())
                 .collect();
 
-            // Separate manifests into kept (delete-type or filtered by predicate) and
-            // to-be-rewritten, so we can load the latter concurrently.
-            let mut manifests_to_rewrite: Vec<ManifestFile> = Vec::new();
-            for manifest_file in remaining_manifests {
-                if manifest_file.content == ManifestContentType::Deletes {
-                    kept_manifests.push(manifest_file);
-                    continue;
+            let mut cached = self.cached_state.lock().await;
+            let requires_rewrite = match cached.as_ref() {
+                None => true,
+                Some(state) => {
+                    // If any previously rewritten manifest is no longer in the
+                    // current snapshot, a concurrent commit has invalidated our
+                    // cached results and we must redo the clustering.
+                    state
+                        .rewritten_manifest_paths
+                        .iter()
+                        .any(|p| !current_manifest_paths.contains(p.as_str()))
                 }
-                if let Some(ref predicate) = self.manifest_predicate
-                    && !predicate(&manifest_file)
-                {
-                    kept_manifests.push(manifest_file);
-                    continue;
-                }
-                rewritten_manifests.push(manifest_file.clone());
-                manifests_to_rewrite.push(manifest_file);
-            }
+            };
 
-            // Load all manifests to rewrite concurrently.
-            let loaded_manifests = load_manifests(
-                table.file_io(),
-                manifests_to_rewrite,
-                DEFAULT_LOAD_CONCURRENCY_LIMIT,
-            )
-            .await?;
+            if requires_rewrite {
+                // Discard any stale cached state — we will produce new manifests.
+                *cached = None;
 
-            // Route entries to writers (sequential — writers are stateful).
-            for (manifest_file, manifest) in &loaded_manifests {
-                let spec_id = &manifest_file.partition_spec_id;
-                for entry in manifest.entries() {
-                    if !entry.is_alive() {
+                // Writers keyed by (cluster_key, partition_spec_id).
+                // BTreeMap ensures deterministic manifest ordering across runs.
+                let mut writers: BTreeMap<(String, i32), ManifestWriter> = BTreeMap::new();
+
+                // Filter out deleted manifests, then process remaining
+                let remaining_manifests: Vec<ManifestFile> = current_manifests
+                    .into_iter()
+                    .filter(|m| !deleted_paths.contains(m.manifest_path.as_str()))
+                    .collect();
+
+                // Separate manifests into kept (delete-type or filtered by predicate) and
+                // to-be-rewritten, so we can load the latter concurrently.
+                let mut manifests_to_rewrite: Vec<ManifestFile> = Vec::new();
+                for manifest_file in remaining_manifests {
+                    if manifest_file.content == ManifestContentType::Deletes {
+                        kept_manifests.push(manifest_file);
                         continue;
                     }
-
-                    let key = cluster_func(entry.data_file());
-                    let writer_key = (key, *spec_id);
-
-                    let writer = match writers.entry(writer_key) {
-                        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(e) => {
-                            let w = snapshot_producer
-                                .new_manifest_writer(ManifestContentType::Data, *spec_id)?;
-                            e.insert(w)
-                        }
-                    };
-                    writer.add_existing_entry(entry.as_ref().clone())?;
-                    entry_count += 1;
+                    if let Some(ref predicate) = self.manifest_predicate
+                        && !predicate(&manifest_file)
+                    {
+                        kept_manifests.push(manifest_file);
+                        continue;
+                    }
+                    rewritten_manifests.push(manifest_file.clone());
+                    manifests_to_rewrite.push(manifest_file);
                 }
-            }
 
-            // Close all writers and collect new manifests (deterministic order)
-            for (_key, writer) in writers {
-                let manifest_file = writer.write_manifest_file().await?;
-                new_manifests.push(manifest_file);
+                // Load all manifests to rewrite concurrently.
+                let loaded_manifests = load_manifests(
+                    table.file_io(),
+                    manifests_to_rewrite,
+                    DEFAULT_LOAD_CONCURRENCY_LIMIT,
+                )
+                .await?;
+
+                // Route entries to writers (sequential — writers are stateful).
+                for (manifest_file, manifest) in &loaded_manifests {
+                    let spec_id = &manifest_file.partition_spec_id;
+                    for entry in manifest.entries() {
+                        if !entry.is_alive() {
+                            continue;
+                        }
+
+                        let key = cluster_func(entry.data_file());
+                        let writer_key = (key, *spec_id);
+
+                        let writer = match writers.entry(writer_key) {
+                            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::btree_map::Entry::Vacant(e) => {
+                                let w = snapshot_producer
+                                    .new_manifest_writer(ManifestContentType::Data, *spec_id)?;
+                                e.insert(w)
+                            }
+                        };
+                        writer.add_existing_entry(entry.as_ref().clone())?;
+                        entry_count += 1;
+                    }
+                }
+
+                // Close all writers and collect new manifests (deterministic order)
+                for (_key, writer) in writers {
+                    let manifest_file = writer.write_manifest_file().await?;
+                    new_manifests.push(manifest_file);
+                }
+
+                // Cache the results for potential future retry attempts.
+                let rewritten_paths: HashSet<String> = rewritten_manifests
+                    .iter()
+                    .map(|m| m.manifest_path.clone())
+                    .collect();
+                *cached = Some(CachedRewriteState {
+                    rewritten_manifest_paths: rewritten_paths,
+                    new_manifests: new_manifests.clone(),
+                    entry_count,
+                });
+            } else {
+                // Previous clustering is still valid — reuse cached manifests
+                // and only refresh the kept-manifests list.
+                let state = cached.as_ref().unwrap();
+                new_manifests = state.new_manifests.clone();
+                entry_count = state.entry_count;
+
+                let rewritten_paths = &state.rewritten_manifest_paths;
+                for manifest_file in current_manifests {
+                    if !deleted_paths.contains(manifest_file.manifest_path.as_str())
+                        && !rewritten_paths.contains(&manifest_file.manifest_path)
+                    {
+                        kept_manifests.push(manifest_file);
+                    }
+                }
+                // Populate rewritten_manifests for file-count validation below
+                // (these are the manifests that were replaced).
+                for manifest_file in current_manifests_by_path.values() {
+                    if rewritten_paths.contains(manifest_file.manifest_path.as_str()) {
+                        rewritten_manifests.push((*manifest_file).clone());
+                    }
+                }
             }
         } else {
             // No clustering — just keep non-deleted manifests
@@ -527,9 +620,9 @@ mod tests {
 
     use crate::spec::{ManifestContentType, ManifestFile};
     use crate::table::Table;
-    use crate::transaction::TransactionAction;
     use crate::transaction::rewrite_manifests::RewriteManifestsAction;
     use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table};
+    use crate::transaction::TransactionAction;
 
     fn test_manifest(
         path: &str,
