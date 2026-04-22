@@ -658,27 +658,40 @@ partition_struct: {:?}, partition_type: {:?}",
             );
         }
 
-        // Also account for files removed by this action (e.g. rewrite/overwrite).
-        // Without this, `deleted-records` / `removed-files-size` / `deleted-data-files`
-        // stay at zero on the new summary, which makes `update_totals` compute
+        // Also account for files removed by this action (e.g. Replace / Delete).
+        // Without this, `deleted-records` / `removed-files-size` /
+        // `deleted-data-files` stay at zero on the new summary, so
+        // `update_totals` computes
         //   total = previous_total + added
         // instead of
         //   total = previous_total + added - removed
-        // i.e. REPLACE commits look like pure appends to consumers that read
+        // — REPLACE commits look like pure appends to consumers that read
         // snapshot summaries.
-        for data_file in &self.removed_data_files {
-            summary_collector.remove_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
-            );
-        }
-        for delete_file in &self.removed_delete_files {
-            summary_collector.remove_file(
-                delete_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
-            );
+        //
+        // Skipped for `Overwrite`: `update_snapshot_summaries` routes those
+        // through `truncate_table_summary`, which derives removed-* fields
+        // directly from the parent's total-* values (full-table truncate
+        // semantics). Pre-populating removed-* here would either be silently
+        // clobbered by truncate (when the parent totals are non-zero) or leak
+        // through and double-count against already-zeroed parent totals (when
+        // the parent was itself produced by a truncating overwrite), which
+        // causes `update_totals` to underflow on `previous_total - removed`.
+        let operation = snapshot_produce_operation.operation();
+        if operation != Operation::Overwrite {
+            for data_file in &self.removed_data_files {
+                summary_collector.remove_file(
+                    data_file,
+                    table_metadata.current_schema().clone(),
+                    table_metadata.default_partition_spec().clone(),
+                );
+            }
+            for delete_file in &self.removed_delete_files {
+                summary_collector.remove_file(
+                    delete_file,
+                    table_metadata.current_schema().clone(),
+                    table_metadata.default_partition_spec().clone(),
+                );
+            }
         }
 
         // The previous snapshot for summary rollup is the current tip of the
@@ -694,14 +707,14 @@ partition_struct: {:?}, partition_type: {:?}",
         additional_properties.extend(self.snapshot_properties.clone());
 
         let summary = Summary {
-            operation: snapshot_produce_operation.operation(),
+            operation: operation.clone(),
             additional_properties,
         };
 
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
+            operation == Operation::Overwrite,
         )
     }
 
@@ -1350,6 +1363,114 @@ mod tests {
         assert_eq!(
             total_data_files, PARENT_TOTAL_DATA_FILES,
             "total-data-files must stay at {PARENT_TOTAL_DATA_FILES} (added=1 − removed=1)",
+        );
+    }
+
+    /// Regression test: on an `Overwrite` commit whose parent is itself a
+    /// truncating overwrite (so the parent's `total-*` rolled down to 0),
+    /// `summary()` must not feed removed_data_files through the summary
+    /// collector. `update_snapshot_summaries` routes Overwrite through
+    /// `truncate_table_summary`, which derives removed-* fields from the
+    /// parent's total-* values. When the parent totals are zero the truncate
+    /// step leaves the summary unchanged, so any removed-* that `summary()`
+    /// pre-populated leaks into `update_totals` and computes
+    ///   new_total = previous_total(0) + added(0) - removed(>0)
+    /// which underflows on u64 and panics with "attempt to subtract with
+    /// overflow".
+    ///
+    /// This mirrors the shape that the existing
+    /// overwrite_files_test::test_partition_spec_id_in_manifest integration
+    /// test exercises: N fast appends followed by N single-file
+    /// overwrite-deletes in separate commits. Before this fix the second
+    /// overwrite-delete panics; with the fix `summary()` skips the
+    /// remove_file calls for Overwrite and `truncate_table_summary` drives
+    /// the accounting as it always has.
+    #[tokio::test]
+    async fn test_overwrite_summary_does_not_underflow_after_prior_truncate() {
+        use crate::transaction::overwrite_files::OverwriteFilesOperation;
+
+        // Build a parent whose `total-*` are all zero — i.e. the prior
+        // commit was a full-table overwrite that already drained the totals.
+        // This is the precondition for the underflow on the next overwrite
+        // that still reports per-file removed-* values.
+        const PARENT_SNAPSHOT_ID: i64 = 42;
+        const RECORDS_PER_FILE: u64 = 4;
+
+        let base = make_v2_minimal_table();
+        let parent_summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::from([
+                (TOTAL_DATA_FILES_KEY.to_string(), "0".to_string()),
+                (TOTAL_RECORDS_KEY.to_string(), "0".to_string()),
+                ("total-files-size".to_string(), "0".to_string()),
+            ]),
+        };
+        let parent_snapshot = Snapshot::builder()
+            .with_snapshot_id(PARENT_SNAPSHOT_ID)
+            .with_timestamp_ms(base.metadata().last_updated_ms() + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("memory:///unused-by-summary.avro")
+            .with_summary(parent_summary)
+            .build();
+
+        let metadata_with_parent = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
+            .add_snapshot(parent_snapshot)
+            .unwrap()
+            .set_ref(MAIN_BRANCH, SnapshotReference {
+                snapshot_id: PARENT_SNAPSHOT_ID,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata_with_parent));
+
+        // Overwrite action that removes one data file and adds nothing —
+        // exactly what the overwrite_files integration test does per commit.
+        let removed = DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::Data)
+            .file_path("test/old.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(RECORDS_PER_FILE)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![removed],
+            vec![],
+        );
+
+        // The key assertion is that this does not panic with
+        // "attempt to subtract with overflow". The returned summary is
+        // allowed to report zeros across the board — that matches what the
+        // JVM Iceberg reference produces for a no-op overwrite on an empty
+        // (post-truncate) table.
+        let summary = producer.summary(&OverwriteFilesOperation).unwrap();
+        assert_eq!(summary.operation, Operation::Overwrite);
+        let props = &summary.additional_properties;
+        assert_eq!(props.get(TOTAL_RECORDS_KEY).map(String::as_str), Some("0"));
+        assert_eq!(
+            props.get(TOTAL_DATA_FILES_KEY).map(String::as_str),
+            Some("0")
         );
     }
 }
