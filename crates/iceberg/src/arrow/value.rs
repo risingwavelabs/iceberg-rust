@@ -695,6 +695,61 @@ pub(crate) fn create_primitive_array_single_element(
         (DataType::Binary, None) => Ok(Arc::new(BinaryArray::from_opt_vec(vec![
             Option::<&[u8]>::None,
         ]))),
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(v))) => Ok(Arc::new(
+            LargeBinaryArray::from_iter_values(std::iter::once(v.as_slice())),
+        )),
+        (DataType::LargeBinary, None) => Ok(Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>]))),
+        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(v))) => {
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![*v])))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), None) => {
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![
+                Option::<i64>::None,
+            ])))
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::Binary(v))) => {
+            if v.len() != *len as usize {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Fixed size binary value length {} does not match expected length {}",
+                        v.len(),
+                        len
+                    ),
+                ));
+            }
+            Ok(Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::once(v.as_slice())).map_err(
+                    |e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to create FixedSizeBinaryArray",
+                        )
+                        .with_source(e)
+                    },
+                )?,
+            ))
+        }
+        (DataType::FixedSizeBinary(_len), Some(PrimitiveLiteral::UInt128(v))) => {
+            // Uuid: UInt128 → big-endian [u8; 16]
+            let bytes = v.to_be_bytes();
+            Ok(Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::once(bytes.as_slice())).map_err(
+                    |e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to create FixedSizeBinaryArray",
+                        )
+                        .with_source(e)
+                    },
+                )?,
+            ))
+        }
+        (DataType::FixedSizeBinary(len), None) => Ok(Arc::new(FixedSizeBinaryArray::new(
+            *len,
+            arrow_buffer::Buffer::from(vec![0u8; *len as usize]),
+            Some(arrow_buffer::NullBuffer::new_null(1)),
+        ))),
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(v))) => {
             let array = Decimal128Array::from(vec![{ *v }])
                 .with_precision_and_scale(*precision, *scale)
@@ -782,6 +837,36 @@ pub(crate) fn create_primitive_array_single_element(
                                 Arc::new(BinaryArray::from_opt_vec(vec![Option::<&[u8]>::None]))
                                     as ArrayRef,
                             )
+                        }
+                        DataType::LargeBinary => {
+                            Ok(
+                                Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])) as ArrayRef
+                            )
+                        }
+                        DataType::Time64(TimeUnit::Microsecond) => {
+                            Ok(Arc::new(Time64MicrosecondArray::from(vec![
+                                Option::<i64>::None,
+                            ])) as ArrayRef)
+                        }
+                        DataType::FixedSizeBinary(len) => {
+                            Ok(Arc::new(FixedSizeBinaryArray::new(
+                                *len,
+                                arrow_buffer::Buffer::from(vec![0u8; *len as usize]),
+                                Some(arrow_buffer::NullBuffer::new_null(1)),
+                            )) as ArrayRef)
+                        }
+                        DataType::Decimal128(precision, scale) => {
+                            let array = Decimal128Array::from(vec![Option::<i128>::None])
+                                .with_precision_and_scale(*precision, *scale)
+                                .map_err(|e| {
+                                    Error::new(
+                                        ErrorKind::DataInvalid,
+                                        format!(
+                                            "Failed to create Decimal128Array with precision {precision} and scale {scale}: {e}"
+                                        ),
+                                    )
+                                })?;
+                            Ok(Arc::new(array) as ArrayRef)
                         }
                         _ => Err(Error::new(
                             ErrorKind::Unexpected,
@@ -909,6 +994,66 @@ pub(crate) fn create_primitive_array_repeated(
             let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
             Arc::new(BinaryArray::from_opt_vec(vals))
         }
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => {
+            Arc::new(LargeBinaryArray::from_iter_values(
+                std::iter::repeat_n(value.as_slice(), num_rows),
+            ))
+        }
+        (DataType::LargeBinary, None) => {
+            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>; num_rows]))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
+            Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), None) => {
+            let vals: Vec<Option<i64>> = vec![None; num_rows];
+            Arc::new(Time64MicrosecondArray::from(vals))
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::Binary(value))) => {
+            if value.len() != *len as usize {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Fixed size binary value length {} does not match expected length {}",
+                        value.len(),
+                        len
+                    ),
+                ));
+            }
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    std::iter::repeat_n(value.as_slice(), num_rows),
+                )
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to create FixedSizeBinaryArray",
+                    )
+                    .with_source(e)
+                })?,
+            )
+        }
+        (DataType::FixedSizeBinary(_len), Some(PrimitiveLiteral::UInt128(value))) => {
+            // Uuid: UInt128 → big-endian [u8; 16]
+            let bytes = value.to_be_bytes();
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    std::iter::repeat_n(bytes.as_slice(), num_rows),
+                )
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to create FixedSizeBinaryArray",
+                    )
+                    .with_source(e)
+                })?,
+            )
+        }
+        (DataType::FixedSizeBinary(len), None) => Arc::new(FixedSizeBinaryArray::new(
+            *len,
+            arrow_buffer::Buffer::from(vec![0u8; *len as usize * num_rows]),
+            Some(arrow_buffer::NullBuffer::new_null(num_rows)),
+        )),
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(value))) => {
             Arc::new(
                 Decimal128Array::from(vec![*value; num_rows])
