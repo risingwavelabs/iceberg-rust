@@ -982,9 +982,9 @@ mod test {
 
     use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StructBuilder};
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, StringArray, StructArray, Time64MicrosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+        Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, StringArray,
+        StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1894,5 +1894,260 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_large_binary() {
+        let value = PrimitiveLiteral::Binary(vec![1, 2, 3]);
+        let num_rows = 3;
+        let array = create_primitive_array_repeated(&DataType::LargeBinary, &Some(value), num_rows)
+            .expect("LargeBinary with value should succeed");
+
+        assert_eq!(array.data_type(), &DataType::LargeBinary);
+        assert_eq!(array.len(), num_rows);
+        let typed = array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("should downcast to LargeBinaryArray");
+        for i in 0..num_rows {
+            assert!(!typed.is_null(i));
+            assert_eq!(typed.value(i), &[1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_large_binary_null() {
+        let num_rows = 3;
+        let array = create_primitive_array_repeated(&DataType::LargeBinary, &None, num_rows)
+            .expect("LargeBinary with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::LargeBinary);
+        assert_eq!(array.len(), num_rows);
+        for i in 0..num_rows {
+            assert!(array.is_null(i));
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_time64() {
+        // 36_000_000_000 microseconds = 10:00:00
+        let value = PrimitiveLiteral::Long(36_000_000_000);
+        let num_rows = 3;
+        let array = create_primitive_array_repeated(
+            &DataType::Time64(TimeUnit::Microsecond),
+            &Some(value),
+            num_rows,
+        )
+        .expect("Time64(Microsecond) with value should succeed");
+
+        assert_eq!(array.data_type(), &DataType::Time64(TimeUnit::Microsecond));
+        assert_eq!(array.len(), num_rows);
+        let typed = array
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("should downcast to Time64MicrosecondArray");
+        for i in 0..num_rows {
+            assert!(!typed.is_null(i));
+            assert_eq!(typed.value(i), 36_000_000_000);
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_time64_null() {
+        let num_rows = 3;
+        let array = create_primitive_array_repeated(
+            &DataType::Time64(TimeUnit::Microsecond),
+            &None,
+            num_rows,
+        )
+        .expect("Time64(Microsecond) with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::Time64(TimeUnit::Microsecond));
+        assert_eq!(array.len(), num_rows);
+        for i in 0..num_rows {
+            assert!(array.is_null(i));
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_fixed_size_binary() {
+        let value = PrimitiveLiteral::Binary(vec![0xCA, 0xFE, 0xBA, 0xBE]);
+        let num_rows = 3;
+        let array =
+            create_primitive_array_repeated(&DataType::FixedSizeBinary(4), &Some(value), num_rows)
+                .expect("FixedSizeBinary(4) with value should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(4));
+        assert_eq!(array.len(), num_rows);
+        let typed = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("should downcast to FixedSizeBinaryArray");
+        for i in 0..num_rows {
+            assert!(!typed.is_null(i));
+            assert_eq!(typed.value(i), &[0xCA, 0xFE, 0xBA, 0xBE]);
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_fixed_size_binary_null() {
+        let num_rows = 3;
+        let array = create_primitive_array_repeated(&DataType::FixedSizeBinary(4), &None, num_rows)
+            .expect("FixedSizeBinary(4) with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(4));
+        assert_eq!(array.len(), num_rows);
+        for i in 0..num_rows {
+            assert!(array.is_null(i));
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_uuid() {
+        let uuid_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000;
+        let value = PrimitiveLiteral::UInt128(uuid_val);
+        let num_rows = 3;
+        let array =
+            create_primitive_array_repeated(&DataType::FixedSizeBinary(16), &Some(value), num_rows)
+                .expect("FixedSizeBinary(16) with UUID should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(array.len(), num_rows);
+        let typed = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("should downcast to FixedSizeBinaryArray");
+        let expected_bytes = uuid_val.to_be_bytes();
+        for i in 0..num_rows {
+            assert!(!typed.is_null(i));
+            assert_eq!(typed.value(i), expected_bytes);
+        }
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_uuid_null() {
+        let num_rows = 3;
+        let array =
+            create_primitive_array_repeated(&DataType::FixedSizeBinary(16), &None, num_rows)
+                .expect("FixedSizeBinary(16) with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(array.len(), num_rows);
+        for i in 0..num_rows {
+            assert!(array.is_null(i));
+        }
+    }
+
+    // ---- Tier 1: create_primitive_array_single_element — missing Arrow type coverage ----
+
+    #[test]
+    fn test_create_primitive_array_single_element_large_binary() {
+        let value = PrimitiveLiteral::Binary(vec![1, 2, 3]);
+        let array = create_primitive_array_single_element(&DataType::LargeBinary, &Some(value))
+            .expect("LargeBinary single element with value should succeed");
+
+        assert_eq!(array.data_type(), &DataType::LargeBinary);
+        assert_eq!(array.len(), 1);
+        let typed = array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("should downcast to LargeBinaryArray");
+        assert!(!typed.is_null(0));
+        assert_eq!(typed.value(0), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_large_binary_null() {
+        let array = create_primitive_array_single_element(&DataType::LargeBinary, &None)
+            .expect("LargeBinary single element with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::LargeBinary);
+        assert_eq!(array.len(), 1);
+        assert!(array.is_null(0));
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_time64() {
+        let value = PrimitiveLiteral::Long(36_000_000_000);
+        let array = create_primitive_array_single_element(
+            &DataType::Time64(TimeUnit::Microsecond),
+            &Some(value),
+        )
+        .expect("Time64 single element with value should succeed");
+
+        assert_eq!(array.data_type(), &DataType::Time64(TimeUnit::Microsecond));
+        assert_eq!(array.len(), 1);
+        let typed = array
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("should downcast to Time64MicrosecondArray");
+        assert!(!typed.is_null(0));
+        assert_eq!(typed.value(0), 36_000_000_000);
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_time64_null() {
+        let array =
+            create_primitive_array_single_element(&DataType::Time64(TimeUnit::Microsecond), &None)
+                .expect("Time64 single element with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::Time64(TimeUnit::Microsecond));
+        assert_eq!(array.len(), 1);
+        assert!(array.is_null(0));
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_fixed_size_binary() {
+        let value = PrimitiveLiteral::Binary(vec![0xCA, 0xFE, 0xBA, 0xBE]);
+        let array =
+            create_primitive_array_single_element(&DataType::FixedSizeBinary(4), &Some(value))
+                .expect("FixedSizeBinary single element with value should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(4));
+        assert_eq!(array.len(), 1);
+        let typed = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("should downcast to FixedSizeBinaryArray");
+        assert!(!typed.is_null(0));
+        assert_eq!(typed.value(0), &[0xCA, 0xFE, 0xBA, 0xBE]);
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_fixed_size_binary_null() {
+        let array = create_primitive_array_single_element(&DataType::FixedSizeBinary(4), &None)
+            .expect("FixedSizeBinary single element with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(4));
+        assert_eq!(array.len(), 1);
+        assert!(array.is_null(0));
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_uuid() {
+        let uuid_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000;
+        let value = PrimitiveLiteral::UInt128(uuid_val);
+        let array =
+            create_primitive_array_single_element(&DataType::FixedSizeBinary(16), &Some(value))
+                .expect("FixedSizeBinary(16) single element with UUID should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(array.len(), 1);
+        let typed = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("should downcast to FixedSizeBinaryArray");
+        assert!(!typed.is_null(0));
+        assert_eq!(typed.value(0), uuid_val.to_be_bytes());
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_uuid_null() {
+        let array = create_primitive_array_single_element(&DataType::FixedSizeBinary(16), &None)
+            .expect("FixedSizeBinary(16) single element with null should succeed");
+
+        assert_eq!(array.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(array.len(), 1);
+        assert!(array.is_null(0));
     }
 }
