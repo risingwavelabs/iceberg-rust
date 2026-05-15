@@ -620,6 +620,21 @@ pub fn arrow_primitive_to_literal(
     )
 }
 
+/// Validate that a FixedSizeBinary length is non-negative and return it as usize.
+///
+/// Arrow's `DataType::FixedSizeBinary` uses `i32` for the length field. A negative value
+/// would wrap around to a large `usize` when cast, potentially exhausting memory if used
+/// for allocating an empty buffer.
+fn validated_fixed_len(len: i32) -> Result<usize> {
+    if len < 0 {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("FixedSizeBinary length must be non-negative, got {len}"),
+        ));
+    }
+    Ok(len as usize)
+}
+
 /// Create a single-element array from a primitive literal.
 ///
 /// This is used for creating constant arrays (Run-End Encoded arrays) where we need
@@ -745,11 +760,14 @@ pub(crate) fn create_primitive_array_single_element(
                 )?,
             ))
         }
-        (DataType::FixedSizeBinary(len), None) => Ok(Arc::new(FixedSizeBinaryArray::new(
-            *len,
-            arrow_buffer::Buffer::from(vec![0u8; *len as usize]),
-            Some(arrow_buffer::NullBuffer::new_null(1)),
-        ))),
+        (DataType::FixedSizeBinary(len), None) => {
+            let byte_len = validated_fixed_len(*len)?;
+            Ok(Arc::new(FixedSizeBinaryArray::new(
+                *len,
+                arrow_buffer::Buffer::from(vec![0u8; byte_len]),
+                Some(arrow_buffer::NullBuffer::new_null(1)),
+            )))
+        }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(v))) => {
             let array = Decimal128Array::from(vec![{ *v }])
                 .with_precision_and_scale(*precision, *scale)
@@ -849,9 +867,10 @@ pub(crate) fn create_primitive_array_single_element(
                             ])) as ArrayRef)
                         }
                         DataType::FixedSizeBinary(len) => {
+                            let byte_len = validated_fixed_len(*len)?;
                             Ok(Arc::new(FixedSizeBinaryArray::new(
                                 *len,
-                                arrow_buffer::Buffer::from(vec![0u8; *len as usize]),
+                                arrow_buffer::Buffer::from(vec![0u8; byte_len]),
                                 Some(arrow_buffer::NullBuffer::new_null(1)),
                             )) as ArrayRef)
                         }
@@ -1049,11 +1068,14 @@ pub(crate) fn create_primitive_array_repeated(
                 })?,
             )
         }
-        (DataType::FixedSizeBinary(len), None) => Arc::new(FixedSizeBinaryArray::new(
-            *len,
-            arrow_buffer::Buffer::from(vec![0u8; *len as usize * num_rows]),
-            Some(arrow_buffer::NullBuffer::new_null(num_rows)),
-        )),
+        (DataType::FixedSizeBinary(len), None) => {
+            let byte_len = validated_fixed_len(*len)?;
+            Arc::new(FixedSizeBinaryArray::new(
+                *len,
+                arrow_buffer::Buffer::from(vec![0u8; byte_len * num_rows]),
+                Some(arrow_buffer::NullBuffer::new_null(num_rows)),
+            ))
+        }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(value))) => {
             Arc::new(
                 Decimal128Array::from(vec![*value; num_rows])
