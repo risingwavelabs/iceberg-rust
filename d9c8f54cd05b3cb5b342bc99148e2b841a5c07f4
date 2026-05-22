@@ -1,0 +1,23 @@
+crates/iceberg/src/spec/snapshot_summary.rs
+  a94e95d76061d884 493-503,505,508-512,529-642
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "d9c8f54cd05b3cb5b342bc99148e2b841a5c07f4",
+  "prompts": {
+    "a94e95d76061d884": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1af95e16affeyVrz0Bc2BSAT1d",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "volodymyr",
+      "messages": [],
+      "total_additions": 247,
+      "total_deletions": 127,
+      "accepted_lines": 131,
+      "overriden_lines": 0
+    }
+  }
+}
