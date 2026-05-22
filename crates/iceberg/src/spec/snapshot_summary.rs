@@ -490,28 +490,26 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
+    // Snapshot summary values are stored as decimal strings inside a
+    // `HashMap<String, String>` and are written by any Iceberg engine (Java,
+    // Python, Rust, ...). We must not panic if a value is missing, malformed,
+    // or exceeds `u64::MAX` — that aborts the writer and produces no progress
+    // signal. Treat any unparseable value as `0` (the same as a missing
+    // entry) and use saturating arithmetic so a `removed > previous + added`
+    // skew from a corrupt history can never underflow.
+    fn parse_or_zero(value: Option<&String>) -> u64 {
+        value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+    }
+
     let previous_total = previous_summary.map_or(0, |previous_summary| {
-        previous_summary
-            .additional_properties
-            .get(total_property)
-            .map_or(0, |value| value.parse::<u64>().unwrap())
+        parse_or_zero(previous_summary.additional_properties.get(total_property))
     });
 
-    let mut new_total = previous_total;
-    if let Some(value) = summary
-        .additional_properties
-        .get(added_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total += value;
-    }
-    if let Some(value) = summary
-        .additional_properties
-        .get(removed_property)
-        .map(|value| value.parse::<u64>().unwrap())
-    {
-        new_total -= value;
-    }
+    let added = parse_or_zero(summary.additional_properties.get(added_property));
+    let removed = parse_or_zero(summary.additional_properties.get(removed_property));
+
+    let new_total = previous_total.saturating_add(added).saturating_sub(removed);
+
     summary
         .additional_properties
         .insert(total_property.to_string(), new_total.to_string());
@@ -527,6 +525,120 @@ mod tests {
         DataFileFormat, Datum, Literal, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
         Transform, Type, UnboundPartitionField,
     };
+
+    /// Previous-summary values that overflow `u64` (e.g. written by a
+    /// non-Rust engine using unbounded integers) used to panic with
+    /// `ParseIntError { kind: PosOverflow }` inside `update_totals`. They
+    /// must now be treated as `0` so compaction can still make progress.
+    #[test]
+    fn test_update_totals_handles_overflowing_previous_total() {
+        // > u64::MAX (= 18_446_744_073_709_551_615)
+        let huge = "99999999999999999999".to_string();
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_FILE_SIZE.to_string(), huge),
+            (TOTAL_RECORDS.to_string(), "100".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props,
+        };
+
+        let new_props: HashMap<String, String> = [
+            (ADDED_FILE_SIZE.to_string(), "400".to_string()),
+            (ADDED_RECORDS.to_string(), "10".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: new_props,
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        // Overflowing previous total is reset to 0, then `added` is applied.
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_FILE_SIZE).unwrap(),
+            "400"
+        );
+        // Non-overflowing values still aggregate correctly.
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_RECORDS).unwrap(),
+            "110"
+        );
+    }
+
+    /// A corrupt history could leave `removed > previous + added`, which
+    /// used to panic on `new_total -= value` in debug builds and silently
+    /// wrap in release. `saturating_sub` clamps the result to `0`.
+    #[test]
+    fn test_update_totals_saturates_on_underflow() {
+        let prev_props: HashMap<String, String> = [(TOTAL_RECORDS.to_string(), "5".to_string())]
+            .into_iter()
+            .collect();
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props,
+        };
+
+        let new_props: HashMap<String, String> = [
+            (ADDED_RECORDS.to_string(), "1".to_string()),
+            (DELETED_RECORDS.to_string(), "100".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: new_props,
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_RECORDS).unwrap(),
+            "0"
+        );
+    }
+
+    /// Non-numeric or empty values must not panic — they are treated the
+    /// same as a missing entry (value `0`).
+    #[test]
+    fn test_update_totals_treats_malformed_value_as_zero() {
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_RECORDS.to_string(), "garbage".to_string()),
+            (TOTAL_FILE_SIZE.to_string(), "".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props,
+        };
+
+        let new_props: HashMap<String, String> = [
+            (ADDED_RECORDS.to_string(), "7".to_string()),
+            (ADDED_FILE_SIZE.to_string(), "70".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let summary = Summary {
+            operation: Operation::Append,
+            additional_properties: new_props,
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_RECORDS).unwrap(),
+            "7"
+        );
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_FILE_SIZE).unwrap(),
+            "70"
+        );
+    }
 
     #[test]
     fn test_update_snapshot_summaries_append() {
