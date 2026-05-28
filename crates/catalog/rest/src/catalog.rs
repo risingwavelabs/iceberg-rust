@@ -38,8 +38,7 @@ use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
 use crate::client::{
-    HttpClient, deserialize_catalog_error_with_message, deserialize_catalog_response,
-    deserialize_unexpected_catalog_error,
+    HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
@@ -1022,31 +1021,22 @@ impl Catalog for RestCatalog {
                 .with_retryable(true));
             }
             StatusCode::INTERNAL_SERVER_ERROR => {
-                return Err(deserialize_catalog_error_with_message(
-                    http_response,
-                    context.client.disable_header_redaction(),
+                return Err(Error::new(
                     ErrorKind::Unexpected,
                     "An unknown server-side problem occurred; the commit state is unknown.",
-                )
-                .await);
+                ));
             }
             StatusCode::BAD_GATEWAY => {
-                return Err(deserialize_catalog_error_with_message(
-                    http_response,
-                    context.client.disable_header_redaction(),
+                return Err(Error::new(
                     ErrorKind::Unexpected,
                     "A gateway or proxy received an invalid response from the upstream server; the commit state is unknown.",
-                )
-                .await);
+                ));
             }
             StatusCode::GATEWAY_TIMEOUT => {
-                return Err(deserialize_catalog_error_with_message(
-                    http_response,
-                    context.client.disable_header_redaction(),
+                return Err(Error::new(
                     ErrorKind::Unexpected,
                     "A server-side gateway timeout occurred; the commit state is unknown.",
-                )
-                .await);
+                ));
             }
             _ => {
                 return Err(deserialize_unexpected_catalog_error(
