@@ -350,11 +350,6 @@ pub(crate) fn update_snapshot_summaries(
     let mut summary = match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
             truncate_table_summary(summary, prev_summary)
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
-                        .with_source(err)
-                })
-                .unwrap()
         }
         _ => summary,
     };
@@ -409,24 +404,24 @@ pub(crate) fn update_snapshot_summaries(
     Ok(summary)
 }
 
+/// Read a `total_*` property from a previous summary as a `u64`.
+///
+/// Snapshot summary values are decimal strings inside a
+/// `HashMap<String, String>` and may be written by any Iceberg engine
+/// (Java, Python, Rust, ...). A malformed entry, an empty string, or a
+/// value exceeding `u64::MAX` must not panic the writer — we treat any
+/// unparseable value as `0`, matching the policy in `update_totals`.
 #[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
-    let value_str = previous_summary
+fn previous_total_or_zero(previous_summary: &Summary, prop: &str) -> u64 {
+    previous_summary
         .additional_properties
         .get(prop)
-        .map(String::as_str)
-        .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
-        Error::new(
-            ErrorKind::Unexpected,
-            "Failed to parse value from previous summary property.",
-        )
-        .with_source(err)
-    })
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[allow(dead_code)]
-fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> Result<Summary> {
+fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> Summary {
     for prop in [
         TOTAL_DATA_FILES,
         TOTAL_DELETE_FILES,
@@ -440,46 +435,23 @@ fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> R
             .insert(prop.to_string(), "0".to_string());
     }
 
-    let value = get_prop(previous_summary, TOTAL_DATA_FILES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(DELETED_DATA_FILES.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_DELETE_FILES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_DELETE_FILES.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_RECORDS)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(DELETED_RECORDS.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_FILE_SIZE)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_FILE_SIZE.to_string(), value.to_string());
+    for (total_prop, removed_prop) in [
+        (TOTAL_DATA_FILES, DELETED_DATA_FILES),
+        (TOTAL_DELETE_FILES, REMOVED_DELETE_FILES),
+        (TOTAL_RECORDS, DELETED_RECORDS),
+        (TOTAL_FILE_SIZE, REMOVED_FILE_SIZE),
+        (TOTAL_POSITION_DELETES, REMOVED_POSITION_DELETES),
+        (TOTAL_EQUALITY_DELETES, REMOVED_EQUALITY_DELETES),
+    ] {
+        let value = previous_total_or_zero(previous_summary, total_prop);
+        if value != 0 {
+            summary
+                .additional_properties
+                .insert(removed_prop.to_string(), value.to_string());
+        }
     }
 
-    let value = get_prop(previous_summary, TOTAL_POSITION_DELETES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_POSITION_DELETES.to_string(), value.to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_EQUALITY_DELETES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_EQUALITY_DELETES.to_string(), value.to_string());
-    }
-
-    Ok(summary)
+    summary
 }
 
 #[allow(dead_code)]
@@ -640,6 +612,110 @@ mod tests {
         );
     }
 
+    /// The truncate-overwrite path used to parse previous-summary totals via
+    /// `get_prop` as `i32` and `?`-propagate the error, which
+    /// `update_snapshot_summaries` then unwrapped — so a malformed or
+    /// overflowing previous value (perfectly legal in a summary written by
+    /// another engine) would panic the writer. Truncation must now degrade
+    /// gracefully: unparseable totals are treated as `0` and produce no
+    /// `removed_*` entry, while well-formed totals still flow through.
+    #[test]
+    fn test_update_snapshot_summaries_truncate_overwrite_handles_malformed_and_overflow() {
+        // > u64::MAX, so `parse::<u64>()` fails with PosOverflow.
+        let overflow = "99999999999999999999".to_string();
+        // Also exceeds the old i32 ceiling (~2.1 GB) — proves the previous
+        // `get_prop -> i32` implementation was too narrow even for valid
+        // `TOTAL_FILE_SIZE` values produced by other engines.
+        let big_but_valid_u64 = "5000000000".to_string();
+        let prev_props: HashMap<String, String> = [
+            // Malformed: not a number at all.
+            (TOTAL_DATA_FILES.to_string(), "garbage".to_string()),
+            // Malformed: empty string.
+            (TOTAL_DELETE_FILES.to_string(), "".to_string()),
+            // Overflows u64.
+            (TOTAL_RECORDS.to_string(), overflow),
+            // Valid u64 that overflows i32 — must survive truncation intact.
+            (TOTAL_FILE_SIZE.to_string(), big_but_valid_u64.clone()),
+            // Well-formed small value — must still produce REMOVED_*.
+            (TOTAL_POSITION_DELETES.to_string(), "7".to_string()),
+            // Missing TOTAL_EQUALITY_DELETES on purpose.
+        ]
+        .into_iter()
+        .collect();
+        let previous_summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: prev_props,
+        };
+
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        };
+
+        // Must not panic.
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), true).unwrap();
+
+        // All totals are reset by truncation, regardless of previous health.
+        for prop in [
+            TOTAL_DATA_FILES,
+            TOTAL_DELETE_FILES,
+            TOTAL_RECORDS,
+            TOTAL_FILE_SIZE,
+            TOTAL_POSITION_DELETES,
+            TOTAL_EQUALITY_DELETES,
+        ] {
+            assert_eq!(
+                updated.additional_properties.get(prop).map(String::as_str),
+                Some("0"),
+                "expected {prop} to be reset to 0 after truncate"
+            );
+        }
+
+        // Malformed / overflowing / missing previous totals must NOT emit a
+        // bogus removed_* counter — treating them as 0 is the only safe choice.
+        assert!(
+            !updated
+                .additional_properties
+                .contains_key(DELETED_DATA_FILES),
+            "malformed TOTAL_DATA_FILES must not produce a removed counter"
+        );
+        assert!(
+            !updated
+                .additional_properties
+                .contains_key(REMOVED_DELETE_FILES),
+            "empty TOTAL_DELETE_FILES must not produce a removed counter"
+        );
+        assert!(
+            !updated.additional_properties.contains_key(DELETED_RECORDS),
+            "overflowing TOTAL_RECORDS must not produce a removed counter"
+        );
+        assert!(
+            !updated
+                .additional_properties
+                .contains_key(REMOVED_EQUALITY_DELETES),
+            "missing TOTAL_EQUALITY_DELETES must not produce a removed counter"
+        );
+
+        // Well-formed previous values still drive removed_* — including ones
+        // that would have overflowed the old i32 path.
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(REMOVED_FILE_SIZE)
+                .map(String::as_str),
+            Some(big_but_valid_u64.as_str()),
+            "valid u64 TOTAL_FILE_SIZE must be carried into REMOVED_FILE_SIZE"
+        );
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(REMOVED_POSITION_DELETES)
+                .map(String::as_str),
+            Some("7"),
+            "valid TOTAL_POSITION_DELETES must be carried into REMOVED_POSITION_DELETES"
+        );
+    }
+
     #[test]
     fn test_update_snapshot_summaries_append() {
         let prev_props: HashMap<String, String> = [
@@ -742,7 +818,7 @@ mod tests {
             additional_properties: new_props,
         };
 
-        let truncated = truncate_table_summary(summary, &previous_summary).unwrap();
+        let truncated = truncate_table_summary(summary, &previous_summary);
 
         assert_eq!(
             truncated
