@@ -60,8 +60,6 @@ use crate::spec::{DataContentType, Datum, NameMapping, NestedField, PrimitiveTyp
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
-const MAX_BYTE_RANGE_CONCURRENCY: usize = 16;
-
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
@@ -1776,9 +1774,8 @@ impl AsyncFileReader for ArrowFileReader {
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let reader = &self.r;
         async move {
-            let concurrency = available_parallelism()
-                .get()
-                .clamp(1, MAX_BYTE_RANGE_CONCURRENCY);
+            // Experiment: serialize byte-range reads to cap HTTP input buffer fanout.
+            let concurrency = 1;
             let reads = ranges.into_iter().map(|range| {
                 reader
                     .read(range.start..range.end)
