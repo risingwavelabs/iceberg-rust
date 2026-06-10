@@ -311,16 +311,15 @@ where
         // opportunities between calls; each chunk is a contiguous slice of a sorted
         // sequence and is therefore itself sorted.
         if !self.position_delete_buffer.is_empty() {
-            let sorted: Vec<PositionDeleteInput> =
-                std::mem::take(&mut self.position_delete_buffer)
-                    .into_iter()
-                    .flat_map(|(path, mut positions)| {
-                        positions.sort_unstable();
-                        positions
-                            .into_iter()
-                            .map(move |pos| PositionDeleteInput::new(path.clone(), pos))
-                    })
-                    .collect();
+            let sorted: Vec<PositionDeleteInput> = std::mem::take(&mut self.position_delete_buffer)
+                .into_iter()
+                .flat_map(|(path, mut positions)| {
+                    positions.sort_unstable();
+                    positions
+                        .into_iter()
+                        .map(move |pos| PositionDeleteInput::new(path.clone(), pos))
+                })
+                .collect();
             for chunk in sorted.chunks(POSITION_DELETE_FLUSH_CHUNK_SIZE) {
                 self.position_delete_writer.write(chunk.to_vec()).await?;
             }
@@ -718,7 +717,9 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
             Arc::new(Int64Array::from(vec![1_i64, 2, 2, 1])),
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from(vec![INSERT_OP, INSERT_OP, INSERT_OP, DELETE_OP])),
+            Arc::new(Int32Array::from(vec![
+                INSERT_OP, INSERT_OP, INSERT_OP, DELETE_OP,
+            ])),
         ])?;
         delta_writer.write(batch).await?;
 
@@ -747,7 +748,11 @@ mod tests {
             .unwrap();
         let positions: Vec<i64> = (0..pos_col.len()).map(|i| pos_col.value(i)).collect();
 
-        assert_eq!(positions, vec![0_i64, 1], "position-delete file is not globally sorted");
+        assert_eq!(
+            positions,
+            vec![0_i64, 1],
+            "position-delete file is not globally sorted"
+        );
 
         Ok(())
     }
@@ -848,7 +853,7 @@ mod tests {
             Arc::new(StringArray::from(vec!["e", "B", "D", "a", "c"])),
             Arc::new(Int32Array::from(vec![
                 INSERT_OP, INSERT_OP, INSERT_OP, // id=5 fresh, id=2 dup, id=4 dup
-                DELETE_OP, DELETE_OP,            // id=1, id=3
+                DELETE_OP, DELETE_OP, // id=1, id=3
             ])),
         ])?;
         delta_writer.write(write_two).await?;
