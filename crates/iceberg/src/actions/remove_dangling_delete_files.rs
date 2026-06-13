@@ -145,7 +145,7 @@ impl RemoveDanglingDeleteFilesAction {
                         let key = (df.partition_spec_id(), df.partition().clone());
                         partition_min_seq
                             .get(&key)
-                            .map_or(true, |&min_seq| *s < min_seq)
+                            .is_none_or(|&min_seq| *s < min_seq)
                     } else {
                         // No referenced_data_file and no sequence number — cannot determine
                         false
@@ -162,12 +162,12 @@ impl RemoveDanglingDeleteFilesAction {
                         // Unpartitioned equality deletes are global — they apply to all
                         // data files regardless of partition. Only remove if seq is <=
                         // the global minimum data sequence number.
-                        global_min_data_seq.map_or(true, |g| *seq <= g)
+                        global_min_data_seq.is_none_or(|g| *seq <= g)
                     } else {
                         let key = (df.partition_spec_id(), df.partition().clone());
                         partition_min_seq
                             .get(&key)
-                            .map_or(true, |&min_seq| *seq <= min_seq)
+                            .is_none_or(|&min_seq| *seq <= min_seq)
                     }
                 })
                 .map(|(df, _)| df),
