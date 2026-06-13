@@ -106,11 +106,19 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
             let mut deleted_entries = Vec::new();
 
             for manifest_file in manifest_list.entries() {
+                if !snapshot_produce.can_contain_removed_files(manifest_file.content) {
+                    continue;
+                }
+
                 let manifest = manifest_file
                     .load_manifest(snapshot_produce.table.file_io())
                     .await?;
 
                 for entry in manifest.entries() {
+                    if !entry.is_alive() {
+                        continue;
+                    }
+
                     if entry.content_type() == DataContentType::Data
                         && snapshot_produce
                             .removed_data_file_paths
@@ -158,12 +166,20 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
+            if !snapshot_produce.can_contain_removed_files(manifest_file.content) {
+                existing_files.push(manifest_file.clone());
+                continue;
+            }
+
             let manifest = manifest_file.load_manifest(file_io_ref).await?;
 
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()
                 .filter_map(|entry| {
+                    if !entry.is_alive() {
+                        return None;
+                    }
                     if snapshot_produce
                         .removed_data_file_paths
                         .contains(entry.data_file().file_path())
