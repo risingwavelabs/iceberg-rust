@@ -194,7 +194,7 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
-    pub(crate) fn can_contain_removed_files(&self, content: ManifestContentType) -> bool {
+    pub(crate) fn has_removed_files_for_manifest_type(&self, content: ManifestContentType) -> bool {
         match content {
             ManifestContentType::Data => !self.removed_data_file_paths.is_empty(),
             ManifestContentType::Deletes => !self.removed_delete_file_paths.is_empty(),
