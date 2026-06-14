@@ -479,8 +479,7 @@ mod tests {
     #[tokio::test]
     async fn test_referenced_data_file_set_on_all_rolled_files() -> Result<()> {
         // When rolling produces multiple output files but all entries target a single
-        // data file, every output file must carry referenced_data_file. A builders.len() == 1
-        // guard would silently drop the field for rolled files, defeating the optimization.
+        // data file, every output file must carry referenced_data_file.
         let temp_dir = TempDir::new()?;
         let file_io = FileIOBuilder::new_fs_io().build()?;
         let location_gen = DefaultLocationGenerator::with_data_location(
