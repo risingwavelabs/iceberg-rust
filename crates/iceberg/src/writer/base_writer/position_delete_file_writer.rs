@@ -167,7 +167,7 @@ where
     async fn close(&mut self) -> Result<Vec<DataFile>> {
         if let Some(writer) = self.inner.take() {
             let builders = writer.close().await?;
-            let single_ref = if builders.len() == 1 && self.distinct_paths.len() == 1 {
+            let single_ref = if self.distinct_paths.len() == 1 {
                 self.distinct_paths
                     .iter()
                     .next()
@@ -472,6 +472,63 @@ mod tests {
         let data_files = writer.close().await?;
         assert_eq!(data_files.len(), 1);
         assert_eq!(data_files[0].referenced_data_file(), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_referenced_data_file_set_on_all_rolled_files() -> Result<()> {
+        // When rolling produces multiple output files but all entries target a single
+        // data file, every output file must carry referenced_data_file. A builders.len() == 1
+        // guard would silently drop the field for rolled files, defeating the optimization.
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("pos_del".to_string(), None, DataFileFormat::Parquet);
+        let schema = Arc::new(POSITION_DELETE_SCHEMA.clone());
+        let parquet_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
+        // Use a tiny target size to force rolling after the first write.
+        let rolling_builder = RollingFileWriterBuilder::new(
+            parquet_builder,
+            1,
+            file_io.clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let mut writer = PositionDeleteFileWriterBuilder::new(rolling_builder)
+            .build(None)
+            .await?;
+
+        writer
+            .write(vec![PositionDeleteInput::new(
+                Arc::from("s3://bucket/data/file-1.parquet"),
+                1,
+            )])
+            .await?;
+        writer
+            .write(vec![PositionDeleteInput::new(
+                Arc::from("s3://bucket/data/file-1.parquet"),
+                2,
+            )])
+            .await?;
+
+        let data_files = writer.close().await?;
+        assert!(
+            data_files.len() > 1,
+            "expected rolling to produce multiple files, got {}",
+            data_files.len()
+        );
+        for file in &data_files {
+            assert_eq!(
+                file.referenced_data_file().as_deref(),
+                Some("s3://bucket/data/file-1.parquet"),
+                "all rolled files must carry referenced_data_file"
+            );
+        }
 
         Ok(())
     }
