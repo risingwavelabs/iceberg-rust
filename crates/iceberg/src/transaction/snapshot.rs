@@ -937,7 +937,8 @@ partition_struct: {:?}, partition_type: {:?}",
 
         let mut duplicate_files = Vec::new();
 
-        // Load all manifests concurrently, then scan entries
+        // Scan the current snapshot's manifests to detect duplicate adds and
+        // validate deletes.
         if let Some(current_snapshot) = branch_snapshot_ref {
             let manifest_list = current_snapshot
                 .load_manifest_list(table.file_io(), table.metadata_ref().as_ref())
