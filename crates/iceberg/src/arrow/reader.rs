@@ -698,7 +698,7 @@ impl ArrowReader {
         fields: &arrow_schema::Fields,
         iceberg_schema_of_task: &Schema,
         selected_leaf_field_ids: &HashSet<i32>,
-    ) -> HashMap<usize, i32> {
+    ) -> Result<HashMap<usize, i32>> {
         let mut variant_leaf_indices = HashMap::new();
         let mut next_leaf_idx = 0;
 
@@ -710,10 +710,10 @@ impl ArrowReader {
                 None,
                 &mut next_leaf_idx,
                 &mut variant_leaf_indices,
-            );
+            )?;
         }
 
-        variant_leaf_indices
+        Ok(variant_leaf_indices)
     }
 
     fn collect_variant_leaf_indices_for_field(
@@ -723,7 +723,8 @@ impl ArrowReader {
         current_variant_field_id: Option<i32>,
         next_leaf_idx: &mut usize,
         variant_leaf_indices: &mut HashMap<usize, i32>,
-    ) {
+    ) -> Result<()> {
+        let entering_variant = current_variant_field_id.is_none();
         let variant_field_id = field
             .metadata()
             .get(PARQUET_FIELD_ID_META_KEY)
@@ -745,6 +746,22 @@ impl ArrowReader {
             other => other,
         };
 
+        // Reject shredded variants: a `typed_value` sub-field means the payload is
+        // shredded, which we can't reconstruct yet. Projecting only metadata/value
+        // would silently drop it, so fail loudly instead.
+        if entering_variant
+            && variant_field_id.is_some()
+            && let DataType::Struct(sub) = data_type
+            && sub.iter().any(|f| f.name() == "typed_value")
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Reading shredded variant columns is not supported yet: found a \
+                 `typed_value` sub-field. Only unshredded variants (metadata + value) \
+                 can be read.",
+            ));
+        }
+
         match data_type {
             DataType::Struct(fields) => {
                 for child in fields {
@@ -755,7 +772,7 @@ impl ArrowReader {
                         variant_field_id,
                         next_leaf_idx,
                         variant_leaf_indices,
-                    );
+                    )?;
                 }
             }
             DataType::List(field)
@@ -769,7 +786,7 @@ impl ArrowReader {
                     variant_field_id,
                     next_leaf_idx,
                     variant_leaf_indices,
-                );
+                )?;
             }
             DataType::Union(fields, _) => {
                 for (_type_id, child) in fields.iter() {
@@ -780,7 +797,7 @@ impl ArrowReader {
                         variant_field_id,
                         next_leaf_idx,
                         variant_leaf_indices,
-                    );
+                    )?;
                 }
             }
             _ => {
@@ -790,6 +807,7 @@ impl ArrowReader {
                 *next_leaf_idx += 1;
             }
         }
+        Ok(())
     }
 
     fn get_arrow_projection_mask(
@@ -868,13 +886,19 @@ impl ArrowReader {
         // HashSet for O(1) membership checks instead of O(n) slice scans.
         let leaf_field_id_set: HashSet<i32> = leaf_field_ids.iter().copied().collect();
         let variant_leaf_indices =
-            Self::collect_variant_leaf_indices(fields, iceberg_schema_of_task, &leaf_field_id_set);
+            Self::collect_variant_leaf_indices(fields, iceberg_schema_of_task, &leaf_field_id_set)?;
 
         // Pre-project only the fields that have been selected, possibly avoiding converting
         // some Arrow types that are not yet supported.
         let mut projected_field_ids: HashMap<usize, i32> = HashMap::new();
         let projected_arrow_schema = ArrowSchema::new_with_metadata(
             fields.filter_leaves(|idx, field| {
+                // Variant sub-leaves must stay in the pre-projected schema even though
+                // they carry no field ids: dropping them would structurally truncate
+                // their containers (e.g. map<string, variant> would lose its value
+                // field and no longer be a valid map). `arrow_schema_to_schema` relies
+                // on the variant group's extension metadata to short-circuit before
+                // inspecting these sub-fields.
                 if let Some(&field_id) = variant_leaf_indices.get(&idx) {
                     projected_field_ids.insert(idx, field_id);
                     return true;
@@ -2267,6 +2291,66 @@ message schema {
         assert_eq!(
             mask_primitive_only,
             ProjectionMask::leaves(&parquet_schema, vec![0]),
+        );
+    }
+
+    /// A shredded variant (a `typed_value` sub-field) cannot be reconstructed yet;
+    /// projecting only metadata/value would silently drop data, so it must fail loudly.
+    #[test]
+    fn test_arrow_projection_mask_shredded_variant_is_rejected() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "v",
+                DataType::Struct(arrow_schema::Fields::from(vec![
+                    Arc::new(Field::new("metadata", DataType::Binary, false)),
+                    Arc::new(Field::new("value", DataType::Binary, true)),
+                    Arc::new(Field::new("typed_value", DataType::Int64, true)),
+                ])),
+                false,
+            )
+            .with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                (
+                    EXTENSION_TYPE_NAME_KEY.to_string(),
+                    "arrow.parquet.variant".to_string(),
+                ),
+            ])),
+        ]));
+
+        let message_type = "
+message schema {
+  required group v = 1 {
+    required binary metadata;
+    optional binary value;
+    optional int64 typed_value;
+  }
+}
+";
+        let parquet_type = parse_message_type(message_type).expect("should parse schema");
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+
+        let err = ArrowReader::get_arrow_projection_mask(
+            &[1],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect_err("shredded variant must be rejected");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.to_string().contains("shredded variant"),
+            "unexpected error: {err}"
         );
     }
 
