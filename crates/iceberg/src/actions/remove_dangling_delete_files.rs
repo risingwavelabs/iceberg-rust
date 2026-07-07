@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, Struct};
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
+use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, for_each_manifest};
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
 /// Action to remove dangling delete files from a table.
@@ -89,47 +89,45 @@ impl RemoveDanglingDeleteFilesAction {
         let mut global_min_data_seq: Option<i64> = None;
 
         let manifest_files: Vec<_> = manifest_list.entries().to_vec();
-        let loaded = load_manifests(
+        for_each_manifest(
             table.file_io(),
             manifest_files,
             DEFAULT_LOAD_CONCURRENCY_LIMIT,
+            |_, manifest| {
+                for entry in manifest.entries() {
+                    if !entry.is_alive() {
+                        continue;
+                    }
+
+                    let df = entry.data_file();
+                    let seq = entry.sequence_number();
+
+                    match entry.content_type() {
+                        DataContentType::Data => {
+                            data_file_paths.insert(df.file_path().to_string());
+                            if let Some(s) = seq {
+                                let key = (df.partition_spec_id(), df.partition().clone());
+                                partition_min_seq
+                                    .entry(key)
+                                    .and_modify(|min| *min = (*min).min(s))
+                                    .or_insert(s);
+                                global_min_data_seq =
+                                    Some(global_min_data_seq.map_or(s, |g| g.min(s)));
+                            }
+                        }
+                        DataContentType::PositionDeletes => {
+                            pos_deletes.push((df.clone(), seq));
+                        }
+                        DataContentType::EqualityDeletes => {
+                            if let Some(s) = seq {
+                                eq_deletes.push((df.clone(), s));
+                            }
+                        }
+                    }
+                }
+            },
         )
         .await?;
-
-        for (_, manifest) in loaded {
-            let (entries, _) = manifest.into_parts();
-
-            for entry in entries {
-                if !entry.is_alive() {
-                    continue;
-                }
-
-                let df = entry.data_file();
-                let seq = entry.sequence_number();
-
-                match entry.content_type() {
-                    DataContentType::Data => {
-                        data_file_paths.insert(df.file_path().to_string());
-                        if let Some(s) = seq {
-                            let key = (df.partition_spec_id(), df.partition().clone());
-                            partition_min_seq
-                                .entry(key)
-                                .and_modify(|min| *min = (*min).min(s))
-                                .or_insert(s);
-                            global_min_data_seq = Some(global_min_data_seq.map_or(s, |g| g.min(s)));
-                        }
-                    }
-                    DataContentType::PositionDeletes => {
-                        pos_deletes.push((df.clone(), seq));
-                    }
-                    DataContentType::EqualityDeletes => {
-                        if let Some(s) = seq {
-                            eq_deletes.push((df.clone(), s));
-                        }
-                    }
-                }
-            }
-        }
 
         let mut dangling: Vec<DataFile> = Vec::new();
 
