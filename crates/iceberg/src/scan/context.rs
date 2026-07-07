@@ -145,6 +145,11 @@ impl ManifestEntryContext {
 
             deletes,
 
+            value_counts: self.manifest_entry.data_file().value_counts().clone(),
+            null_value_counts: self.manifest_entry.data_file().null_value_counts().clone(),
+            lower_bounds: self.manifest_entry.data_file().lower_bounds().clone(),
+            upper_bounds: self.manifest_entry.data_file().upper_bounds().clone(),
+
             // Include partition data and spec from manifest entry
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             // TODO: Pass actual PartitionSpec through context chain for native flow

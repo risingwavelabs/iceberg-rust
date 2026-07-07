@@ -1843,6 +1843,10 @@ pub mod tests {
             case_sensitive: false,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
         test_fn(task);
 
@@ -1866,6 +1870,10 @@ pub mod tests {
             case_sensitive: false,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
         test_fn(task);
     }

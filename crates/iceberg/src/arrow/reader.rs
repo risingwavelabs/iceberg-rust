@@ -2725,6 +2725,10 @@ message schema {
                 case_sensitive: false,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3052,6 +3056,10 @@ message schema {
             data_file_content: DataContentType::Data,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         // Task 2: read the second and third row groups
@@ -3074,6 +3082,10 @@ message schema {
             data_file_content: DataContentType::Data,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -3209,6 +3221,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3393,6 +3409,10 @@ message schema {
                     partition_spec: None,
                     name_mapping: None,
                     case_sensitive: false,
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
                 }
                 .into(),
             ],
@@ -3403,6 +3423,10 @@ message schema {
             data_file_content: DataContentType::Data,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3633,6 +3657,10 @@ message schema {
                     partition_spec: None,
                     name_mapping: None,
                     case_sensitive: false,
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
                 }
                 .into(),
             ],
@@ -3643,6 +3671,10 @@ message schema {
             data_file_content: DataContentType::Data,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3866,6 +3898,10 @@ message schema {
                     partition_spec: None,
                     name_mapping: None,
                     case_sensitive: false,
+                    value_counts: HashMap::new(),
+                    null_value_counts: HashMap::new(),
+                    lower_bounds: HashMap::new(),
+                    upper_bounds: HashMap::new(),
                 }
                 .into(),
             ],
@@ -3876,6 +3912,10 @@ message schema {
             data_file_content: DataContentType::Data,
             sequence_number: 0,
             equality_ids: None,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3987,6 +4027,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4092,6 +4136,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4186,6 +4234,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4294,6 +4346,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4431,6 +4487,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4535,6 +4595,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4652,6 +4716,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4750,6 +4818,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
@@ -4772,6 +4844,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
@@ -4794,6 +4870,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             }),
         ];
 
@@ -4980,6 +5060,10 @@ message schema {
                 data_file_content: DataContentType::Data,
                 sequence_number: 0,
                 equality_ids: None,
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
             })]
             .into_iter(),
         )) as FileScanTaskStream;

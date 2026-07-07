@@ -1130,6 +1130,10 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         let eq_del_scan_task = FileScanTask {
@@ -1151,6 +1155,10 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         let file_scan_task = FileScanTask {
@@ -1172,6 +1180,10 @@ mod tests {
             partition_spec: None,
             name_mapping: None,
             case_sensitive: false,
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         };
 
         // Load the deletes - should handle both types without error

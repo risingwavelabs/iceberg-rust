@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, Struct,
 };
 
@@ -101,6 +102,20 @@ pub struct FileScanTask {
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
     pub case_sensitive: bool,
+
+    /// Per-column non-null value counts from the manifest entry (`field_id -> count`).
+    /// Empty when the manifest carries no column statistics.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub value_counts: HashMap<i32, u64>,
+    /// Per-column null value counts from the manifest entry (`field_id -> count`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub null_value_counts: HashMap<i32, u64>,
+    /// Per-column lower bounds (minimum value) from the manifest entry (`field_id -> value`).
+    #[serde(skip)]
+    pub lower_bounds: HashMap<i32, Datum>,
+    /// Per-column upper bounds (maximum value) from the manifest entry (`field_id -> value`).
+    #[serde(skip)]
+    pub upper_bounds: HashMap<i32, Datum>,
 }
 
 impl FileScanTask {
@@ -185,6 +200,11 @@ impl From<&DeleteFileContext> for FileScanTask {
             partition_spec: None, // TODO: pass through partition spec info
             name_mapping: None,   // TODO: implement name mapping
             case_sensitive: ctx.case_sensitive,
+            // Delete files do not contribute data-column statistics.
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
         }
     }
 }
