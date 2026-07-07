@@ -20,9 +20,8 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use futures::future::try_join_all;
-
 use async_trait::async_trait;
+use futures::future::try_join_all;
 
 use crate::spec::{PartitionKey, Struct};
 use crate::writer::partitioning::PartitioningWriter;
@@ -119,8 +118,7 @@ where
 
     async fn close(mut self) -> Result<O> {
         let mut writers: Vec<B::R> = self.partition_writers.into_values().collect();
-        let results: Vec<O> =
-            try_join_all(writers.iter_mut().map(|w| w.close())).await?;
+        let results: Vec<O> = try_join_all(writers.iter_mut().map(|w| w.close())).await?;
         for result in results {
             self.output.extend(result);
         }
