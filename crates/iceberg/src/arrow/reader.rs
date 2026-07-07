@@ -2449,6 +2449,82 @@ message schema {
         assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1, 2]));
     }
 
+    /// Files written by Spark/iceberg-java annotate variant groups with the Parquet
+    /// VARIANT logical type but embed no Arrow schema, so the Arrow schema is derived
+    /// from the Parquet schema at read time. The derivation (parquet's
+    /// `variant_experimental` feature) must attach the variant extension metadata,
+    /// otherwise `arrow_schema_to_schema` recurses into the id-less variant sub-fields
+    /// and fails with "Field id not found in metadata".
+    #[test]
+    fn test_arrow_projection_mask_variant_schema_derived_from_parquet() {
+        use parquet::basic::{LogicalType, Repetition, Type as PhysicalType};
+        use parquet::schema::types::Type as ParquetSchemaType;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let id_field = ParquetSchemaType::primitive_type_builder("id", PhysicalType::INT32)
+            .with_repetition(Repetition::REQUIRED)
+            .with_id(Some(1))
+            .build()
+            .unwrap();
+        let metadata_field =
+            ParquetSchemaType::primitive_type_builder("metadata", PhysicalType::BYTE_ARRAY)
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap();
+        let value_field =
+            ParquetSchemaType::primitive_type_builder("value", PhysicalType::BYTE_ARRAY)
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap();
+        let variant_group = ParquetSchemaType::group_type_builder("v")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Variant {
+                specification_version: None,
+            }))
+            .with_id(Some(2))
+            .with_fields(vec![metadata_field.into(), value_field.into()])
+            .build()
+            .unwrap();
+        let message = ParquetSchemaType::group_type_builder("schema")
+            .with_fields(vec![id_field.into(), variant_group.into()])
+            .build()
+            .unwrap();
+        let parquet_schema = SchemaDescriptor::new(Arc::new(message));
+
+        let arrow_schema =
+            Arc::new(parquet::arrow::parquet_to_arrow_schema(&parquet_schema, None).unwrap());
+        assert_eq!(
+            arrow_schema
+                .field_with_name("v")
+                .unwrap()
+                .metadata()
+                .get(EXTENSION_TYPE_NAME_KEY)
+                .map(String::as_str),
+            Some("arrow.parquet.variant"),
+            "derived Arrow schema must carry the variant extension metadata"
+        );
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[1, 2],
+            &schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .expect("projection mask for parquet-derived variant schema");
+        assert_eq!(mask, ProjectionMask::leaves(&parquet_schema, vec![0, 1, 2]));
+    }
+
     #[test]
     fn test_arrow_projection_mask_dictionary_wrapped_variant() {
         let schema = Arc::new(
