@@ -28,8 +28,7 @@ use super::{
 };
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation,
+    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus, Operation,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -293,7 +292,7 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
                     .any(|entry| !found_deleted_files.contains(entry.data_file().file_path()))
                 {
                     let mut manifest_writer = snapshot_produce.new_manifest_writer(
-                        ManifestContentType::Data,
+                        manifest_file.content,
                         manifest_file.partition_spec_id,
                     )?;
 
