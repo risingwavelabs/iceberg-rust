@@ -185,8 +185,8 @@ pub struct ManifestWriter {
     metadata: ManifestMetadata,
 }
 
-/// Serialized (single-value) byte length of a bound [`Datum`], matching
-/// [`Datum::to_bytes`] but computed without allocating.
+/// Serialized (single-value) byte length of a bound [`Datum`], matching the byte
+/// length of [`Datum::to_bytes`] but computed without allocating.
 ///
 /// Iceberg stores bounds as the minimal single-value binary encoding, so the
 /// variable-width types (string / binary / decimal) must be measured from the
@@ -201,8 +201,36 @@ fn datum_serialized_len(datum: &Datum) -> u64 {
         PrimitiveLiteral::Double(_) => 8,
         PrimitiveLiteral::String(s) => s.len() as u64,
         PrimitiveLiteral::Binary(b) => b.len() as u64,
-        // Decimal (Int128) / UInt128 serialize to at most 16 bytes.
-        PrimitiveLiteral::Int128(_) | PrimitiveLiteral::UInt128(_) => 16,
+        // UUID is always 16 bytes.
+        PrimitiveLiteral::UInt128(_) => 16,
+        // Decimal uses a minimal two's-complement representation, clamped by the
+        // spec-required byte length for the declared precision.
+        PrimitiveLiteral::Int128(v) => {
+            let bytes = v.to_be_bytes();
+            let is_negative = *v < 0;
+            let skip_byte = if is_negative { 0xFF } else { 0x00 };
+
+            let mut start = 0usize;
+            while start < 15 && bytes[start] == skip_byte {
+                let next_byte = bytes[start + 1];
+                let next_is_negative = (next_byte & 0x80) != 0;
+                if next_is_negative == is_negative {
+                    start += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let min_len = (16 - start) as u64;
+            let max_len = match datum.data_type() {
+                PrimitiveType::Decimal { precision, .. } => crate::spec::Type::decimal_required_bytes(*precision)
+                    .map(|n| n as u64)
+                    .unwrap_or(16),
+                _ => 16,
+            };
+            min_len.min(max_len)
+        }
+        // These should not appear in manifest bounds; treat as 0 to keep the estimate total.
         PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => 0,
     }
 }
