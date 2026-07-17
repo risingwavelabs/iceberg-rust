@@ -1096,7 +1096,7 @@ mod tests {
         let ratio = estimated as f64 / actual as f64;
         assert!(
             (0.7..=1.4).contains(&ratio),
-            "estimate {estimated} should be within 30% of on-disk length {actual} \
+            "estimate {estimated} should be within -30%/+40% of on-disk length {actual} \
              (ratio {ratio:.3}); the per-entry constants need recalibration",
         );
     }
