@@ -1,0 +1,19 @@
+crates/iceberg/src/spec/manifest/writer.rs
+  s_37cb13e4504b8c::t_249ee9ba81dd50 226-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3b9d3e8613a808bc07239fd0df432c283f15d634",
+  "prompts": {},
+  "sessions": {
+    "s_37cb13e4504b8c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_080626a84ffe2XfjIEfDKvQXqr",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Volodymyr Dorokhov <volodymyr@cloudflare.com>"
+    }
+  }
+}
