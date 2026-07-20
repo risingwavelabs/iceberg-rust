@@ -1,0 +1,19 @@
+crates/iceberg/src/spec/values/datum.rs
+  s_5409ce78d7369c::t_39cf78c022e94b 415-424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eaed5b9a66029814a5cc4244b48177eddd739265",
+  "prompts": {},
+  "sessions": {
+    "s_5409ce78d7369c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_08084554affevLY7UHYVCn2tJc",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Volodymyr Dorokhov <volodymyr@cloudflare.com>"
+    }
+  }
+}
