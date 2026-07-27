@@ -1,0 +1,19 @@
+crates/iceberg/src/transaction/manifest_filter.rs
+  s_5306e8a11082a9::t_825fe95c94fbcb 27-28,293-295,420-422,463-494,560-587,690-716,1247-1390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "30e8f7a7239644d30f4623f91032e79be48490fb",
+  "prompts": {},
+  "sessions": {
+    "s_5306e8a11082a9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05bf2bebaffecL5EGAfPppS3QK",
+        "model": "claude-opus-5"
+      },
+      "human_author": "vovacf201 <volodymyr@cloudflare.com>"
+    }
+  }
+}
