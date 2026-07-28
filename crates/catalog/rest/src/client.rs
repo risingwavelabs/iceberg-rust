@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
+use gcp_auth::TokenProvider;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::header::HeaderMap;
@@ -25,8 +26,8 @@ use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
-use crate::RestCatalogConfig;
 use crate::types::{ErrorResponse, TokenResponse};
+use crate::{GCP_CLOUD_PLATFORM_SCOPE, RestCatalogConfig};
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -45,6 +46,8 @@ pub(crate) struct HttpClient {
     extra_oauth_params: HashMap<String, String>,
     /// Whether to disable header redaction in error logs (defaults to false for security).
     disable_header_redaction: bool,
+    /// GCP service-account JSON for BigLake REST authentication.
+    gcp_credential: Option<String>,
 }
 
 impl Debug for HttpClient {
@@ -68,6 +71,7 @@ impl HttpClient {
             extra_headers,
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
+            gcp_credential: cfg.gcp_credential(),
         })
     }
 
@@ -96,6 +100,7 @@ impl HttpClient {
                 self.extra_oauth_params
             },
             disable_header_redaction: cfg.disable_header_redaction(),
+            gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
         })
     }
 
@@ -178,6 +183,40 @@ impl HttpClient {
         Ok(auth_res.access_token)
     }
 
+    async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
+        let credential = self.gcp_credential.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "GCP service account must be provided for authentication",
+            )
+        })?;
+        let service_account =
+            gcp_auth::CustomServiceAccount::from_json(credential).map_err(|error| {
+                Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
+                    .with_source(error)
+            })?;
+        let token = service_account
+            .token(&[GCP_CLOUD_PLATFORM_SCOPE])
+            .await
+            .map_err(|error| {
+                Error::new(ErrorKind::Unexpected, "Failed to get GCP access token")
+                    .with_source(error)
+            })?;
+        Ok(token.as_str().to_string())
+    }
+
+    async fn exchange_token(&self) -> Result<String> {
+        if self.gcp_credential.is_some() {
+            self.exchange_gcp_credential_for_token().await
+        } else {
+            self.exchange_credential_for_token().await
+        }
+    }
+
+    fn can_refresh_token(&self) -> bool {
+        self.credential.is_some() || self.gcp_credential.is_some()
+    }
+
     /// Invalidate the current token without generating a new one. On the next request, the client
     /// will attempt to generate a new token.
     pub(crate) async fn invalidate_token(&self) -> Result<()> {
@@ -192,41 +231,37 @@ impl HttpClient {
     /// If credential is invalid, or the request fails, this method will return an error and leave
     /// the current token unchanged.
     pub(crate) async fn regenerate_token(&self) -> Result<()> {
-        let new_token = self.exchange_credential_for_token().await?;
-        *self.token.lock().await = Some(new_token.clone());
+        let new_token = self.exchange_token().await?;
+        *self.token.lock().await = Some(new_token);
         Ok(())
     }
 
     /// Authenticates the request by adding a bearer token to the authorization header.
     ///
-    /// This method supports three authentication modes:
+    /// This method supports four authentication modes:
     ///
     /// 1. **No authentication** - Skip authentication when both `credential` and `token` are missing.
     /// 2. **Token authentication** - Use the provided `token` directly for authentication.
     /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
+    /// 4. **GCP service account** - Exchange `gcs.credentials-json` for a Google access token.
     ///
     /// When both `credential` and `token` are present, `token` takes precedence.
-    ///
-    /// # TODO: Support automatic token refreshing.
-    async fn authenticate(&self, req: &mut Request) -> Result<()> {
-        // Clone the token from lock without holding the lock for entire function.
-        let token = self.token.lock().await.clone();
-
-        if self.credential.is_none() && token.is_none() {
-            return Ok(());
+    /// GCP service-account exchange takes precedence when a new token is needed.
+    async fn authenticate(&self, req: &mut Request) -> Result<Option<String>> {
+        let mut token_guard = self.token.lock().await;
+        if !self.can_refresh_token() && token_guard.is_none() {
+            return Ok(None);
         }
-
-        // Either use the provided token or exchange credential for token, cache and use that
-        let token = match token {
-            Some(token) => token,
-            None => {
-                let token = self.exchange_credential_for_token().await?;
-                // Update token so that we use it for next request instead of
-                // exchanging credential for token from the server again
-                *self.token.lock().await = Some(token.clone());
-                token
-            }
-        };
+        if token_guard.is_none() {
+            *token_guard = Some(self.exchange_token().await?);
+        }
+        let token = token_guard.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Authentication token was not initialized",
+            )
+        })?;
+        drop(token_guard);
 
         // Insert token in request.
         req.headers_mut().insert(
@@ -240,6 +275,14 @@ impl HttpClient {
             })?,
         );
 
+        Ok(Some(token))
+    }
+
+    async fn refresh_after_unauthorized(&self, rejected_token: &str) -> Result<()> {
+        let mut token = self.token.lock().await;
+        if token.as_deref() == Some(rejected_token) {
+            *token = Some(self.exchange_token().await?);
+        }
         Ok(())
     }
 
@@ -259,8 +302,20 @@ impl HttpClient {
     // Queries the Iceberg REST catalog after authentication with the given `Request` and
     // returns a `Response`.
     pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
-        self.authenticate(&mut request).await?;
-        self.execute(request).await
+        let retry_request = request.try_clone();
+        let used_token = self.authenticate(&mut request).await?;
+        let response = self.execute(request).await?;
+        if response.status() != StatusCode::UNAUTHORIZED || !self.can_refresh_token() {
+            return Ok(response);
+        }
+
+        let (Some(mut retry_request), Some(rejected_token)) = (retry_request, used_token) else {
+            return Ok(response);
+        };
+        drop(response);
+        self.refresh_after_unauthorized(&rejected_token).await?;
+        self.authenticate(&mut retry_request).await?;
+        self.execute(retry_request).await
     }
 
     /// Returns whether header redaction is disabled for this client.

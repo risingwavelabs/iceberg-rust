@@ -41,6 +41,7 @@ repository = "https://github.com/apache/iceberg-rust"
 rust-version = "1.94"
 
 [workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
 unused_qualifications = "deny"
 
 [workspace.dependencies]
@@ -97,6 +98,7 @@ flate2 = "1.1.5"
 fnv = "1.0.7"
 fs-err = "3.1.0"
 futures = "0.3"
+gcp_auth = "0.12"
 hive_metastore = "0.2.0"
 home = "0.5.12"
 http = "1.2"

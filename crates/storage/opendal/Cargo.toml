@@ -36,10 +36,12 @@ opendal-all = [
   "opendal-gcs",
   "opendal-oss",
   "opendal-azdls",
+  "opendal-azblob",
   "opendal-hf",
 ]
 
 opendal-azdls = ["opendal/services-azdls"]
+opendal-azblob = ["opendal/services-azblob"]
 opendal-fs = ["opendal/services-fs"]
 opendal-gcs = ["opendal/services-gcs"]
 opendal-hf = ["opendal/services-hf"]

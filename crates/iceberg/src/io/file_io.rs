@@ -27,6 +27,24 @@ use super::storage::{
 };
 use crate::Result;
 
+/// Configuration property for setting the chunk size for write operations.
+///
+/// This is useful for multipart uploads where every non-final chunk must use
+/// the same size.
+pub const IO_CHUNK_SIZE: &str = "io.write.chunk-size";
+
+/// Configuration property for setting the per-attempt I/O timeout in seconds.
+pub const IO_TIMEOUT_SECONDS: &str = "io.timeout";
+
+/// Configuration property for setting the maximum number of retry attempts.
+pub const IO_MAX_RETRIES: &str = "io.max-retries";
+
+/// Configuration property for setting the minimum retry delay in milliseconds.
+pub const IO_RETRY_MIN_DELAY_MS: &str = "io.retry.min-delay-ms";
+
+/// Configuration property for setting the maximum retry delay in milliseconds.
+pub const IO_RETRY_MAX_DELAY_MS: &str = "io.retry.max-delay-ms";
+
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
 /// FileIO wraps a `dyn Storage` with lazy initialization via `StorageFactory`.
