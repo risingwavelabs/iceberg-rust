@@ -57,6 +57,7 @@ mod append;
 mod expire_snapshots;
 mod manifest_filter;
 mod replace_files;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -72,6 +73,7 @@ pub use append::FastAppendAction;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 pub use manifest_filter::{ManifestFilterManager, ManifestWriterContext};
 pub use replace_files::{OverwriteFilesAction, RewriteFilesAction};
+pub use rewrite_manifests::RewriteManifestsAction;
 pub use update_schema::AddColumn;
 
 use crate::error::Result;
@@ -86,6 +88,19 @@ use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
+
+/// Target size property used when writing replacement manifests.
+pub const MANIFEST_TARGET_SIZE_BYTES: &str = "commit.manifest.target-size-bytes";
+/// Default target manifest size: 8 MiB.
+pub const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024;
+/// Minimum manifest count property used to decide whether merging is worthwhile.
+pub const MANIFEST_MIN_MERGE_COUNT: &str = "commit.manifest.min-count-to-merge";
+/// Default minimum number of manifests to merge.
+pub const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
+/// Property controlling automatic manifest merging.
+pub const MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
+/// Automatic manifest merging is disabled by default.
+pub const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
 
 /// Table transaction.
 #[derive(Clone)]
@@ -163,6 +178,11 @@ impl Transaction {
     /// Creates an action that replaces files as a logical overwrite.
     pub fn overwrite_files(&self) -> OverwriteFilesAction {
         OverwriteFilesAction::new()
+    }
+
+    /// Creates an action that rewrites manifest files without changing table data.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates replace sort order action.
