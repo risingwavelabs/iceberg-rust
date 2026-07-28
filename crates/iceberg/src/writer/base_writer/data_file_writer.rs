@@ -23,13 +23,14 @@ use crate::spec::{DataContentType, DataFile, PartitionKey};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
-use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
+use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder, PositionDeleteInput};
 use crate::{Error, ErrorKind, Result};
 
 /// Builder for `DataFileWriter`.
 #[derive(Debug)]
 pub struct DataFileWriterBuilder<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
     inner: RollingFileWriterBuilder<B, L, F>,
+    sort_order_id: Option<i32>,
 }
 
 impl<B, L, F> DataFileWriterBuilder<B, L, F>
@@ -40,7 +41,16 @@ where
 {
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            sort_order_id: None,
+        }
+    }
+
+    /// Set sort order id for data files.
+    pub fn sort_order_id(mut self, sort_order_id: Option<i32>) -> Self {
+        self.sort_order_id = sort_order_id;
+        self
     }
 }
 
@@ -57,6 +67,7 @@ where
         Ok(DataFileWriter {
             inner: Some(self.inner.build()),
             partition_key,
+            sort_order_id: self.sort_order_id,
         })
     }
 }
@@ -66,6 +77,7 @@ where
 pub struct DataFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
     inner: Option<RollingFileWriter<B, L, F>>,
     partition_key: Option<PartitionKey>,
+    sort_order_id: Option<i32>,
 }
 
 #[async_trait::async_trait]
@@ -86,6 +98,22 @@ where
         }
     }
 
+    async fn write_with_position(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<Vec<PositionDeleteInput>> {
+        if let Some(writer) = self.inner.as_mut() {
+            writer
+                .write_with_position(&self.partition_key, &batch)
+                .await
+        } else {
+            Err(Error::new(
+                ErrorKind::Unexpected,
+                "Writer is not initialized!",
+            ))
+        }
+    }
+
     async fn close(&mut self) -> Result<Vec<DataFile>> {
         if let Some(writer) = self.inner.take() {
             writer
@@ -97,6 +125,9 @@ where
                     if let Some(pk) = self.partition_key.as_ref() {
                         res.partition(pk.data().clone());
                         res.partition_spec_id(pk.spec().spec_id());
+                    }
+                    if let Some(sort_order_id) = self.sort_order_id {
+                        res.sort_order_id(sort_order_id);
                     }
                     res.build().map_err(|e| {
                         Error::new(
@@ -126,11 +157,15 @@ where
     }
 
     fn current_row_num(&self) -> usize {
-        self.inner.as_ref().unwrap().current_row_num()
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.current_row_num())
     }
 
     fn current_written_size(&self) -> usize {
-        self.inner.as_ref().unwrap().current_written_size()
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.current_written_size())
     }
 }
 
