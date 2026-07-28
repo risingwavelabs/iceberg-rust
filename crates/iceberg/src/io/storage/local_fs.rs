@@ -24,17 +24,18 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 
 use crate::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
     StorageFactory,
 };
 use crate::{Error, ErrorKind, Result};
@@ -87,6 +88,41 @@ impl LocalFsStorage {
         };
         PathBuf::from(path)
     }
+
+    fn list_error(path: &Path, error: std::io::Error) -> Error {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Failed to list {}: {error}", path.display()),
+        )
+        .with_source(error)
+    }
+
+    fn listed_path(base: &str, root: &Path, path: &Path) -> Result<String> {
+        let relative = path.strip_prefix(root).map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Failed to make {} relative to {}",
+                    path.display(),
+                    root.display()
+                ),
+            )
+            .with_source(error)
+        })?;
+        let base = base.trim_end_matches('/');
+        if relative.as_os_str().is_empty() {
+            Ok(base.to_string())
+        } else {
+            Ok(format!("{base}/{}", relative.to_string_lossy()))
+        }
+    }
+}
+
+struct LocalListState {
+    base: String,
+    root: PathBuf,
+    recursive: bool,
+    directories: Vec<fs::ReadDir>,
 }
 
 #[async_trait]
@@ -207,6 +243,60 @@ impl Storage for LocalFsStorage {
             self.delete(&path).await?;
         }
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        let root = Self::normalize_path(path);
+        let directory = fs::read_dir(&root).map_err(|error| Self::list_error(&root, error))?;
+        let state = LocalListState {
+            base: path.to_string(),
+            root,
+            recursive,
+            directories: vec![directory],
+        };
+
+        Ok(stream::try_unfold(state, |mut state| async move {
+            loop {
+                let Some(directory) = state.directories.last_mut() else {
+                    return Ok(None);
+                };
+
+                let Some(entry) = directory.next() else {
+                    state.directories.pop();
+                    continue;
+                };
+                let entry = entry.map_err(|error| Self::list_error(&state.root, error))?;
+                let entry_path = entry.path();
+                let metadata = entry
+                    .metadata()
+                    .map_err(|error| Self::list_error(&entry_path, error))?;
+                let is_dir = metadata.is_dir();
+                if state.recursive && is_dir {
+                    state.directories.push(
+                        fs::read_dir(&entry_path)
+                            .map_err(|error| Self::list_error(&entry_path, error))?,
+                    );
+                }
+
+                let last_modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+                let listed = ListEntry {
+                    path: Self::listed_path(&state.base, &state.root, &entry_path)?,
+                    size: metadata.len(),
+                    last_modified_ms,
+                    is_dir,
+                };
+                return Ok(Some((listed, state)));
+            }
+        })
+        .boxed())
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {
@@ -599,5 +689,59 @@ mod tests {
         // Delete with empty stream should succeed
         let path_stream = stream::iter(Vec::<String>::new()).boxed();
         storage.delete_stream(path_stream).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_local_fs_storage_list_preserves_scheme_and_recursion() {
+        use futures::TryStreamExt;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let root = tmp_dir.path().join("root");
+        let root_file = root.join("root.txt");
+        let nested_file = root.join("nested").join("child.txt");
+        let storage = LocalFsStorage::new();
+        storage
+            .write(root_file.to_str().unwrap(), Bytes::from_static(b"root"))
+            .await
+            .unwrap();
+        storage
+            .write(nested_file.to_str().unwrap(), Bytes::from_static(b"child"))
+            .await
+            .unwrap();
+
+        let root_uri = format!("file://{}", root.display());
+        let direct: Vec<_> = storage
+            .list(&root_uri, false)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            direct
+                .iter()
+                .any(|entry| entry.path == format!("{root_uri}/root.txt") && !entry.is_dir)
+        );
+        assert!(
+            direct
+                .iter()
+                .any(|entry| entry.path == format!("{root_uri}/nested") && entry.is_dir)
+        );
+        assert!(!direct.iter().any(|entry| entry.path.ends_with("child.txt")));
+
+        let recursive: Vec<_> = storage
+            .list(&root_uri, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let child = recursive
+            .iter()
+            .find(|entry| entry.path == format!("{root_uri}/nested/child.txt"))
+            .unwrap();
+        assert_eq!(child.size, 5);
+        assert!(child.last_modified_ms.is_some());
+        assert!(!child.is_dir);
     }
 }

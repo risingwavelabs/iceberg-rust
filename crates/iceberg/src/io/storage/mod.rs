@@ -31,7 +31,7 @@ use futures::stream::BoxStream;
 pub use local_fs::{LocalFsStorage, LocalFsStorageFactory};
 pub use memory::{MemoryStorage, MemoryStorageFactory};
 
-use super::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile};
+use super::{FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile};
 use crate::Result;
 
 /// Trait for storage operations in Iceberg.
@@ -96,6 +96,13 @@ pub trait Storage: Debug + Send + Sync {
 
     /// Delete multiple files from a stream of paths.
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()>;
+
+    /// List files and directories under a path.
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>>;
 
     /// Create a new input file for reading
     fn new_input(&self, path: &str) -> Result<InputFile>;

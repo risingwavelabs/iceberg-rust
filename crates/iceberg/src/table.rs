@@ -329,6 +329,30 @@ impl Table {
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
     }
+
+    /// Deletes files that became unreachable after snapshots were expired.
+    ///
+    /// `before_metadata` must be the metadata captured before committing
+    /// [`Transaction::expire_snapshots`](crate::transaction::Transaction::expire_snapshots).
+    pub async fn cleanup_expired_files(&self, before_metadata: &TableMetadataRef) -> Result<()> {
+        self.cleanup_expired_files_with_concurrency(
+            before_metadata,
+            crate::actions::maintenance::DEFAULT_LOAD_CONCURRENCY,
+        )
+        .await
+    }
+
+    /// Deletes files made unreachable by snapshot expiration with bounded loading.
+    pub async fn cleanup_expired_files_with_concurrency(
+        &self,
+        before_metadata: &TableMetadataRef,
+        concurrency_limit: usize,
+    ) -> Result<()> {
+        crate::actions::maintenance::PhysicalFileCleanup::new(self.clone())
+            .with_load_concurrency(concurrency_limit)
+            .clean(before_metadata)
+            .await
+    }
 }
 
 /// `StaticTable` is a read-only table struct that can be created from a metadata file or from `TableMetaData` without a catalog.

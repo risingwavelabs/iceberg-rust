@@ -26,7 +26,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
     StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
@@ -305,6 +305,14 @@ impl Storage for OpenDalResolvingStorage {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        self.resolve(path)?.list(path, recursive).await
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {

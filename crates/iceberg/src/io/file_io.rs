@@ -19,6 +19,7 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
 use super::storage::{
@@ -153,6 +154,20 @@ impl FileIO {
         self.get_storage()?.delete_stream(paths.boxed()).await
     }
 
+    /// Lists files and directories under the given path.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`: An absolute path starting with the scheme used by this [`FileIO`].
+    /// * `recursive`: Whether to include descendants below direct children.
+    pub async fn list(
+        &self,
+        path: impl AsRef<str>,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        self.get_storage()?.list(path.as_ref(), recursive).await
+    }
+
     /// Check file exists.
     ///
     /// # Arguments
@@ -234,12 +249,25 @@ impl FileIOBuilder {
     }
 }
 
-/// The struct the represents the metadata of a file.
+/// The struct that represents the metadata of a file.
 ///
 /// TODO: we can add last modified time, content type, etc. in the future.
 pub struct FileMetadata {
     /// The size of the file.
     pub size: u64,
+}
+
+/// An entry returned by a storage listing operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEntry {
+    /// Absolute path that can be passed back to [`FileIO`] operations.
+    pub path: String,
+    /// Size of the entry in bytes.
+    pub size: u64,
+    /// Last modified time in milliseconds since the Unix epoch, when available.
+    pub last_modified_ms: Option<i64>,
+    /// Whether this entry represents a directory.
+    pub is_dir: bool,
 }
 
 /// Trait for reading file.
