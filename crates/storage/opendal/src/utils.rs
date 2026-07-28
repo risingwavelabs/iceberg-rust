@@ -21,9 +21,10 @@ pub(crate) fn is_truthy(value: &str) -> bool {
 
 /// Convert an opendal error into an iceberg error.
 pub(crate) fn from_opendal_error(e: opendal::Error) -> iceberg::Error {
-    iceberg::Error::new(
-        iceberg::ErrorKind::Unexpected,
-        "Failure in doing io operation",
-    )
-    .with_source(e)
+    let kind = if e.kind() == opendal::ErrorKind::RangeNotSatisfied {
+        iceberg::ErrorKind::DataInvalid
+    } else {
+        iceberg::ErrorKind::Unexpected
+    };
+    iceberg::Error::new(kind, "Failure in doing io operation").with_source(e)
 }

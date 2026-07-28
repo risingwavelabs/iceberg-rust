@@ -511,6 +511,7 @@ impl ArrowReader {
             file_size_in_bytes,
             parquet_read_options,
             key_metadata,
+            data_file_path,
         )
         .await
     }
@@ -520,6 +521,7 @@ impl ArrowReader {
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
         key_metadata: Option<&[u8]>,
+        data_file_path: &str,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let mut reader = ArrowFileReader::new(
             FileMetadata {
@@ -534,7 +536,29 @@ impl ArrowReader {
         let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, arrow_reader_options)
             .await
             .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
+                let is_invalid_data = matches!(
+                    &e,
+                    parquet::errors::ParquetError::EOF(_)
+                        | parquet::errors::ParquetError::NeedMoreData(_)
+                        | parquet::errors::ParquetError::NeedMoreDataRange(_)
+                ) || matches!(
+                    &e,
+                    parquet::errors::ParquetError::External(source)
+                        if source
+                            .downcast_ref::<Error>()
+                            .is_some_and(|error| error.kind() == ErrorKind::DataInvalid)
+                );
+                let (kind, message) = if is_invalid_data {
+                    (
+                        ErrorKind::DataInvalid,
+                        "Failed to load Parquet metadata: the file may be truncated or its recorded size may be incorrect",
+                    )
+                } else {
+                    (ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                };
+                Error::new(kind, message)
+                    .with_context("path", data_file_path.to_string())
+                    .with_source(e)
             })?;
 
         Ok((reader, arrow_metadata))
@@ -585,8 +609,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::Runtime;
-    use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::arrow::{ArrowReader, ArrowReaderBuilder, ParquetReadOptions};
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskStream};
     use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
@@ -609,6 +633,31 @@ mod tests {
         let expected_micros = (INT96_TEST_JULIAN_DAY as i64 - UNIX_EPOCH_JULIAN) * MICROS_PER_DAY
             + (INT96_TEST_NANOS_WITHIN_DAY / 1_000) as i64;
         (val, expected_micros)
+    }
+
+    #[tokio::test]
+    async fn test_truncated_parquet_file_returns_data_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("truncated.parquet");
+        std::fs::write(&path, vec![0_u8; 32]).unwrap();
+        let path = path.to_str().unwrap();
+        let bytes_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let result = ArrowReader::open_parquet_file(
+            path,
+            &FileIO::new_with_fs(),
+            4096,
+            ParquetReadOptions::builder().build(),
+            &bytes_read,
+            None,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("expected truncated Parquet file to fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("truncated"), "{error}");
     }
 
     async fn read_int96_batches(

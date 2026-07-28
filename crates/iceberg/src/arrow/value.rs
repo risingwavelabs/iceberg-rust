@@ -23,7 +23,7 @@ use arrow_array::{
     LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
     Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray, new_null_array,
 };
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{Buffer, NullBuffer};
 use arrow_schema::{DataType, FieldRef, TimeUnit};
 use uuid::Uuid;
 
@@ -627,6 +627,34 @@ pub fn arrow_primitive_to_literal(
     )
 }
 
+fn validated_fixed_len(len: i32) -> Result<usize> {
+    usize::try_from(len).map_err(|_| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("FixedSizeBinary length must be non-negative, got {len}"),
+        )
+    })
+}
+
+fn create_fixed_size_binary_array(value: &[u8], len: i32, num_rows: usize) -> Result<ArrayRef> {
+    let expected_len = validated_fixed_len(len)?;
+    if value.len() != expected_len {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Fixed size binary value length {} does not match expected length {len}",
+                value.len()
+            ),
+        ));
+    }
+
+    Ok(Arc::new(FixedSizeBinaryArray::new(
+        len,
+        Buffer::from(value.repeat(num_rows)),
+        None,
+    )))
+}
+
 /// Create a single-element array from a primitive literal.
 ///
 /// This is used for creating constant arrays (Run-End Encoded arrays) where we need
@@ -635,6 +663,13 @@ pub(crate) fn create_primitive_array_single_element(
     data_type: &DataType,
     prim_lit: &Option<PrimitiveLiteral>,
 ) -> Result<ArrayRef> {
+    if prim_lit.is_none() {
+        if let DataType::FixedSizeBinary(len) = data_type {
+            validated_fixed_len(*len)?;
+        }
+        return Ok(new_null_array(data_type, 1));
+    }
+
     match (data_type, prim_lit) {
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(v))) => {
             Ok(Arc::new(BooleanArray::from(vec![*v])))
@@ -702,6 +737,18 @@ pub(crate) fn create_primitive_array_single_element(
         (DataType::Binary, None) => Ok(Arc::new(BinaryArray::from_opt_vec(vec![
             Option::<&[u8]>::None,
         ]))),
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => Ok(Arc::new(
+            LargeBinaryArray::from_iter_values(std::iter::once(value.as_slice())),
+        )),
+        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
+            Ok(Arc::new(Time64MicrosecondArray::from(vec![*value])))
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::Binary(value))) => {
+            create_fixed_size_binary_array(value, *len, 1)
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::UInt128(value))) => {
+            create_fixed_size_binary_array(&value.to_be_bytes(), *len, 1)
+        }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(v))) => {
             let array = Decimal128Array::from(vec![{ *v }])
                 .with_precision_and_scale(*precision, *scale)
@@ -819,6 +866,13 @@ pub(crate) fn create_primitive_array_repeated(
     prim_lit: &Option<PrimitiveLiteral>,
     num_rows: usize,
 ) -> Result<ArrayRef> {
+    if prim_lit.is_none() {
+        if let DataType::FixedSizeBinary(len) = data_type {
+            validated_fixed_len(*len)?;
+        }
+        return Ok(new_null_array(data_type, num_rows));
+    }
+
     Ok(match (data_type, prim_lit) {
         // --- Primitive Some arms ---
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(value))) => {
@@ -884,6 +938,21 @@ pub(crate) fn create_primitive_array_repeated(
         }
         (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))
+        }
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => {
+            Arc::new(LargeBinaryArray::from_iter_values(std::iter::repeat_n(
+                value.as_slice(),
+                num_rows,
+            )))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
+            Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::Binary(value))) => {
+            return create_fixed_size_binary_array(value, *len, num_rows);
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::UInt128(value))) => {
+            return create_fixed_size_binary_array(&value.to_be_bytes(), *len, num_rows);
         }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(value))) => {
             Arc::new(
@@ -1913,5 +1982,69 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_missing_primitive_type_arrays() {
+        let cases = [
+            (
+                DataType::LargeBinary,
+                PrimitiveLiteral::Binary(vec![1, 2, 3]),
+            ),
+            (
+                DataType::Time64(TimeUnit::Microsecond),
+                PrimitiveLiteral::Long(36_000_000_000),
+            ),
+            (
+                DataType::FixedSizeBinary(4),
+                PrimitiveLiteral::Binary(vec![0xca, 0xfe, 0xba, 0xbe]),
+            ),
+            (
+                DataType::FixedSizeBinary(16),
+                PrimitiveLiteral::UInt128(0x550e8400_e29b_41d4_a716_446655440000),
+            ),
+        ];
+
+        for (data_type, value) in cases {
+            let single =
+                create_primitive_array_single_element(&data_type, &Some(value.clone())).unwrap();
+            assert_eq!(single.data_type(), &data_type);
+            assert_eq!(single.len(), 1);
+            assert!(!single.is_null(0));
+
+            let repeated = create_primitive_array_repeated(&data_type, &Some(value), 3).unwrap();
+            assert_eq!(repeated.data_type(), &data_type);
+            assert_eq!(repeated.len(), 3);
+            assert!((0..3).all(|index| !repeated.is_null(index)));
+        }
+    }
+
+    #[test]
+    fn test_create_null_nested_array() {
+        let data_type = DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(
+                vec![Arc::new(Field::new("binary", DataType::LargeBinary, true))].into(),
+            ),
+            true,
+        )));
+
+        let array = create_primitive_array_repeated(&data_type, &None, 3).unwrap();
+        assert_eq!(array.data_type(), &data_type);
+        assert_eq!(array.len(), 3);
+        assert!((0..3).all(|index| array.is_null(index)));
+    }
+
+    #[test]
+    fn test_create_fixed_size_binary_rejects_invalid_lengths() {
+        assert!(
+            create_primitive_array_repeated(
+                &DataType::FixedSizeBinary(4),
+                &Some(PrimitiveLiteral::Binary(vec![1, 2, 3])),
+                1,
+            )
+            .is_err()
+        );
+        assert!(create_primitive_array_repeated(&DataType::FixedSizeBinary(-1), &None, 1).is_err());
     }
 }
