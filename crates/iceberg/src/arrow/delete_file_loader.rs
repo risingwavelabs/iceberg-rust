@@ -241,6 +241,8 @@ mod tests {
             referenced_data_file: None,
             content_offset: None,
             content_size_in_bytes: None,
+            record_count: None,
+            sequence_number: 0,
             key_metadata: Some(Box::from(key_metadata.as_ref())),
         };
 
@@ -319,6 +321,8 @@ mod tests {
             referenced_data_file: None,
             content_offset: None,
             content_size_in_bytes: None,
+            record_count: None,
+            sequence_number: 0,
             key_metadata: Some(Box::from(key_metadata.as_ref())),
         };
 

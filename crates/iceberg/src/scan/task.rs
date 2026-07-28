@@ -27,6 +27,7 @@ use crate::spec::{
     DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, Struct, StructType,
 };
+use crate::writer::base_writer::position_delete_file_writer::POSITION_DELETE_SCHEMA;
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
@@ -103,6 +104,14 @@ pub struct FileScanTask {
     /// The list of delete files that may need to be applied to this data file
     #[builder(default)]
     pub deletes: Vec<FileScanTaskDeleteFile>,
+
+    /// Data sequence number of the manifest entry that produced this task.
+    ///
+    /// Consumers that merge data and delete streams use this value to preserve
+    /// Iceberg row-level ordering semantics.
+    #[serde(default)]
+    #[builder(default)]
+    pub sequence_number: i64,
 
     /// Partition data from the manifest entry, used to identify which columns can use
     /// constant values from partition metadata vs. reading from the data file.
@@ -213,6 +222,8 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             .with_referenced_data_file(data_file.referenced_data_file())
             .with_content_offset(data_file.content_offset())
             .with_content_size_in_bytes(data_file.content_size_in_bytes())
+            .with_record_count(Some(ctx.manifest_entry.record_count()))
+            .with_sequence_number(ctx.manifest_entry.sequence_number().unwrap_or_default())
             .with_key_metadata(data_file.key_metadata.as_deref().map(Box::from))
             .build()
     }
@@ -262,6 +273,16 @@ pub struct FileScanTaskDeleteFile {
     #[builder(default)]
     pub content_size_in_bytes: Option<i64>,
 
+    /// Number of records in the delete file, or the cardinality of a deletion vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub record_count: Option<u64>,
+
+    /// Data sequence number of the delete-file manifest entry.
+    #[serde(default)]
+    #[builder(default)]
+    pub sequence_number: i64,
+
     /// Key metadata for encrypted delete files (Parquet Modular Encryption).
     /// When present, the reader uses this to build `FileDecryptionProperties`.
     ///
@@ -272,4 +293,113 @@ pub struct FileScanTaskDeleteFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub key_metadata: Option<Box<[u8]>>,
+}
+
+impl FileScanTaskDeleteFile {
+    /// Converts this lightweight delete descriptor into a standalone scan task.
+    ///
+    /// Equality deletes reuse the table schema and project their equality
+    /// columns. Position deletes use Iceberg's fixed `(file_path, pos)` schema.
+    /// The returned task intentionally does not copy the template's predicate,
+    /// partition constants, or nested deletes. This is useful for engines that
+    /// plan delete files as separate scan streams.
+    pub fn to_file_scan_task(&self, template: &FileScanTask) -> FileScanTask {
+        let (start, length) = match self.file_format {
+            DataFileFormat::Puffin => (
+                self.content_offset.unwrap_or_default().max(0) as u64,
+                self.content_size_in_bytes.unwrap_or_default().max(0) as u64,
+            ),
+            _ => (0, self.file_size_in_bytes),
+        };
+        let (schema, project_field_ids) = match self.file_type {
+            DataContentType::PositionDeletes => {
+                let schema = (*POSITION_DELETE_SCHEMA).clone();
+                let project_field_ids = schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
+                (Arc::new(schema), project_field_ids)
+            }
+            DataContentType::EqualityDeletes => (
+                template.schema.clone(),
+                self.equality_ids
+                    .clone()
+                    .unwrap_or_else(|| template.project_field_ids.clone()),
+            ),
+            DataContentType::Data => (template.schema.clone(), template.project_field_ids.clone()),
+        };
+
+        FileScanTask::builder()
+            .with_file_size_in_bytes(self.file_size_in_bytes)
+            .with_start(start)
+            .with_length(length)
+            .with_record_count(self.record_count)
+            .with_data_file_path(self.file_path.clone())
+            .with_data_file_format(self.file_format)
+            .with_schema(schema)
+            .with_project_field_ids(project_field_ids)
+            .with_deletes(Vec::new())
+            .with_sequence_number(self.sequence_number)
+            .with_partition(None)
+            .with_partition_spec(None)
+            .with_name_mapping(template.name_mapping.clone())
+            .with_case_sensitive(template.case_sensitive)
+            .with_key_metadata(self.key_metadata.clone())
+            .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_delete_file_to_standalone_scan_task() {
+        let template = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_data_file_path("memory://data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(Schema::builder().build().unwrap()))
+            .with_project_field_ids(vec![1, 2])
+            .with_sequence_number(3)
+            .with_case_sensitive(false)
+            .build();
+        let delete = FileScanTaskDeleteFile::builder()
+            .with_file_path("memory://deletes.puffin".to_string())
+            .with_file_size_in_bytes(80)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .with_file_format(DataFileFormat::Puffin)
+            .with_content_offset(Some(11))
+            .with_content_size_in_bytes(Some(23))
+            .with_record_count(Some(7))
+            .with_sequence_number(5)
+            .with_key_metadata(Some(Box::from([1_u8, 2])))
+            .build();
+
+        let task = delete.to_file_scan_task(&template);
+
+        assert_eq!(task.start, 11);
+        assert_eq!(task.length, 23);
+        assert_eq!(task.record_count, Some(7));
+        assert_eq!(task.sequence_number, 5);
+        assert_eq!(task.project_field_ids, vec![2147483546, 2147483545]);
+        assert_eq!(
+            task.schema
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file_path", "pos"]
+        );
+        assert!(!task.case_sensitive);
+        assert!(task.predicate.is_none());
+        assert!(task.deletes.is_empty());
+        assert_eq!(task.key_metadata.as_deref(), Some([1_u8, 2].as_slice()));
+    }
 }

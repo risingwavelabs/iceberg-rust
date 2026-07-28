@@ -241,10 +241,24 @@ impl DataFile {
     pub fn lower_bounds(&self) -> &HashMap<i32, Datum> {
         &self.lower_bounds
     }
+    /// Get mutable lower bounds of the data file values per column.
+    ///
+    /// Callers may use this to discard metrics that are unsafe or too large to
+    /// persist while keeping the remaining file metadata unchanged.
+    pub fn lower_bounds_mut(&mut self) -> &mut HashMap<i32, Datum> {
+        &mut self.lower_bounds
+    }
     /// Get the upper bounds of the data file values per column.
     /// Map from column id to upper bound in the column serialized as binary.
     pub fn upper_bounds(&self) -> &HashMap<i32, Datum> {
         &self.upper_bounds
+    }
+    /// Get mutable upper bounds of the data file values per column.
+    ///
+    /// Callers may use this to discard metrics that are unsafe or too large to
+    /// persist while keeping the remaining file metadata unchanged.
+    pub fn upper_bounds_mut(&mut self) -> &mut HashMap<i32, Datum> {
+        &mut self.upper_bounds
     }
     /// Get the Implementation-specific key metadata for the data file.
     pub fn key_metadata(&self) -> Option<&[u8]> {
@@ -279,6 +293,10 @@ impl DataFile {
     /// Positional delete files could have the field set, and deletion vectors must the field set.
     pub fn referenced_data_file(&self) -> Option<String> {
         self.referenced_data_file.clone()
+    }
+    /// Get the partition spec id of the data file.
+    pub fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
     }
     /// Get the offset in the file where the blob content starts.
     /// Only meaningful for puffin blobs, and required for deletion vectors.

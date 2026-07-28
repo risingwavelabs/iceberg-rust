@@ -2198,11 +2198,31 @@ pub mod tests {
             tasks[0].data_file_path,
             format!("{}/1.parquet", &fixture.table_location)
         );
+        assert_eq!(
+            tasks[0].sequence_number,
+            fixture
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .sequence_number()
+        );
 
         // Check second task is existing data file
         assert_eq!(
             tasks[1].data_file_path,
             format!("{}/3.parquet", &fixture.table_location)
+        );
+        assert_eq!(
+            tasks[1].sequence_number,
+            fixture
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot(fixture.table.metadata())
+                .unwrap()
+                .sequence_number()
         );
     }
 
