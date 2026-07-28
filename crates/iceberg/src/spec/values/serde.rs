@@ -18,6 +18,8 @@
 //\! Serialization and deserialization support for Iceberg values
 
 pub(crate) mod _serde {
+    use std::collections::HashMap;
+
     use serde::de::Visitor;
     use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
     use serde::{Deserialize, Serialize};
@@ -668,27 +670,56 @@ pub(crate) mod _serde {
                     }
                     _ => Err(invalid_err("list")),
                 },
-                RawLiteralEnum::Record(Record {
-                    required,
-                    optional: _,
-                }) => match ty {
+                RawLiteralEnum::Record(Record { required, optional }) => match ty {
                     Type::Struct(struct_ty) => {
-                        let iters: Vec<Option<Literal>> = required
-                            .into_iter()
-                            .map(|(field_name, value)| {
-                                let field = struct_ty
-                                    .field_by_name(field_name.as_str())
-                                    .ok_or_else(|| {
-                                        invalid_err_with_reason(
-                                            "record",
-                                            &format!("field {} is not exist", &field_name),
-                                        )
-                                    })?;
-                                let value = value.try_into(&field.field_type)?;
-                                Ok(value)
+                        let mut value_by_name =
+                            HashMap::with_capacity(required.len().saturating_add(optional.len()));
+
+                        for (field_name, value) in required {
+                            let field = struct_ty.field_by_name(&field_name).ok_or_else(|| {
+                                invalid_err_with_reason(
+                                    "record",
+                                    &format!("field {field_name} does not exist"),
+                                )
+                            })?;
+                            let value = value.try_into(&field.field_type)?;
+                            if value.is_none() && field.required {
+                                return Err(invalid_err_with_reason(
+                                    "record",
+                                    &format!("required field {field_name} is null"),
+                                ));
+                            }
+                            value_by_name.insert(field.name.clone(), value);
+                        }
+
+                        for (field_name, value) in optional {
+                            let field = struct_ty.field_by_name(&field_name).ok_or_else(|| {
+                                invalid_err_with_reason(
+                                    "record",
+                                    &format!("field {field_name} does not exist"),
+                                )
+                            })?;
+                            let value = value
+                                .map(|value| value.try_into(&field.field_type))
+                                .transpose()?
+                                .flatten();
+                            value_by_name.insert(field.name.clone(), value);
+                        }
+
+                        let values = struct_ty
+                            .fields()
+                            .iter()
+                            .map(|field| match value_by_name.remove(&field.name) {
+                                Some(value) => Ok(value),
+                                None if field.required => Err(invalid_err_with_reason(
+                                    "record",
+                                    &format!("required field {} is missing", field.name),
+                                )),
+                                None => Ok(None),
                             })
-                            .collect::<Result<_, Error>>()?;
-                        Ok(Some(Literal::Struct(Struct::from_iter(iters))))
+                            .collect::<Result<Vec<_>, Error>>()?;
+
+                        Ok(Some(Literal::Struct(Struct::from_iter(values))))
                     }
                     Type::Map(map_ty) => {
                         if *map_ty.key_field.field_type != Type::Primitive(PrimitiveType::String) {

@@ -381,6 +381,38 @@ fn json_struct() {
 }
 
 #[test]
+fn json_struct_values_follow_schema_order() {
+    let struct_type = Type::Struct(StructType::new(vec![
+        NestedField::required(2, "b", Primitive(PrimitiveType::Int)).into(),
+        NestedField::required(1, "a", Primitive(PrimitiveType::Long)).into(),
+        NestedField::optional(3, "missing", Primitive(PrimitiveType::String)).into(),
+    ]));
+
+    let raw: RawLiteral = serde_json::from_value(serde_json::json!({"a": 10, "b": 5})).unwrap();
+    let value = raw.try_into(&struct_type).unwrap();
+    assert_eq!(
+        value,
+        Some(Literal::Struct(Struct::from_iter(vec![
+            Some(Literal::int(5)),
+            Some(Literal::long(10)),
+            None,
+        ])))
+    );
+}
+
+#[test]
+fn json_struct_rejects_missing_or_null_required_fields() {
+    let struct_type = Type::Struct(StructType::new(vec![
+        NestedField::required(1, "required", Primitive(PrimitiveType::Int)).into(),
+    ]));
+
+    let missing: RawLiteral = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(missing.try_into(&struct_type).is_err());
+    let null: RawLiteral = serde_json::from_value(serde_json::json!({"required": null})).unwrap();
+    assert!(null.try_into(&struct_type).is_err());
+}
+
+#[test]
 fn json_list() {
     let record = r#"[1, 2, 3, null]"#;
 

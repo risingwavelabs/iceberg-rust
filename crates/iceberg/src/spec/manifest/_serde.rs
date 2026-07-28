@@ -21,7 +21,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{Datum, ManifestEntry, Schema, Struct};
-use crate::spec::{FormatVersion, Literal, RawLiteral, StructType, Type};
+use crate::spec::{FormatVersion, Literal, PrimitiveType, RawLiteral, StructType, Type};
 use crate::{Error, ErrorKind, metadata_columns};
 
 #[derive(Serialize, Deserialize)]
@@ -261,6 +261,14 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
                     )
                 })?
                 .clone();
+            if data_type == PrimitiveType::String
+                && std::str::from_utf8(entry.value.as_ref()).is_err()
+            {
+                // A byte-truncated UTF-8 metric bound is not safe to turn into
+                // a replacement-character string for pruning. Ignore only this
+                // bound so the manifest remains readable and scans stay conservative.
+                continue;
+            }
             m.insert(entry.key, Datum::try_from_bytes(&entry.value, data_type)?);
         }
         // We ignore the entry if the field is not found in schema or metadata columns (schema evolution).
@@ -625,5 +633,28 @@ mod tests {
             Some(&Datum::long(pos_value)),
             "_pos should be parsed as long with correct value"
         );
+    }
+
+    #[test]
+    fn test_parse_bytes_entry_ignores_invalid_utf8_bound() {
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
+
+        let result = parse_bytes_entry(
+            vec![
+                BytesEntry {
+                    key: 1,
+                    value: serde_bytes::ByteBuf::from(42_i32.to_le_bytes().to_vec()),
+                },
+                BytesEntry {
+                    key: 2,
+                    value: serde_bytes::ByteBuf::from(vec![b'a', 0xc3]),
+                },
+            ],
+            &schema(),
+        )
+        .unwrap();
+
+        assert_eq!(result.get(&1), Some(&Datum::int(42)));
+        assert!(!result.contains_key(&2));
     }
 }

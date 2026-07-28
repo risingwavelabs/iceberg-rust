@@ -580,11 +580,14 @@ impl RecordBatchTransformer {
                 // No conflict detection needed - schema resolution happened in reader.rs.
                 let field_by_id = field_id_to_source_schema_map.get(field_id).map(
                     |(source_field, source_index)| {
-                        if source_field.data_type().equals_datatype(target_type) {
+                        if source_field.data_type() == target_type {
                             ColumnSource::PassThrough {
                                 source_index: *source_index,
                             }
                         } else {
+                            // Besides physical type promotion, casting normalizes nested
+                            // Parquet names such as list `item` and map `entries` to
+                            // Iceberg's `element` and `key_value`.
                             ColumnSource::Promote {
                                 target_type: target_type.clone(),
                                 source_index: *source_index,
@@ -731,8 +734,9 @@ mod test {
     use std::sync::Arc;
 
     use arrow_array::{
-        Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        Array, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array,
+        Int64Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+        Time64MicrosecondArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -740,7 +744,9 @@ mod test {
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
     };
-    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
+    use crate::spec::{
+        ListType, Literal, MapType, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
+    };
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
     /// Returns empty string for null values
@@ -967,7 +973,7 @@ mod test {
                     NestedField::optional(
                         3,
                         "struct_col",
-                        Type::Struct(crate::spec::StructType::new(vec![
+                        Type::Struct(StructType::new(vec![
                             NestedField::optional(
                                 100,
                                 "inner_field",
@@ -1022,11 +1028,237 @@ mod test {
         let struct_column = result
             .column(2)
             .as_any()
-            .downcast_ref::<arrow_array::StructArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
         assert!(struct_column.is_null(0));
         assert!(struct_column.is_null(1));
         assert!(struct_column.is_null(2));
+    }
+
+    #[test]
+    fn schema_evolution_materializes_all_missing_types_with_nulls() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "binary", Type::Primitive(PrimitiveType::Binary))
+                        .into(),
+                    NestedField::optional(3, "time", Type::Primitive(PrimitiveType::Time)).into(),
+                    NestedField::optional(4, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
+                    NestedField::optional(5, "fixed", Type::Primitive(PrimitiveType::Fixed(4)))
+                        .into(),
+                    NestedField::optional(
+                        6,
+                        "nested",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                7,
+                                "nested_binary",
+                                Type::Primitive(PrimitiveType::Binary),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        8,
+                        "list",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                9,
+                                Type::Primitive(PrimitiveType::Fixed(2)),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        10,
+                        "map",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(
+                                11,
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::map_value_element(
+                                12,
+                                Type::Primitive(PrimitiveType::Uuid),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let projected_field_ids = [1, 2, 3, 4, 5, 6, 8, 10];
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "id",
+            DataType::Int32,
+            false,
+            "1",
+        )]));
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        assert_eq!(result.num_columns(), projected_field_ids.len());
+        assert_eq!(result.num_rows(), 3);
+        assert!(result.column(1).as_any().is::<LargeBinaryArray>());
+        assert!(result.column(2).as_any().is::<Time64MicrosecondArray>());
+        assert!(result.column(3).as_any().is::<FixedSizeBinaryArray>());
+        assert!(result.column(4).as_any().is::<FixedSizeBinaryArray>());
+        assert_eq!(result.column(3).data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(result.column(4).data_type(), &DataType::FixedSizeBinary(4));
+        assert!(result.column(5).as_any().is::<StructArray>());
+        assert!(result.column(6).as_any().is::<ListArray>());
+        assert!(result.column(7).as_any().is::<MapArray>());
+        for column in result.columns().iter().skip(1) {
+            assert!((0..result.num_rows()).all(|row| column.is_null(row)));
+        }
+    }
+
+    #[test]
+    fn nested_list_field_name_is_normalized() {
+        use arrow_buffer::OffsetBuffer;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "items",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                3,
+                                Type::Primitive(PrimitiveType::Int),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        ));
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new("items", DataType::List(item_field.clone()), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        ]));
+        let list = ListArray::new(
+            item_field,
+            OffsetBuffer::from_lengths([2, 1]),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(list),
+        ])
+        .unwrap();
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let DataType::List(element) = result.column(1).data_type() else {
+            panic!("expected list column");
+        };
+        assert_eq!(element.name(), "element");
+        RecordBatch::try_new(result.schema(), result.columns().to_vec()).unwrap();
+    }
+
+    #[test]
+    fn nested_map_field_name_is_normalized() {
+        use arrow_buffer::OffsetBuffer;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "properties",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(3, Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::map_value_element(
+                                4,
+                                Type::Primitive(PrimitiveType::String),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let key_field = Arc::new(Field::new("key", DataType::Utf8, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        ));
+        let value_field = Arc::new(Field::new("value", DataType::Utf8, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())]),
+        ));
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![key_field.clone(), value_field.clone()].into()),
+            false,
+        ));
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new(
+                "properties",
+                DataType::Map(entries_field.clone(), false),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let entries = StructArray::new(
+            vec![key_field, value_field].into(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec![Some("1")])),
+            ],
+            None,
+        );
+        let map = MapArray::new(
+            entries_field,
+            OffsetBuffer::from_lengths([1, 0]),
+            entries,
+            None,
+            false,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(map),
+        ])
+        .unwrap();
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let DataType::Map(entries, _) = result.column(1).data_type() else {
+            panic!("expected map column");
+        };
+        assert_eq!(entries.name(), "key_value");
+        RecordBatch::try_new(result.schema(), result.columns().to_vec()).unwrap();
     }
 
     pub fn source_record_batch() -> RecordBatch {

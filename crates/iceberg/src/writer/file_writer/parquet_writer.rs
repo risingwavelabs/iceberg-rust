@@ -27,7 +27,7 @@ use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
 
@@ -45,6 +45,8 @@ use crate::spec::{
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
+
+const ICEBERG_SCHEMA_KEY: &str = "iceberg.schema";
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
 #[derive(Clone, Debug)]
@@ -71,11 +73,25 @@ impl ParquetWriterBuilder {
         schema: SchemaRef,
         match_mode: FieldMatchMode,
     ) -> Self {
+        let props = Self::add_iceberg_schema_metadata(props, schema.as_ref());
         Self {
             props,
             schema,
             match_mode,
         }
+    }
+
+    fn add_iceberg_schema_metadata(props: WriterProperties, schema: &Schema) -> WriterProperties {
+        let schema_json =
+            serde_json::to_string(schema).expect("Iceberg schema serialization should not fail");
+        let mut metadata = props.key_value_metadata().cloned().unwrap_or_default();
+        metadata.retain(|entry| entry.key != ICEBERG_SCHEMA_KEY);
+        metadata.push(KeyValue::new(ICEBERG_SCHEMA_KEY.to_string(), schema_json));
+
+        props
+            .into_builder()
+            .set_key_value_metadata(Some(metadata))
+            .build()
     }
 
     /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
@@ -531,7 +547,16 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+            let arrow_schema: ArrowSchemaRef = {
+                let schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+                let mut metadata = schema.metadata().clone();
+                metadata.insert(
+                    ICEBERG_SCHEMA_KEY.to_string(),
+                    serde_json::to_string(self.schema.as_ref())
+                        .expect("Iceberg schema serialization should not fail"),
+                );
+                Arc::new(schema.with_metadata(metadata))
+            };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
@@ -663,6 +688,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::statistics::ValueStatistics;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -873,13 +899,14 @@ mod tests {
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
         )?;
+        let iceberg_schema: SchemaRef = Arc::new(to_write.schema().as_ref().try_into().unwrap());
 
         // write data
         let mut pw = ParquetWriterBuilder::new(
             WriterProperties::builder()
                 .set_max_row_group_row_count(Some(128))
                 .build(),
-            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
+            iceberg_schema.clone(),
         )
         .build(output_file)
         .await?;
@@ -914,6 +941,38 @@ mod tests {
         // check the written file
         let expect_batch = concat_batches(&schema, vec![&to_write, &to_write_null]).unwrap();
         check_parquet_data_file(&file_io, &data_file, &expect_batch).await;
+
+        let input = file_io
+            .new_input(data_file.file_path())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(input).unwrap();
+        let footer_metadata = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        let footer_schema_json = footer_metadata
+            .iter()
+            .find(|entry| entry.key == ICEBERG_SCHEMA_KEY)
+            .and_then(|entry| entry.value.as_deref())
+            .expect("Parquet footer should contain iceberg.schema");
+        assert_eq!(
+            serde_json::from_str::<Schema>(footer_schema_json).unwrap(),
+            *iceberg_schema
+        );
+
+        let arrow_schema = reader.schema();
+        let arrow_schema_json = arrow_schema
+            .metadata()
+            .get(ICEBERG_SCHEMA_KEY)
+            .expect("Arrow schema metadata should contain iceberg.schema");
+        assert_eq!(
+            serde_json::from_str::<Schema>(arrow_schema_json).unwrap(),
+            *iceberg_schema
+        );
 
         Ok(())
     }
@@ -2361,6 +2420,39 @@ mod tests {
 
     fn table_props(entries: HashMap<String, String>) -> TableProperties {
         TableProperties::try_from(&entries).unwrap()
+    }
+
+    #[test]
+    fn test_iceberg_schema_metadata_preserves_custom_entries() {
+        let schema = cdc_test_schema();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![
+                KeyValue::new("custom.key".to_string(), "custom-value".to_string()),
+                KeyValue::new(ICEBERG_SCHEMA_KEY.to_string(), "stale-schema".to_string()),
+            ]))
+            .build();
+
+        let builder = ParquetWriterBuilder::new(props, schema.clone());
+        let metadata = builder.props.key_value_metadata().unwrap();
+        assert_eq!(
+            metadata
+                .iter()
+                .find(|entry| entry.key == "custom.key")
+                .and_then(|entry| entry.value.as_deref()),
+            Some("custom-value")
+        );
+        let iceberg_entries = metadata
+            .iter()
+            .filter(|entry| entry.key == ICEBERG_SCHEMA_KEY)
+            .collect::<Vec<_>>();
+        assert_eq!(iceberg_entries.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Schema>(
+                iceberg_entries[0].value.as_deref().expect("schema value")
+            )
+            .unwrap(),
+            *schema
+        );
     }
 
     #[test]

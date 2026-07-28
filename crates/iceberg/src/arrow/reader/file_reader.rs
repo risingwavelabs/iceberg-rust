@@ -22,13 +22,38 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 
 use super::ParquetReadOptions;
 use crate::io::{FileMetadata, FileRead};
+
+fn validate_range_read(range: &Range<u64>, bytes: Bytes) -> parquet::errors::Result<Bytes> {
+    let expected_len = range
+        .end
+        .checked_sub(range.start)
+        .ok_or_else(|| {
+            parquet::errors::ParquetError::General(format!(
+                "Invalid Parquet byte range {}..{}",
+                range.start, range.end
+            ))
+        })
+        .and_then(|len| usize::try_from(len).map_err(Into::into))?;
+
+    if bytes.len() != expected_len {
+        return Err(parquet::errors::ParquetError::EOF(format!(
+            "Parquet byte range {}..{} returned {} of {expected_len} bytes; \
+             the file may be truncated or its recorded size may be incorrect",
+            range.start,
+            range.end,
+            bytes.len()
+        )));
+    }
+
+    Ok(bytes)
+}
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 pub struct ArrowFileReader {
@@ -56,11 +81,14 @@ impl ArrowFileReader {
 
 impl AsyncFileReader for ArrowFileReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        Box::pin(
-            self.r
-                .read(range.start..range.end)
-                .map_err(|err| parquet::errors::ParquetError::External(Box::new(err))),
-        )
+        Box::pin(async move {
+            let bytes = self
+                .r
+                .read(range.clone())
+                .await
+                .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+            validate_range_read(&range, bytes)
+        })
     }
 
     /// Override the default `get_byte_ranges` which calls `get_bytes` sequentially.
@@ -82,26 +110,42 @@ impl AsyncFileReader for ArrowFileReader {
             // Fetch merged ranges concurrently.
             let fetched: Vec<Bytes> = futures::stream::iter(fetch_ranges.iter().cloned())
                 .map(|range| async move {
-                    r.read(range)
+                    let bytes = r
+                        .read(range.clone())
                         .await
-                        .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+                        .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))?;
+                    validate_range_read(&range, bytes)
                 })
                 .buffered(concurrency)
                 .try_collect()
                 .await?;
 
             // Slice the fetched data back into the originally requested ranges.
-            Ok(ranges
+            ranges
                 .iter()
                 .map(|range| {
-                    let idx = fetch_ranges.partition_point(|v| v.start <= range.start) - 1;
+                    let idx = fetch_ranges
+                        .partition_point(|v| v.start <= range.start)
+                        .checked_sub(1)
+                        .ok_or_else(|| {
+                            parquet::errors::ParquetError::General(format!(
+                                "No fetched Parquet range contains {}..{}",
+                                range.start, range.end
+                            ))
+                        })?;
                     let fetch_range = &fetch_ranges[idx];
                     let fetch_bytes = &fetched[idx];
-                    let start = (range.start - fetch_range.start) as usize;
-                    let end = (range.end - fetch_range.start) as usize;
-                    fetch_bytes.slice(start..end.min(fetch_bytes.len()))
+                    let start = usize::try_from(range.start - fetch_range.start)?;
+                    let end = usize::try_from(range.end - fetch_range.start)?;
+                    if end > fetch_bytes.len() {
+                        return Err(parquet::errors::ParquetError::EOF(format!(
+                            "Fetched Parquet range {}..{} does not contain requested range {}..{}",
+                            fetch_range.start, fetch_range.end, range.start, range.end
+                        )));
+                    }
+                    Ok(fetch_bytes.slice(start..end))
                 })
-                .collect())
+                .collect()
         }
         .boxed()
     }
@@ -238,8 +282,32 @@ mod tests {
     #[async_trait::async_trait]
     impl FileRead for MockFileRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
-            Ok(self.data.slice(range.start as usize..range.end as usize))
+            let start = usize::try_from(range.start).unwrap().min(self.data.len());
+            let end = usize::try_from(range.end).unwrap().min(self.data.len());
+            Ok(self.data.slice(start..end))
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_bytes_rejects_short_read() {
+        let mut reader =
+            ArrowFileReader::new(FileMetadata { size: 200 }, Box::new(MockFileRead::new(100)));
+
+        let error = reader.get_bytes(90..110).await.unwrap_err();
+        assert!(matches!(error, parquet::errors::ParquetError::EOF(_)));
+        assert!(error.to_string().contains("file may be truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_get_byte_ranges_rejects_short_read() {
+        let mut reader =
+            ArrowFileReader::new(FileMetadata { size: 200 }, Box::new(MockFileRead::new(100)));
+
+        let error = reader
+            .get_byte_ranges(vec![80..90, 90..110])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, parquet::errors::ParquetError::EOF(_)));
     }
 
     #[tokio::test]
