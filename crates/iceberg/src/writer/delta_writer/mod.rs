@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Base writer module contains the basic writer provide by iceberg: `DataFileWriter`,
-//! `PositionDeleteFileWriter`, `EqualityDeleteFileWriter`, `DeletionVectorWriter`.
+//! Higher-level delta writers built on top of base Iceberg writers.
 
-pub mod data_file_writer;
-pub mod deletion_vector_writer;
-pub mod equality_delete_writer;
-pub mod position_delete_file_writer;
+mod writer;
+
+pub use writer::{DELETE_OP, DeltaWriter, DeltaWriterBuilder, INSERT_OP};

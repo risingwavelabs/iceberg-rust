@@ -148,6 +148,7 @@ mod tests {
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
     use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::spec::DataFileFormat;
 
     #[tokio::test]
     async fn test_basic_delete_file_loader_read_delete_file() {
@@ -236,6 +237,10 @@ mod tests {
             file_type: DataContentType::PositionDeletes,
             partition_spec_id: 0,
             equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
             key_metadata: Some(Box::from(key_metadata.as_ref())),
         };
 
@@ -310,6 +315,10 @@ mod tests {
             file_type: DataContentType::EqualityDeletes,
             partition_spec_id: 0,
             equality_ids: Some(vec![1]),
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
             key_metadata: Some(Box::from(key_metadata.as_ref())),
         };
 

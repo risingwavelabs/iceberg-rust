@@ -15,32 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Delete vector types and Puffin serialization support.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::mem::size_of_val;
 use std::ops::BitOrAssign;
 
+use crc32fast::Hasher;
 use roaring::RoaringTreemap;
 use roaring::bitmap::Iter;
 use roaring::treemap::BitmapIter;
 
+use crate::puffin::{Blob, DELETION_VECTOR_V1};
 use crate::{Error, ErrorKind, Result};
 
-#[derive(Debug, Default)]
+const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
+
+/// Puffin blob property for deletion vector cardinality.
+pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
+/// Puffin blob property for referenced data file path.
+pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenced-data-file";
+
+/// A set of deleted row positions backed by a `RoaringTreemap`.
+#[derive(Clone, Debug, Default)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
 }
 
 impl DeleteVector {
-    #[allow(unused)]
+    /// Creates a delete vector from an existing roaring treemap.
     pub fn new(roaring_treemap: RoaringTreemap) -> DeleteVector {
         DeleteVector {
             inner: roaring_treemap,
         }
     }
 
+    /// Returns an iterator over deleted row positions in ascending order.
     pub fn iter(&self) -> DeleteVectorIterator<'_> {
         let outer = self.inner.bitmaps();
         DeleteVectorIterator { outer, inner: None }
     }
 
+    /// Marks a single row position as deleted.
+    ///
+    /// Returns `true` when the position was not already present.
     pub fn insert(&mut self, pos: u64) -> bool {
         self.inner.insert(pos)
     }
@@ -52,7 +72,6 @@ impl DeleteVector {
     /// # Errors
     ///
     /// Returns an error if the precondition is not met.
-    #[allow(dead_code)]
     pub fn insert_positions(&mut self, positions: &[u64]) -> Result<usize> {
         if let Err(err) = self.inner.append(positions.iter().copied()) {
             return Err(Error::new(
@@ -64,9 +83,147 @@ impl DeleteVector {
         Ok(positions.len())
     }
 
-    #[allow(unused)]
+    /// Returns `true` if there are no deleted positions in this vector.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the number of deleted row positions in the vector.
     pub fn len(&self) -> u64 {
         self.inner.len()
+    }
+
+    /// Serialize this delete vector into a Puffin deletion vector blob.
+    pub fn to_puffin_blob(&self, properties: HashMap<String, String>) -> Result<Blob> {
+        Self::check_properties(&properties)?;
+
+        let serialized_bitmap_size = self.inner.serialized_size();
+        let combined_length = (DELETION_VECTOR_MAGIC_BYTES.len() + serialized_bitmap_size) as u32;
+        let mut data = Vec::with_capacity(
+            size_of_val(&combined_length)
+                + DELETION_VECTOR_MAGIC_BYTES.len()
+                + serialized_bitmap_size
+                + 4, // the length of the CRC
+        );
+
+        data.extend_from_slice(&combined_length.to_be_bytes());
+        data.extend_from_slice(&DELETION_VECTOR_MAGIC_BYTES);
+
+        let bitmap_start = data.len();
+        data.resize(bitmap_start + serialized_bitmap_size, 0);
+        {
+            let mut cursor = Cursor::new(&mut data[bitmap_start..]);
+            self.inner.serialize_into(&mut cursor).map_err(|err| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "failed to serialize deletion vector bitmap".to_string(),
+                )
+                .with_source(err)
+            })?;
+        }
+
+        let mut hasher = Hasher::new();
+        hasher.update(&data[4..]);
+        let crc = hasher.finalize();
+        data.extend_from_slice(&crc.to_be_bytes());
+
+        Ok(Blob::builder()
+            .r#type(DELETION_VECTOR_V1.to_string())
+            .fields(vec![])
+            .snapshot_id(-1)
+            .sequence_number(-1)
+            .data(data)
+            .properties(properties)
+            .build())
+    }
+
+    /// Deserialize a delete vector from a Puffin deletion vector blob.
+    pub fn from_puffin_blob(blob: Blob) -> Result<Self> {
+        if blob.blob_type() != DELETION_VECTOR_V1 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("unsupported puffin blob type: {}", blob.blob_type()),
+            ));
+        }
+
+        let data = blob.data();
+        if data.len() < MIN_SERIALIZED_DELETION_VECTOR_BLOB {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "serialized deletion vector blob too small".to_string(),
+            ));
+        }
+
+        let magic = &data[4..8];
+        if magic != DELETION_VECTOR_MAGIC_BYTES {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "invalid deletion vector magic bytes".to_string(),
+            ));
+        }
+
+        let combined_length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let expected_len = size_of_val(&combined_length) + combined_length as usize + 4;
+        if expected_len != data.len() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "serialized deletion vector length mismatch: expected {expected_len}, actual {}",
+                    data.len()
+                ),
+            ));
+        }
+
+        let bitmap_start = 8;
+        let bitmap_end = data.len() - 4;
+        let bitmap_data = &data[bitmap_start..bitmap_end];
+
+        let mut hasher = Hasher::new();
+        hasher.update(&data[4..bitmap_end]);
+        let expected_crc = hasher.finalize();
+        let stored_crc = u32::from_be_bytes([
+            data[data.len() - 4],
+            data[data.len() - 3],
+            data[data.len() - 2],
+            data[data.len() - 1],
+        ]);
+        if expected_crc != stored_crc {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("deletion vector crc mismatch: expected {expected_crc}, got {stored_crc}"),
+            ));
+        }
+
+        let bitmap =
+            RoaringTreemap::deserialize_from(&mut Cursor::new(bitmap_data)).map_err(|err| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "failed to deserialize deletion vector bitmap".to_string(),
+                )
+                .with_source(err)
+            })?;
+
+        Ok(DeleteVector::new(bitmap))
+    }
+
+    fn check_properties(properties: &HashMap<String, String>) -> Result<()> {
+        if !properties.contains_key(DELETION_VECTOR_PROPERTY_CARDINALITY) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector properties must include {DELETION_VECTOR_PROPERTY_CARDINALITY}"
+                ),
+            ));
+        }
+        if !properties.contains_key(DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector properties must include {DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE}"
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -76,6 +233,7 @@ impl DeleteVector {
 // There is a PR open on roaring to add this (https://github.com/RoaringBitmap/roaring-rs/pull/314)
 // and if that gets merged then we can simplify `DeleteVectorIterator` here, refactoring `advance_to`
 // to just a wrapper around the underlying iterator's method.
+/// An iterator over deleted row positions.
 pub struct DeleteVectorIterator<'a> {
     // NB: `BitMapIter` was only exposed publicly in https://github.com/RoaringBitmap/roaring-rs/pull/316
     // which is not yet released. As a consequence our Cargo.toml temporarily uses a git reference for
@@ -113,6 +271,7 @@ impl Iterator for DeleteVectorIterator<'_> {
 }
 
 impl DeleteVectorIterator<'_> {
+    /// Advances the iterator to the first position greater than or equal to `pos`.
     pub fn advance_to(&mut self, pos: u64) {
         let hi = (pos >> 32) as u32;
         let lo = pos as u32;
@@ -138,6 +297,12 @@ impl DeleteVectorIterator<'_> {
 
 impl BitOrAssign for DeleteVector {
     fn bitor_assign(&mut self, other: Self) {
+        self.inner.bitor_assign(other.inner);
+    }
+}
+
+impl BitOrAssign<&DeleteVector> for DeleteVector {
+    fn bitor_assign(&mut self, other: &DeleteVector) {
         self.inner.bitor_assign(&other.inner);
     }
 }
@@ -145,6 +310,19 @@ impl BitOrAssign for DeleteVector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn puffin_properties() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                DELETION_VECTOR_PROPERTY_CARDINALITY.to_string(),
+                "2".to_string(),
+            ),
+            (
+                DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE.to_string(),
+                "data.parquet".to_string(),
+            ),
+        ])
+    }
 
     #[test]
     fn test_insertion_and_iteration() {
@@ -197,5 +375,32 @@ mod tests {
         let positions = vec![1, 3, 5, 5];
         let res = dv.insert_positions(&positions);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_puffin_blob_round_trip() {
+        let mut dv = DeleteVector::default();
+        dv.insert(7);
+        dv.insert(1 << 33);
+
+        let decoded =
+            DeleteVector::from_puffin_blob(dv.to_puffin_blob(puffin_properties()).unwrap())
+                .unwrap();
+
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), vec![7, 1 << 33]);
+    }
+
+    #[test]
+    fn test_clone_and_borrowed_union() {
+        let mut left = DeleteVector::default();
+        left.insert(1);
+        let mut right = DeleteVector::default();
+        right.insert(2);
+
+        let mut union = left.clone();
+        union |= &right;
+
+        assert_eq!(union.iter().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(right.iter().collect::<Vec<_>>(), vec![2]);
     }
 }

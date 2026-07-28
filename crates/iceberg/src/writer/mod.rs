@@ -385,20 +385,25 @@
 //! ```
 
 pub mod base_writer;
+pub mod delta_writer;
 pub mod file_writer;
 pub mod partitioning;
+pub mod task_writer;
 
 use arrow_array::RecordBatch;
 
 use crate::Result;
 use crate::spec::{DataFile, PartitionKey};
+pub use crate::writer::base_writer::position_delete_file_writer::PositionDeleteInput;
 
 type DefaultInput = RecordBatch;
 type DefaultOutput = Vec<DataFile>;
 
 /// The builder for iceberg writer.
 #[async_trait::async_trait]
-pub trait IcebergWriterBuilder<I = DefaultInput, O = DefaultOutput>: Send + Sync + 'static {
+pub trait IcebergWriterBuilder<I = DefaultInput, O = DefaultOutput>: Send + Sync + 'static
+where I: Send + 'static
+{
     /// The associated writer type.
     type R: IcebergWriter<I, O>;
     /// Build the iceberg writer with an optional partition key.
@@ -407,15 +412,28 @@ pub trait IcebergWriterBuilder<I = DefaultInput, O = DefaultOutput>: Send + Sync
 
 /// The iceberg writer used to write data to iceberg table.
 #[async_trait::async_trait]
-pub trait IcebergWriter<I = DefaultInput, O = DefaultOutput>: Send + 'static {
+pub trait IcebergWriter<I = DefaultInput, O = DefaultOutput>: Send + 'static
+where I: Send + 'static
+{
     /// Write data to iceberg table.
     async fn write(&mut self, input: I) -> Result<()>;
+
+    /// Write data to iceberg table and return position information for each record.
+    async fn write_with_position(&mut self, _input: I) -> Result<Vec<PositionDeleteInput>> {
+        Err(crate::Error::new(
+            crate::ErrorKind::Unexpected,
+            "write_with_position is not supported for this writer",
+        ))
+    }
+
     /// Close the writer and return the written data files.
     /// If close failed, the data written before maybe be lost. User may need to recreate the writer and rewrite the data again.
     /// # NOTE
     /// After close, regardless of success or failure, the writer should never be used again, otherwise the writer will panic.
     async fn close(&mut self) -> Result<O>;
 }
+
+pub use task_writer::TaskWriter;
 
 /// The current file status of the Iceberg writer.
 /// This is implemented for writers that write a single file at a time.
