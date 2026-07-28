@@ -27,6 +27,7 @@ mod utils;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,7 +35,7 @@ use cfg_if::cfg_if;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
     StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
@@ -580,6 +581,48 @@ impl Storage for OpenDalStorage {
         Ok(())
     }
 
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        let path: Arc<str> = Arc::from(path);
+        let (operator, relative_path) = self.create_operator(&path)?;
+        let absolute_prefix: Arc<str> =
+            Arc::from(&path[..path.len().saturating_sub(relative_path.len())]);
+        let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
+            relative_path.to_string()
+        } else {
+            format!("{relative_path}/")
+        };
+        let lister = operator
+            .lister_with(&list_path)
+            .recursive(recursive)
+            .await
+            .map_err(from_opendal_error)?;
+
+        Ok(lister
+            .map(move |entry| {
+                entry.map_err(from_opendal_error).map(|entry| {
+                    let metadata = entry.metadata();
+                    let last_modified_ms = metadata
+                        .last_modified()
+                        .and_then(|timestamp| {
+                            let modified: SystemTime = timestamp.into();
+                            modified.duration_since(UNIX_EPOCH).ok()
+                        })
+                        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+                    ListEntry {
+                        path: format!("{absolute_prefix}{}", entry.path()),
+                        size: metadata.content_length(),
+                        last_modified_ms,
+                        is_dir: metadata.is_dir(),
+                    }
+                })
+            })
+            .boxed())
+    }
+
     #[allow(unreachable_code, unused_variables)]
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
@@ -766,6 +809,43 @@ mod tests {
                 .relativize_path("abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
                 .unwrap(),
             "/path/to/file.parquet"
+        );
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_list_memory_storage() {
+        use futures::TryStreamExt;
+
+        let storage = OpenDalStorage::Memory(default_memory_operator());
+        storage
+            .write("memory:/root/direct.txt", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        storage
+            .write(
+                "memory:/root/nested/child.txt",
+                Bytes::from_static(b"child"),
+            )
+            .await
+            .unwrap();
+
+        let entries: Vec<_> = storage
+            .list("memory:/root", true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == "memory:/root/direct.txt" && entry.size == 1)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == "memory:/root/nested/child.txt" && entry.size == 5)
         );
     }
 }

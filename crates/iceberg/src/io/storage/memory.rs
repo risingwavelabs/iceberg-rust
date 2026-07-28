@@ -22,18 +22,19 @@
 //! It is primarily intended for unit testing and scenarios where persistent
 //! storage is not needed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 
 use crate::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
     StorageFactory,
 };
 use crate::{Error, ErrorKind, Result};
@@ -63,10 +64,24 @@ use crate::{Error, ErrorKind, Result};
 pub struct MemoryStorage {
     #[serde(skip, default = "default_memory_data")]
     data: Arc<RwLock<HashMap<String, Bytes>>>,
+    #[serde(skip, default = "default_memory_timestamps")]
+    last_modified_ms: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 fn default_memory_data() -> Arc<RwLock<HashMap<String, Bytes>>> {
     Arc::new(RwLock::new(HashMap::new()))
+}
+
+fn default_memory_timestamps() -> Arc<RwLock<HashMap<String, i64>>> {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 impl MemoryStorage {
@@ -74,6 +89,7 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            last_modified_ms: default_memory_timestamps(),
         }
     }
 
@@ -169,14 +185,25 @@ impl Storage for MemoryStorage {
                 format!("Failed to acquire write lock: {e}"),
             )
         })?;
-        data.insert(normalized, bs);
+        data.insert(normalized.clone(), bs);
+        drop(data);
+        self.last_modified_ms
+            .write()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to acquire timestamp write lock: {e}"),
+                )
+            })?
+            .insert(normalized, now_ms());
         Ok(())
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let normalized = Self::normalize_path(path);
-        Ok(Box::new(MemoryFileWrite::new(
+        Ok(Box::new(MemoryFileWrite::new_with_timestamps(
             self.data.clone(),
+            self.last_modified_ms.clone(),
             normalized,
         )))
     }
@@ -190,6 +217,16 @@ impl Storage for MemoryStorage {
             )
         })?;
         data.remove(&normalized);
+        drop(data);
+        self.last_modified_ms
+            .write()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to acquire timestamp write lock: {e}"),
+                )
+            })?
+            .remove(&normalized);
         Ok(())
     }
 
@@ -218,6 +255,14 @@ impl Storage for MemoryStorage {
         for key in keys_to_remove {
             data.remove(&key);
         }
+        drop(data);
+        let mut timestamps = self.last_modified_ms.write().map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to acquire timestamp write lock: {e}"),
+            )
+        })?;
+        timestamps.retain(|key, _| !key.starts_with(&prefix));
 
         Ok(())
     }
@@ -227,6 +272,64 @@ impl Storage for MemoryStorage {
             self.delete(&path).await?;
         }
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        let normalized = Self::normalize_path(path);
+        let prefix = if normalized.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", normalized.trim_end_matches('/'))
+        };
+        let base = path.trim_end_matches('/');
+        let data = self.data.read().map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to acquire read lock: {e}"),
+            )
+        })?;
+        let timestamps = self.last_modified_ms.read().map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to acquire timestamp read lock: {e}"),
+            )
+        })?;
+
+        let mut entries = Vec::new();
+        let mut directories = HashSet::new();
+        for (stored_path, bytes) in data.iter() {
+            let Some(relative) = stored_path.strip_prefix(&prefix) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+
+            if !recursive && let Some((directory, _)) = relative.split_once('/') {
+                if directories.insert(directory.to_string()) {
+                    entries.push(ListEntry {
+                        path: format!("{base}/{directory}"),
+                        size: 0,
+                        last_modified_ms: None,
+                        is_dir: true,
+                    });
+                }
+                continue;
+            }
+
+            entries.push(ListEntry {
+                path: format!("{base}/{relative}"),
+                size: bytes.len() as u64,
+                last_modified_ms: timestamps.get(stored_path).copied(),
+                is_dir: false,
+            });
+        }
+        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        Ok(stream::iter(entries.into_iter().map(Ok)).boxed())
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {
@@ -296,6 +399,7 @@ impl FileRead for MemoryFileRead {
 #[derive(Debug)]
 pub struct MemoryFileWrite {
     data: Arc<RwLock<HashMap<String, Bytes>>>,
+    last_modified_ms: Option<Arc<RwLock<HashMap<String, i64>>>>,
     path: String,
     buffer: Vec<u8>,
     closed: bool,
@@ -306,10 +410,21 @@ impl MemoryFileWrite {
     pub fn new(data: Arc<RwLock<HashMap<String, Bytes>>>, path: String) -> Self {
         Self {
             data,
+            last_modified_ms: None,
             path,
             buffer: Vec::new(),
             closed: false,
         }
+    }
+
+    fn new_with_timestamps(
+        data: Arc<RwLock<HashMap<String, Bytes>>>,
+        last_modified_ms: Arc<RwLock<HashMap<String, i64>>>,
+        path: String,
+    ) -> Self {
+        let mut writer = Self::new(data, path);
+        writer.last_modified_ms = Some(last_modified_ms);
+        writer
     }
 }
 
@@ -342,6 +457,18 @@ impl FileWrite for MemoryFileWrite {
             self.path.clone(),
             Bytes::from(std::mem::take(&mut self.buffer)),
         );
+        drop(data);
+        if let Some(timestamps) = &self.last_modified_ms {
+            timestamps
+                .write()
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to acquire timestamp write lock: {e}"),
+                    )
+                })?
+                .insert(self.path.clone(), now_ms());
+        }
         self.closed = true;
         Ok(())
     }
@@ -654,5 +781,52 @@ mod tests {
         // Delete with empty stream should succeed
         let path_stream = stream::iter(Vec::<String>::new()).boxed();
         storage.delete_stream(path_stream).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_memory_storage_list() {
+        use futures::TryStreamExt;
+
+        let storage = MemoryStorage::new();
+        storage
+            .write("memory://root/direct.txt", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        storage
+            .write(
+                "memory://root/nested/child.txt",
+                Bytes::from_static(b"child"),
+            )
+            .await
+            .unwrap();
+
+        let direct: Vec<_> = storage
+            .list("memory://root", false)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(direct.len(), 2);
+        assert!(
+            direct
+                .iter()
+                .any(|entry| entry.path == "memory://root/nested" && entry.is_dir)
+        );
+
+        let recursive: Vec<_> = storage
+            .list("memory://root", true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let child = recursive
+            .iter()
+            .find(|entry| entry.path == "memory://root/nested/child.txt")
+            .unwrap();
+        assert_eq!(child.size, 5);
+        assert!(child.last_modified_ms.is_some());
+        assert!(!child.is_dir);
     }
 }

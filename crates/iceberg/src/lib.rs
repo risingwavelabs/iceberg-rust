@@ -74,6 +74,7 @@ mod catalog;
 pub use catalog::utils::drop_table_data;
 pub use catalog::*;
 
+pub mod actions;
 pub mod table;
 
 mod avro;
