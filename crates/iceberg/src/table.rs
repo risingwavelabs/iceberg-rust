@@ -275,6 +275,10 @@ impl Table {
         self.encryption_manager.as_deref()
     }
 
+    pub(crate) fn encryption_manager_ref(&self) -> Option<Arc<EncryptionManager>> {
+        self.encryption_manager.clone()
+    }
+
     /// Creates a table scan.
     pub fn scan(&self) -> TableScanBuilder<'_> {
         TableScanBuilder::new(self)

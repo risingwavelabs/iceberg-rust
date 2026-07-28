@@ -3147,13 +3147,38 @@ pub fn iceberg::transaction::AddColumn::optional(name: impl alloc::string::ToStr
 pub fn iceberg::transaction::AddColumn::required(name: impl alloc::string::ToString, field_type: iceberg::spec::Type, initial_default: iceberg::spec::Literal) -> Self
 impl iceberg::transaction::AddColumn
 pub fn iceberg::transaction::AddColumn::builder() -> AddColumnBuilder<((), (), (), (), (), (), ())>
+pub struct iceberg::transaction::FastAppendAction
+impl iceberg::transaction::FastAppendAction
+pub fn iceberg::transaction::FastAppendAction::add_data_files(self, data_files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::FastAppendAction::generate_snapshot_id(table: &iceberg::table::Table) -> i64
+pub fn iceberg::transaction::FastAppendAction::set_check_duplicate(self, v: bool) -> Self
+pub fn iceberg::transaction::FastAppendAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
+pub fn iceberg::transaction::FastAppendAction::set_snapshot_id(self, snapshot_id: i64) -> Self
+pub fn iceberg::transaction::FastAppendAction::set_snapshot_properties(self, snapshot_properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::FastAppendAction::set_target_branch(self, target_branch: alloc::string::String) -> Self
+pub fn iceberg::transaction::FastAppendAction::with_check_duplicate(self, v: bool) -> Self
+pub struct iceberg::transaction::ManifestFilterManager
+impl iceberg::transaction::ManifestFilterManager
+pub fn iceberg::transaction::ManifestFilterManager::contains_deletes(&self) -> bool
+pub fn iceberg::transaction::ManifestFilterManager::delete_file(&mut self, file: iceberg::spec::DataFile) -> iceberg::Result<()>
+pub fn iceberg::transaction::ManifestFilterManager::fail_any_delete(self) -> Self
+pub fn iceberg::transaction::ManifestFilterManager::fail_missing_delete_paths(self) -> Self
+pub fn iceberg::transaction::ManifestFilterManager::files_to_be_deleted(&self) -> alloc::vec::Vec<&iceberg::spec::DataFile>
+pub async fn iceberg::transaction::ManifestFilterManager::filter_manifests(&mut self, table_schema: &iceberg::spec::Schema, manifests: alloc::vec::Vec<iceberg::spec::ManifestFile>) -> iceberg::Result<alloc::vec::Vec<iceberg::spec::ManifestFile>>
+pub fn iceberg::transaction::ManifestFilterManager::new(file_io: iceberg::io::FileIO, writer_context: iceberg::transaction::ManifestWriterContext) -> Self
+pub struct iceberg::transaction::ManifestWriterContext
+impl iceberg::transaction::ManifestWriterContext
+pub fn iceberg::transaction::ManifestWriterContext::new(metadata_location: alloc::string::String, commit_uuid: uuid::Uuid, manifest_counter: alloc::sync::Arc<core::sync::atomic::AtomicU64>, format_version: iceberg::spec::FormatVersion, snapshot_id: i64, file_io: iceberg::io::FileIO, encryption_manager: core::option::Option<alloc::sync::Arc<iceberg::encryption::EncryptionManager>>) -> Self
+pub fn iceberg::transaction::ManifestWriterContext::new_manifest_writer(&self, content_type: iceberg::spec::ManifestContentType, table_schema: &iceberg::spec::Schema, partition_spec: &iceberg::spec::PartitionSpec) -> iceberg::Result<iceberg::spec::ManifestWriter>
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
 pub fn iceberg::transaction::Transaction::expire_snapshots(&self) -> iceberg::transaction::expire_snapshots::ExpireSnapshotsAction
-pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transaction::append::FastAppendAction
+pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transaction::FastAppendAction
 pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> Self
+pub fn iceberg::transaction::Transaction::overwrite_files(&self) -> iceberg::transaction::OverwriteFilesAction
 pub fn iceberg::transaction::Transaction::replace_sort_order(&self) -> iceberg::transaction::sort_order::ReplaceSortOrderAction
+pub fn iceberg::transaction::Transaction::rewrite_files(&self) -> iceberg::transaction::RewriteFilesAction
 pub fn iceberg::transaction::Transaction::update_location(&self) -> iceberg::transaction::update_location::UpdateLocationAction
 pub fn iceberg::transaction::Transaction::update_schema(&self) -> iceberg::transaction::update_schema::UpdateSchemaAction
 pub fn iceberg::transaction::Transaction::update_statistics(&self) -> iceberg::transaction::update_statistics::UpdateStatisticsAction
@@ -3164,7 +3189,9 @@ pub fn iceberg::transaction::Transaction::clone(&self) -> iceberg::transaction::
 pub trait iceberg::transaction::ApplyTransactionAction
 pub fn iceberg::transaction::ApplyTransactionAction::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction>
 impl<T: TransactionAction + 'static> iceberg::transaction::ApplyTransactionAction for T
-pub fn T::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction> where Self: core::marker::Sized
+pub fn T::apply(self, tx: iceberg::transaction::Transaction) -> core::result::Result<iceberg::transaction::Transaction, iceberg::Error>
+pub type iceberg::transaction::OverwriteFilesAction = iceberg::transaction::replace_files::ReplaceFilesAction<iceberg::transaction::replace_files::Overwrite>
+pub type iceberg::transaction::RewriteFilesAction = iceberg::transaction::replace_files::ReplaceFilesAction<iceberg::transaction::replace_files::Rewrite>
 pub mod iceberg::transform
 pub trait iceberg::transform::TransformFunction: core::marker::Send + core::marker::Sync + core::fmt::Debug
 pub fn iceberg::transform::TransformFunction::transform(&self, input: arrow_array::array::ArrayRef) -> iceberg::Result<arrow_array::array::ArrayRef>

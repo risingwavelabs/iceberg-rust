@@ -55,6 +55,8 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod manifest_filter;
+mod replace_files;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -66,14 +68,16 @@ mod upgrade_format_version;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use append::FastAppendAction;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+pub use manifest_filter::{ManifestFilterManager, ManifestWriterContext};
+pub use replace_files::{OverwriteFilesAction, RewriteFilesAction};
 pub use update_schema::AddColumn;
 
 use crate::error::Result;
 use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
-use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -149,6 +153,16 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates an action that rewrites files without changing table data.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
+    /// Creates an action that replaces files as a logical overwrite.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
     }
 
     /// Creates replace sort order action.
@@ -264,12 +278,126 @@ mod tests {
     use crate::io::FileIO;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct, TableMetadata,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        ManifestListWriter, ManifestWriterBuilder, Operation, Snapshot, SnapshotReference,
+        SnapshotRetention, Struct, Summary, TableMetadata,
     };
     use crate::table::Table;
     use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
+
+    pub const PARENT_SNAPSHOT_ID: i64 = 42;
+    pub const PARENT_SEQUENCE_NUMBER: i64 = 1;
+    pub const REMOVED_DELETE_FILE: &str = "test/removed-position-delete.parquet";
+    pub const RETAINED_DELETE_FILE: &str = "test/retained-position-delete.parquet";
+
+    const TABLE_LOCATION: &str = "memory:///test/location";
+    const MANIFEST_LIST_LOCATION: &str = "memory:///test/location/metadata/manifest-list-1.avro";
+    const DELETE_MANIFEST_LOCATION: &str =
+        "memory:///test/location/metadata/delete-manifest-1.avro";
+
+    pub fn position_delete_file(table: &Table, path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap()
+    }
+
+    pub async fn make_v2_table_with_delete_manifest() -> Table {
+        let base = make_v2_minimal_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
+            .set_location(TABLE_LOCATION.to_string())
+            .build()
+            .unwrap()
+            .metadata;
+        let base = base.with_metadata(Arc::new(metadata));
+        let file_io = base.file_io().clone();
+
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            file_io.new_output(DELETE_MANIFEST_LOCATION).unwrap(),
+            Some(PARENT_SNAPSHOT_ID),
+            base.metadata().current_schema().clone(),
+            base.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_deletes();
+
+        for path in [REMOVED_DELETE_FILE, RETAINED_DELETE_FILE] {
+            manifest_writer
+                .add_existing_file(
+                    position_delete_file(&base, path),
+                    PARENT_SNAPSHOT_ID,
+                    PARENT_SEQUENCE_NUMBER,
+                    Some(PARENT_SEQUENCE_NUMBER),
+                )
+                .unwrap();
+        }
+        let delete_manifest = manifest_writer.write_manifest_file().await.unwrap();
+
+        let manifest_list_output = file_io
+            .new_output(MANIFEST_LIST_LOCATION)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut manifest_list_writer = ManifestListWriter::v2(
+            manifest_list_output,
+            PARENT_SNAPSHOT_ID,
+            None,
+            PARENT_SEQUENCE_NUMBER,
+        );
+        manifest_list_writer
+            .add_manifests(vec![delete_manifest].into_iter())
+            .unwrap();
+        manifest_list_writer.close().await.unwrap();
+
+        let parent_snapshot = Snapshot::builder()
+            .with_snapshot_id(PARENT_SNAPSHOT_ID)
+            .with_timestamp_ms(base.metadata().last_updated_ms() + 1)
+            .with_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .with_schema_id(0)
+            .with_manifest_list(MANIFEST_LIST_LOCATION)
+            .with_summary(Summary {
+                operation: Operation::Overwrite,
+                additional_properties: [
+                    ("total-delete-files".to_string(), "2".to_string()),
+                    ("total-position-deletes".to_string(), "2".to_string()),
+                    ("total-files-size".to_string(), "200".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .build();
+
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
+            .add_snapshot(parent_snapshot)
+            .unwrap()
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(
+                    PARENT_SNAPSHOT_ID,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        base.with_metadata(Arc::new(metadata))
+    }
 
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
@@ -324,6 +452,26 @@ mod tests {
         Table::builder()
             .metadata(resp)
             .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    pub fn make_v3_minimal_table() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV3ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(metadata)
+            .metadata_location("memory:///test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
             .runtime(test_runtime())
