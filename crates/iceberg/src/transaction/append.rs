@@ -25,7 +25,7 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer, data_file_identity,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -34,8 +34,11 @@ pub struct FastAppendAction {
     check_duplicate: bool,
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
+    snapshot_id: Option<i64>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
+    target_branch: Option<String>,
 }
 
 impl FastAppendAction {
@@ -43,8 +46,11 @@ impl FastAppendAction {
         Self {
             check_duplicate: true,
             commit_uuid: None,
+            snapshot_id: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            added_delete_files: vec![],
+            target_branch: None,
         }
     }
 
@@ -54,9 +60,28 @@ impl FastAppendAction {
         self
     }
 
+    /// Set whether to check files against the target branch before committing.
+    pub fn set_check_duplicate(self, v: bool) -> Self {
+        self.with_check_duplicate(v)
+    }
+
+    /// Set the branch this append commits to.
+    pub fn set_target_branch(mut self, target_branch: String) -> Self {
+        self.target_branch = Some(target_branch);
+        self
+    }
+
     /// Add data files to the snapshot.
     pub fn add_data_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
-        self.added_data_files.extend(data_files);
+        for file in data_files {
+            match file.content_type() {
+                crate::spec::DataContentType::Data => self.added_data_files.push(file),
+                crate::spec::DataContentType::PositionDeletes
+                | crate::spec::DataContentType::EqualityDeletes => {
+                    self.added_delete_files.push(file);
+                }
+            }
+        }
         self
     }
 
@@ -72,35 +97,75 @@ impl FastAppendAction {
         self
     }
 
-    /// Collapse files sharing a path to their first occurrence, so a single
-    /// manifest never references the same file twice. Always runs (unlike the
+    /// Set the snapshot ID before committing, for exactly-once integrations.
+    pub fn set_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Generate a snapshot ID that can be persisted before commit.
+    pub fn generate_snapshot_id(table: &Table) -> i64 {
+        SnapshotProducer::generate_unique_snapshot_id(table)
+    }
+
+    /// Collapse duplicate file identities to their first occurrence.
+    ///
+    /// Deletion vectors use `(path, offset, length)` identity because multiple
+    /// vectors may share one Puffin file. This always runs (unlike the
     /// `check_duplicate`-gated cross-snapshot check) since it is in-memory only.
-    fn dedupe_added_files(&self) -> Vec<DataFile> {
-        let mut seen = HashSet::with_capacity(self.added_data_files.len());
-        self.added_data_files
+    fn dedupe_added_files(&self) -> (Vec<DataFile>, Vec<DataFile>) {
+        let mut seen =
+            HashSet::with_capacity(self.added_data_files.len() + self.added_delete_files.len());
+        let data_files = self
+            .added_data_files
             .iter()
-            .filter(|data_file| seen.insert(data_file.file_path.as_str()))
+            .filter(|file| seen.insert(data_file_identity(file)))
             .cloned()
-            .collect()
+            .collect();
+        let delete_files = self
+            .added_delete_files
+            .iter()
+            .filter(|file| seen.insert(data_file_identity(file)))
+            .cloned()
+            .collect();
+        (data_files, delete_files)
     }
 }
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        let snapshot_producer = SnapshotProducer::new(
+        if let Some(snapshot_id) = self.snapshot_id
+            && table.metadata().snapshot_by_id(snapshot_id).is_some()
+        {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                format!("Snapshot id {snapshot_id} already exists"),
+            ));
+        }
+
+        let (added_data_files, added_delete_files) = self.dedupe_added_files();
+        let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+            self.snapshot_id,
             self.snapshot_properties.clone(),
-            self.dedupe_added_files(),
+            added_data_files,
+            added_delete_files,
+            vec![],
+            vec![],
         );
 
-        // validate added files
-        snapshot_producer.validate_added_data_files()?;
+        if let Some(target_branch) = &self.target_branch {
+            snapshot_producer.set_target_branch(target_branch.clone());
+        }
+
+        snapshot_producer.validate_added_files(&snapshot_producer.added_data_files)?;
+        snapshot_producer.validate_added_files(&snapshot_producer.added_delete_files)?;
 
         // Checks duplicate files
         if self.check_duplicate {
-            snapshot_producer.validate_duplicate_files().await?;
+            snapshot_producer.validate_data_file_changes().await?;
         }
 
         snapshot_producer
@@ -125,9 +190,13 @@ impl SnapshotProduceOperation for FastAppendOperation {
 
     async fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce
+            .table
+            .metadata()
+            .snapshot_for_ref(snapshot_produce.target_branch())
+        else {
             return Ok(vec![]);
         };
 
@@ -166,13 +235,15 @@ mod tests {
     use crate::io::FileIO;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
-        ManifestEntry, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, SnapshotRef,
-        Struct, TableMetadata,
+        ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, SnapshotRef, Struct, TableMetadata,
     };
     use crate::table::Table;
     use crate::test_utils::test_runtime;
-    use crate::transaction::tests::{make_encrypted_table, make_v2_minimal_table};
-    use crate::transaction::{Transaction, TransactionAction};
+    use crate::transaction::tests::{
+        make_encrypted_table, make_v2_minimal_table, make_v3_minimal_table,
+    };
+    use crate::transaction::{FastAppendAction, Transaction, TransactionAction};
     use crate::{TableIdent, TableRequirement, TableUpdate};
 
     fn render_template(template: &str, ctx: Value) -> String {
@@ -920,5 +991,139 @@ mod tests {
             manifest.entries()[0].snapshot_id().unwrap()
         );
         assert_eq!(data_file, *manifest.entries()[0].data_file());
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_uses_pre_generated_id_and_target_branch() {
+        let table = make_v2_minimal_table();
+        let snapshot_id = FastAppendAction::generate_snapshot_id(&table);
+        let target_branch = "staging";
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/branch.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = Transaction::new(&table)
+            .fast_append()
+            .set_snapshot_id(snapshot_id)
+            .set_target_branch(target_branch.to_string())
+            .add_data_files([data_file]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let requirements = action_commit.take_requirements();
+
+        assert!(matches!(
+            &updates[..],
+            [
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name,
+                    reference
+                }
+            ] if snapshot.snapshot_id() == snapshot_id
+                && ref_name == target_branch
+                && reference.snapshot_id == snapshot_id
+        ));
+        assert_eq!(requirements, vec![
+            TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: target_branch.to_string(),
+                snapshot_id: None,
+            },
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_writes_delete_manifest() {
+        let table = make_v2_minimal_table();
+        let delete_file =
+            crate::transaction::tests::position_delete_file(&table, "test/delete.parquet");
+        let action = Transaction::new(&table)
+            .fast_append()
+            .add_data_files([delete_file.clone()]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+
+        assert_eq!(manifest_list.entries().len(), 1);
+        assert_eq!(
+            manifest_list.entries()[0].content,
+            ManifestContentType::Deletes
+        );
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(manifest.entries().len(), 1);
+        assert_eq!(manifest.entries()[0].data_file(), &delete_file);
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get("added-delete-files")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_keeps_distinct_deletion_vectors_in_shared_puffin() {
+        let table = make_v3_minimal_table();
+        let make_dv = |referenced_data_file: &str, offset: i64| {
+            DataFileBuilder::default()
+                .content(DataContentType::PositionDeletes)
+                .file_path("test/shared.puffin".to_string())
+                .file_format(DataFileFormat::Puffin)
+                .file_size_in_bytes(256)
+                .record_count(1)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .referenced_data_file(Some(referenced_data_file.to_string()))
+                .content_offset(Some(offset))
+                .content_size_in_bytes(Some(64))
+                .build()
+                .unwrap()
+        };
+        let action = Transaction::new(&table).fast_append().add_data_files([
+            make_dv("test/data-a.parquet", 4),
+            make_dv("test/data-b.parquet", 68),
+        ]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        let mut offsets = manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().content_offset().unwrap())
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+
+        assert_eq!(offsets, vec![4, 68]);
     }
 }
