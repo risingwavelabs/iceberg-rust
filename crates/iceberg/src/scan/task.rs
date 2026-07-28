@@ -168,21 +168,24 @@ pub(crate) struct DeleteFileContext {
 
 impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
     fn from(ctx: &DeleteFileContext) -> Self {
+        let data_file = ctx.manifest_entry.data_file();
         FileScanTaskDeleteFile::builder()
             .with_file_path(ctx.manifest_entry.file_path().to_string())
             .with_file_size_in_bytes(ctx.manifest_entry.file_size_in_bytes())
             .with_file_type(ctx.manifest_entry.content_type())
             .with_partition_spec_id(ctx.partition_spec_id)
-            .with_equality_ids(ctx.manifest_entry.data_file.equality_ids.clone())
-            .with_key_metadata(
-                ctx.manifest_entry
-                    .data_file
-                    .key_metadata
-                    .as_deref()
-                    .map(Box::from),
-            )
+            .with_equality_ids(data_file.equality_ids.clone())
+            .with_file_format(data_file.file_format())
+            .with_referenced_data_file(data_file.referenced_data_file())
+            .with_content_offset(data_file.content_offset())
+            .with_content_size_in_bytes(data_file.content_size_in_bytes())
+            .with_key_metadata(data_file.key_metadata.as_deref().map(Box::from))
             .build()
     }
+}
+
+fn default_delete_file_format() -> DataFileFormat {
+    DataFileFormat::Parquet
 }
 
 /// A task to scan part of file.
@@ -204,6 +207,26 @@ pub struct FileScanTaskDeleteFile {
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     #[builder(default)]
     pub equality_ids: Option<Vec<i32>>,
+
+    /// Physical format of the delete file.
+    #[serde(default = "default_delete_file_format")]
+    #[builder(default = DataFileFormat::Parquet)]
+    pub file_format: DataFileFormat,
+
+    /// Data file referenced by a deletion vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub referenced_data_file: Option<String>,
+
+    /// Byte offset of a deletion-vector blob within its Puffin file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub content_offset: Option<i64>,
+
+    /// Byte length of a deletion-vector blob within its Puffin file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub content_size_in_bytes: Option<i64>,
 
     /// Key metadata for encrypted delete files (Parquet Modular Encryption).
     /// When present, the reader uses this to build `FileDecryptionProperties`.

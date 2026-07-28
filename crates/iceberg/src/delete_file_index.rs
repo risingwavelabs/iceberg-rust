@@ -27,6 +27,25 @@ use crate::runtime::Runtime;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
 use crate::spec::{DataContentType, DataFile, Struct};
 
+// Iceberg field ID for the `file_path` column in position delete files.
+const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2147483546;
+
+fn inferred_referenced_data_file(delete_file: &DataFile) -> Option<String> {
+    let lower = delete_file
+        .lower_bounds
+        .get(&POSITION_DELETE_FILE_PATH_FIELD_ID)?;
+    let upper = delete_file
+        .upper_bounds
+        .get(&POSITION_DELETE_FILE_PATH_FIELD_ID)?;
+
+    if lower != upper {
+        return None;
+    }
+
+    let bytes = lower.to_bytes().ok()?;
+    std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned)
+}
+
 /// Index of delete files
 #[derive(Debug, Clone)]
 pub(crate) struct DeleteFileIndex {
@@ -195,19 +214,22 @@ impl PopulatedDeleteFileIndex {
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
 
-        // TODO: the spec states that:
-        //     "The data file's file_path is equal to the delete file's referenced_data_file if it is non-null".
-        //     we're not yet doing that here. The referenced data file's name will also be present in the positional
-        //     delete file's file path column.
         if let Some(deletes) = self.pos_deletes_by_partition.get(data_file.partition()) {
             deletes
                 .iter()
                 // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
                 .filter(|&delete| {
+                    let delete_file = delete.manifest_entry.data_file();
+                    let referenced_data_file_matches = delete_file
+                        .referenced_data_file()
+                        .or_else(|| inferred_referenced_data_file(delete_file))
+                        .is_none_or(|path| path == data_file.file_path());
+
                     seq_num
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                        && referenced_data_file_matches
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -222,8 +244,8 @@ mod tests {
 
     use super::*;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus,
-        Struct,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
+        ManifestStatus, Struct,
     };
 
     #[test]
@@ -444,7 +466,6 @@ mod tests {
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::PositionDeletes)
             .record_count(1)
-            .referenced_data_file(Some("/some-data-file.parquet".to_string()))
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
@@ -484,5 +505,79 @@ mod tests {
             .sequence_number(data_seq_number)
             .data_file(file.clone())
             .build()
+    }
+
+    #[test]
+    fn test_position_delete_referenced_data_file_pruning() {
+        let data_file = build_unpartitioned_data_file();
+        let other_data_file = build_unpartitioned_data_file();
+        let targeted_delete = DataFileBuilder::default()
+            .file_path("targeted-delete.puffin".to_string())
+            .file_format(DataFileFormat::Puffin)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(Some(data_file.file_path().to_string()))
+            .content_offset(Some(17))
+            .content_size_in_bytes(Some(23))
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+        let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(1, &targeted_delete).into(),
+            partition_spec_id: 0,
+        }]);
+
+        let deletes = index.get_deletes_for_data_file(&data_file, Some(0));
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].file_format, DataFileFormat::Puffin);
+        assert_eq!(
+            deletes[0].referenced_data_file.as_deref(),
+            Some(data_file.file_path())
+        );
+        assert_eq!(deletes[0].content_offset, Some(17));
+        assert_eq!(deletes[0].content_size_in_bytes, Some(23));
+        assert!(
+            index
+                .get_deletes_for_data_file(&other_data_file, Some(0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_position_delete_single_path_bounds_pruning() {
+        let data_file = build_unpartitioned_data_file();
+        let other_data_file = build_unpartitioned_data_file();
+        let path = Datum::string(data_file.file_path());
+        let bounded_delete = DataFileBuilder::default()
+            .file_path("bounded-delete.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .lower_bounds(HashMap::from([(
+                POSITION_DELETE_FILE_PATH_FIELD_ID,
+                path.clone(),
+            )]))
+            .upper_bounds(HashMap::from([(POSITION_DELETE_FILE_PATH_FIELD_ID, path)]))
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+        let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
+            manifest_entry: build_added_manifest_entry(1, &bounded_delete).into(),
+            partition_spec_id: 0,
+        }]);
+
+        assert_eq!(
+            index.get_deletes_for_data_file(&data_file, Some(0)).len(),
+            1
+        );
+        assert!(
+            index
+                .get_deletes_for_data_file(&other_data_file, Some(0))
+                .is_empty()
+        );
     }
 }
