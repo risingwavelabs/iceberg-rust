@@ -201,6 +201,10 @@ impl DataFile {
     pub fn partition(&self) -> &Struct {
         &self.partition
     }
+    /// Replaces the partition tuple of this data file.
+    pub fn set_partition(&mut self, partition: Struct) {
+        self.partition = partition;
+    }
     /// Get the record count in the data file.
     pub fn record_count(&self) -> u64 {
         self.record_count
@@ -415,7 +419,8 @@ impl std::fmt::Display for DataFileFormat {
 
 #[cfg(test)]
 mod test {
-    use crate::spec::DataContentType;
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+
     #[test]
     fn test_data_content_type_default() {
         assert_eq!(DataContentType::default(), DataContentType::Data);
@@ -424,5 +429,23 @@ mod test {
     #[test]
     fn test_data_content_type_default_value() {
         assert_eq!(DataContentType::default() as i32, 0);
+    }
+
+    #[test]
+    fn test_set_partition() {
+        let mut data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("s3://bucket/data.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter([Some(Literal::long(42))]);
+
+        data_file.set_partition(partition.clone());
+
+        assert_eq!(data_file.partition(), &partition);
     }
 }
