@@ -689,6 +689,14 @@ pub fn iceberg::inspect::SnapshotsTable<'a>::new(table: &'a iceberg::table::Tabl
 pub async fn iceberg::inspect::SnapshotsTable<'a>::scan(&self) -> iceberg::Result<iceberg::scan::ArrowRecordBatchStream>
 pub fn iceberg::inspect::SnapshotsTable<'a>::schema(&self) -> iceberg::spec::Schema
 pub mod iceberg::io
+pub mod iceberg::io::object_cache
+pub struct iceberg::io::object_cache::ObjectCache
+impl iceberg::io::object_cache::ObjectCache
+pub async fn iceberg::io::object_cache::ObjectCache::get_manifest_list(&self, snapshot: &iceberg::spec::SnapshotRef, table_metadata: &iceberg::spec::TableMetadataRef) -> iceberg::Result<alloc::sync::Arc<iceberg::spec::ManifestList>>
+impl core::clone::Clone for iceberg::io::object_cache::ObjectCache
+pub fn iceberg::io::object_cache::ObjectCache::clone(&self) -> iceberg::io::object_cache::ObjectCache
+impl core::fmt::Debug for iceberg::io::object_cache::ObjectCache
+pub fn iceberg::io::object_cache::ObjectCache::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::io::AzdlsConfig
 pub iceberg::io::AzdlsConfig::account_key: core::option::Option<alloc::string::String>
 pub iceberg::io::AzdlsConfig::account_name: core::option::Option<alloc::string::String>
@@ -1833,6 +1841,7 @@ pub fn iceberg::spec::DataFile::null_value_counts(&self) -> &std::collections::h
 pub fn iceberg::spec::DataFile::partition(&self) -> &iceberg::spec::Struct
 pub fn iceberg::spec::DataFile::record_count(&self) -> u64
 pub fn iceberg::spec::DataFile::referenced_data_file(&self) -> core::option::Option<alloc::string::String>
+pub fn iceberg::spec::DataFile::set_partition(&mut self, partition: iceberg::spec::Struct)
 pub fn iceberg::spec::DataFile::sort_order_id(&self) -> core::option::Option<i32>
 pub fn iceberg::spec::DataFile::split_offsets(&self) -> core::option::Option<&[i64]>
 pub fn iceberg::spec::DataFile::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
@@ -3113,9 +3122,11 @@ pub fn iceberg::table::Table::metadata(&self) -> &iceberg::spec::TableMetadata
 pub fn iceberg::table::Table::metadata_location(&self) -> core::option::Option<&str>
 pub fn iceberg::table::Table::metadata_location_result(&self) -> iceberg::Result<&str>
 pub fn iceberg::table::Table::metadata_ref(&self) -> iceberg::spec::TableMetadataRef
+pub fn iceberg::table::Table::object_cache(&self) -> alloc::sync::Arc<iceberg::io::object_cache::ObjectCache>
 pub fn iceberg::table::Table::reader_builder(&self) -> iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::table::Table::readonly(&self) -> bool
 pub fn iceberg::table::Table::scan(&self) -> iceberg::scan::TableScanBuilder<'_>
+pub fn iceberg::table::Table::with_object_cache(self, object_cache: alloc::sync::Arc<iceberg::io::object_cache::ObjectCache>) -> Self
 impl core::clone::Clone for iceberg::table::Table
 pub fn iceberg::table::Table::clone(&self) -> iceberg::table::Table
 impl core::fmt::Debug for iceberg::table::Table

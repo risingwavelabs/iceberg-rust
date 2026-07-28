@@ -260,9 +260,19 @@ impl Table {
         &self.file_io
     }
 
-    /// Returns this table's object cache
-    pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
+    /// Returns this table's object cache.
+    pub fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Returns a new [`Table`] instance sharing entries with the provided object cache.
+    ///
+    /// The returned table retains its own file IO and encryption context for cache misses.
+    pub fn with_object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
+        self.object_cache = Arc::new(
+            object_cache.share_entries_with(self.file_io.clone(), self.encryption_manager.clone()),
+        );
+        self
     }
 
     /// Returns the [`EncryptionManager`] for this table, if encryption is
