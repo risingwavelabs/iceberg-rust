@@ -42,6 +42,7 @@ use crate::runtime::Runtime;
 use crate::spec::{DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, NameMapping, SnapshotRef};
 use crate::table::Table;
 use crate::util::available_parallelism;
+use crate::util::snapshot::ancestors_of;
 use crate::{Error, ErrorKind, Result};
 
 /// A stream of arrow [`RecordBatch`]es.
@@ -53,6 +54,10 @@ pub struct TableScanBuilder<'a> {
     // Defaults to none which means select all columns
     column_names: Option<Vec<String>>,
     snapshot_id: Option<i64>,
+    // Exclusive lower bound for an incremental scan.
+    from_snapshot_id: Option<i64>,
+    // Inclusive upper bound for an incremental scan.
+    to_snapshot_id: Option<i64>,
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
@@ -71,6 +76,8 @@ impl<'a> TableScanBuilder<'a> {
             table,
             column_names: None,
             snapshot_id: None,
+            from_snapshot_id: None,
+            to_snapshot_id: None,
             batch_size: None,
             case_sensitive: true,
             filter: None,
@@ -132,6 +139,24 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Set the exclusive starting snapshot for an incremental scan.
+    ///
+    /// [`Self::to_snapshot_id`] must also be set.
+    pub fn from_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.from_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Set the inclusive ending snapshot for an incremental scan.
+    ///
+    /// The scan plans data files added by append and overwrite snapshots in
+    /// `(from_snapshot_id, to_snapshot_id]`. Delete files and replace
+    /// snapshots are not returned.
+    pub fn to_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.to_snapshot_id = Some(snapshot_id);
+        self
+    }
+
     /// Sets the concurrency limit for both manifest files and manifest
     /// entries for this scan
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
@@ -187,7 +212,33 @@ impl<'a> TableScanBuilder<'a> {
 
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
-        let snapshot = match self.snapshot_id {
+        let incremental_scan = match (self.from_snapshot_id, self.to_snapshot_id) {
+            (Some(_), None) => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Incremental scan requires to_snapshot_id to be set",
+                ));
+            }
+            (from_snapshot_id, Some(to_snapshot_id)) => {
+                if self.snapshot_id.is_some() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "snapshot_id cannot be combined with an incremental scan",
+                    ));
+                }
+                Some(IncrementalScanRange {
+                    from_snapshot_id,
+                    to_snapshot_id,
+                })
+            }
+            (None, None) => None,
+        };
+
+        let selected_snapshot_id = incremental_scan
+            .as_ref()
+            .map(|range| range.to_snapshot_id)
+            .or(self.snapshot_id);
+        let snapshot = match selected_snapshot_id {
             Some(snapshot_id) => self
                 .table
                 .metadata()
@@ -217,6 +268,20 @@ impl<'a> TableScanBuilder<'a> {
                 current_snapshot_id.clone()
             }
         };
+
+        if let Some(incremental_scan) = &incremental_scan
+            && let Some(from_snapshot_id) = incremental_scan.from_snapshot_id
+            && !ancestors_of(&self.table.metadata_ref(), incremental_scan.to_snapshot_id)
+                .any(|snapshot| snapshot.snapshot_id() == from_snapshot_id)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Snapshot with id {from_snapshot_id} is not an ancestor of snapshot {}",
+                    incremental_scan.to_snapshot_id
+                ),
+            ));
+        }
 
         let schema = snapshot.schema(self.table.metadata())?;
 
@@ -313,6 +378,7 @@ impl<'a> TableScanBuilder<'a> {
             partition_filter_cache: Arc::new(PartitionFilterCache::new()),
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
+            incremental_scan,
         };
 
         Ok(TableScan {
@@ -384,12 +450,14 @@ impl TableScan {
         // get the [`ManifestFile`]s from the [`ManifestList`], filtering out any
         // whose partitions cannot match this
         // scan's filter
-        let manifest_file_contexts = plan_context.build_manifest_file_contexts(
-            manifest_list,
-            manifest_entry_data_ctx_tx,
-            delete_file_idx.clone(),
-            manifest_entry_delete_ctx_tx,
-        )?;
+        let manifest_file_contexts = plan_context
+            .build_manifest_file_contexts(
+                manifest_list,
+                manifest_entry_data_ctx_tx,
+                delete_file_idx.clone(),
+                manifest_entry_delete_ctx_tx,
+            )
+            .await?;
 
         let mut channel_for_manifest_error = file_scan_task_tx.clone();
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
@@ -651,7 +719,7 @@ pub mod tests {
     use crate::scan::FileScanTask;
     use crate::spec::{
         DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, DataFileBuilder, DataFileFormat, Datum,
-        Literal, MAIN_BRANCH, ManifestEntry, ManifestListWriter, ManifestStatus,
+        Literal, MAIN_BRANCH, ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus,
         ManifestWriterBuilder, NestedField, Operation, PartitionSpec, PrimitiveType, Schema,
         Snapshot, Struct, StructType, Summary, TableMetadata, TableMetadataBuilder, Type,
         UnboundPartitionSpec,
@@ -871,6 +939,95 @@ pub mod tests {
                     Uuid::new_v4()
                 ))
                 .unwrap()
+        }
+
+        pub async fn add_snapshot_with_data_file(
+            &mut self,
+            snapshot_id: i64,
+            operation: Operation,
+            manifests: &mut Vec<ManifestFile>,
+        ) {
+            let metadata = self.table.metadata();
+            let schema = metadata.current_schema();
+            let partition_spec = metadata.default_partition_spec();
+            let parent_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
+            let sequence_number = metadata.last_sequence_number() + 1;
+
+            let mut manifest_writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(snapshot_id),
+                schema.clone(),
+                partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+            manifest_writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(partition_spec.spec_id())
+                                .content(DataContentType::Data)
+                                .file_path(format!(
+                                    "{}/data/{snapshot_id}.parquet",
+                                    self.table_location
+                                ))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(100)
+                                .record_count(1)
+                                .partition(Struct::from_iter([Some(Literal::long(snapshot_id))]))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+            let mut manifest = manifest_writer.write_manifest_file().await.unwrap();
+            manifest.sequence_number = sequence_number;
+            manifest.min_sequence_number = sequence_number;
+            manifests.push(manifest);
+
+            let manifest_list_path =
+                format!("{}/metadata/snap-{snapshot_id}.avro", self.table_location);
+            let manifest_list_writer = self
+                .table
+                .file_io()
+                .new_output(&manifest_list_path)
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
+            let mut manifest_list_writer = ManifestListWriter::v2(
+                manifest_list_writer,
+                snapshot_id,
+                parent_snapshot_id,
+                sequence_number,
+            );
+            manifest_list_writer
+                .add_manifests(manifests.iter().cloned())
+                .unwrap();
+            manifest_list_writer.close().await.unwrap();
+
+            let snapshot = Snapshot::builder()
+                .with_snapshot_id(snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(sequence_number)
+                .with_timestamp_ms(metadata.last_updated_ms + 1)
+                .with_schema_id(metadata.current_schema_id())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(Summary {
+                    operation,
+                    additional_properties: HashMap::new(),
+                })
+                .build();
+            let metadata =
+                TableMetadataBuilder::new_from_metadata(self.table.metadata().clone(), None)
+                    .set_branch_snapshot(snapshot, MAIN_BRANCH)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata;
+            self.table = self.table.clone().with_metadata(Arc::new(metadata));
         }
 
         pub async fn setup_manifest_files(&mut self) {
@@ -1687,6 +1844,114 @@ pub mod tests {
             table_scan.snapshot().unwrap().snapshot_id(),
             3051729675574597004
         );
+    }
+
+    #[test]
+    fn test_incremental_scan_requires_to_snapshot() {
+        let table = TableTestFixture::new().table;
+
+        let error = table
+            .scan()
+            .from_snapshot_id(3051729675574597004)
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("requires to_snapshot_id"));
+    }
+
+    #[test]
+    fn test_incremental_scan_rejects_snapshot_id() {
+        let table = TableTestFixture::new().table;
+
+        let error = table
+            .scan()
+            .snapshot_id(3051729675574597004)
+            .to_snapshot_id(3051729675574597004)
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_incremental_scan_rejects_non_ancestor() {
+        let table = TableTestFixture::new().table;
+
+        let error = table
+            .scan()
+            .from_snapshot_id(999)
+            .to_snapshot_id(3051729675574597004)
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("is not an ancestor"));
+    }
+
+    #[tokio::test]
+    async fn test_incremental_scan_plans_each_added_file_once() {
+        let mut fixture = TableTestFixture::new_empty();
+        let mut manifests = Vec::new();
+        fixture
+            .add_snapshot_with_data_file(101, Operation::Append, &mut manifests)
+            .await;
+        fixture
+            .add_snapshot_with_data_file(102, Operation::Append, &mut manifests)
+            .await;
+        fixture
+            .add_snapshot_with_data_file(103, Operation::Overwrite, &mut manifests)
+            .await;
+
+        let scan = fixture
+            .table
+            .scan()
+            .from_snapshot_id(101)
+            .to_snapshot_id(103)
+            .build()
+            .unwrap();
+        assert_eq!(scan.snapshot().unwrap().snapshot_id(), 103);
+
+        let mut paths = scan
+            .plan_files()
+            .await
+            .unwrap()
+            .map_ok(|task| task.data_file_path)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        paths.sort();
+
+        assert_eq!(paths, vec![
+            format!("{}/data/102.parquet", fixture.table_location),
+            format!("{}/data/103.parquet", fixture.table_location),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_scan_ignores_replace_snapshots() {
+        let mut fixture = TableTestFixture::new_empty();
+        let mut manifests = Vec::new();
+        fixture
+            .add_snapshot_with_data_file(101, Operation::Append, &mut manifests)
+            .await;
+        fixture
+            .add_snapshot_with_data_file(102, Operation::Replace, &mut manifests)
+            .await;
+
+        let tasks = fixture
+            .table
+            .scan()
+            .from_snapshot_id(101)
+            .to_snapshot_id(102)
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(tasks.is_empty());
     }
 
     fn table_with_property(key: &str, value: &str) -> Table {

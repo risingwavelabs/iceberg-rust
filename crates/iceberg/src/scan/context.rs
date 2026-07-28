@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::channel::mpsc::Sender;
@@ -28,10 +29,41 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
-    PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadataRef,
+    DataContentType, ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList,
+    ManifestStatus, NameMapping, Operation, PartitionSpecRef, SchemaRef, SnapshotRef,
+    TableMetadataRef,
 };
+use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, Result};
+
+#[derive(Clone, Debug)]
+pub(crate) struct IncrementalScanRange {
+    pub(crate) from_snapshot_id: Option<i64>,
+    pub(crate) to_snapshot_id: i64,
+}
+
+#[derive(Clone, Default)]
+enum ManifestEntryFilter {
+    #[default]
+    All,
+    IncrementalAddedData(Arc<HashSet<i64>>),
+}
+
+impl ManifestEntryFilter {
+    fn matches(&self, entry: &ManifestEntryRef) -> bool {
+        match self {
+            Self::All => true,
+            Self::IncrementalAddedData(snapshot_ids) => {
+                entry.status() == ManifestStatus::Added
+                    && entry.data_file().content_type() == DataContentType::Data
+                    && entry
+                        .snapshot_id()
+                        .map(|id| snapshot_ids.contains(&id))
+                        .unwrap_or(true)
+            }
+        }
+    }
+}
 
 /// Wraps a [`ManifestFile`] alongside the objects that are needed
 /// to process it in a thread-safe manner
@@ -49,6 +81,7 @@ pub(crate) struct ManifestFileContext {
     name_mapping: Option<Arc<NameMapping>>,
     case_sensitive: bool,
     partition_spec: Option<PartitionSpecRef>,
+    entry_filter: ManifestEntryFilter,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -83,11 +116,16 @@ impl ManifestFileContext {
             name_mapping,
             case_sensitive,
             partition_spec,
+            entry_filter,
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
 
-        for manifest_entry in manifest.entries() {
+        for manifest_entry in manifest
+            .entries()
+            .iter()
+            .filter(|entry| entry_filter.matches(entry))
+        {
             let manifest_entry_context = ManifestEntryContext {
                 // TODO: refactor to avoid the expensive ManifestEntry clone
                 manifest_entry: manifest_entry.clone(),
@@ -165,6 +203,7 @@ pub(crate) struct PlanContext {
     pub partition_filter_cache: Arc<PartitionFilterCache>,
     pub manifest_evaluator_cache: Arc<ManifestEvaluatorCache>,
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
+    pub incremental_scan: Option<IncrementalScanRange>,
 }
 
 impl PlanContext {
@@ -198,14 +237,67 @@ impl PlanContext {
         Ok(partition_filter)
     }
 
-    pub(crate) fn build_manifest_file_contexts(
+    pub(crate) async fn build_manifest_file_contexts(
         &self,
         manifest_list: Arc<ManifestList>,
         tx_data: Sender<ManifestEntryContext>,
         delete_file_idx: DeleteFileIndex,
         delete_file_tx: Sender<ManifestEntryContext>,
     ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
-        let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
+        let (mut manifest_files, entry_filter) =
+            if let Some(incremental_scan) = &self.incremental_scan {
+                let snapshots = ancestors_between(
+                    &self.table_metadata,
+                    incremental_scan.to_snapshot_id,
+                    incremental_scan.from_snapshot_id,
+                )
+                .filter(|snapshot| {
+                    matches!(
+                        snapshot.summary().operation,
+                        Operation::Append | Operation::Overwrite
+                    )
+                })
+                .collect::<Vec<_>>();
+                let snapshot_ids = Arc::new(
+                    snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.snapshot_id())
+                        .collect::<HashSet<_>>(),
+                );
+
+                let mut manifest_files = Vec::new();
+                let mut manifest_paths = HashSet::new();
+                for snapshot in snapshots {
+                    let snapshot_manifest_list =
+                        if snapshot.snapshot_id() == self.snapshot.snapshot_id() {
+                            manifest_list.clone()
+                        } else {
+                            self.object_cache
+                                .get_manifest_list(&snapshot, &self.table_metadata)
+                                .await?
+                        };
+
+                    manifest_files.extend(
+                        snapshot_manifest_list
+                            .entries()
+                            .iter()
+                            .filter(|manifest| {
+                                manifest.content == ManifestContentType::Data
+                                    && manifest.added_snapshot_id == snapshot.snapshot_id()
+                                    && manifest_paths.insert(manifest.manifest_path.clone())
+                            })
+                            .cloned(),
+                    );
+                }
+
+                (
+                    manifest_files,
+                    ManifestEntryFilter::IncrementalAddedData(snapshot_ids),
+                )
+            } else {
+                (manifest_list.entries().to_vec(), ManifestEntryFilter::All)
+            };
+
         // Sort manifest files to process delete manifests first.
         // This avoids a deadlock where the producer blocks on sending data manifest entries
         // (because the data channel is full) while the delete manifest consumer is waiting
@@ -219,7 +311,7 @@ impl PlanContext {
 
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
-        for manifest_file in manifest_files {
+        for manifest_file in &manifest_files {
             let tx = if manifest_file.content == ManifestContentType::Deletes {
                 delete_file_tx.clone()
             } else {
@@ -252,6 +344,7 @@ impl PlanContext {
                 partition_bound_predicate,
                 tx,
                 delete_file_idx.clone(),
+                entry_filter.clone(),
             );
 
             filtered_mfcs.push(Ok(mfc));
@@ -266,6 +359,7 @@ impl PlanContext {
         partition_filter: Option<Arc<BoundPredicate>>,
         sender: Sender<ManifestEntryContext>,
         delete_file_index: DeleteFileIndex,
+        entry_filter: ManifestEntryFilter,
     ) -> ManifestFileContext {
         let bound_predicates =
             if let (Some(ref partition_bound_predicate), Some(snapshot_bound_predicate)) =
@@ -294,6 +388,7 @@ impl PlanContext {
                 .table_metadata
                 .partition_spec_by_id(manifest_file.partition_spec_id)
                 .cloned(),
+            entry_filter,
         }
     }
 }
