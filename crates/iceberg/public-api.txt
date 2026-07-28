@@ -1350,10 +1350,12 @@ pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) ->
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
+pub fn iceberg::scan::TableScanBuilder<'a>::from_snapshot_id(self, snapshot_id: i64) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_empty(self) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::snapshot_id(self, snapshot_id: i64) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::to_snapshot_id(self, snapshot_id: i64) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_batch_size(self, batch_size: core::option::Option<usize>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_case_sensitive(self, case_sensitive: bool) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_concurrency_limit(self, limit: usize) -> Self
@@ -2405,6 +2407,16 @@ pub fn iceberg::spec::SchemaBuilder::with_identifier_field_ids(self, ids: impl c
 pub fn iceberg::spec::SchemaBuilder::with_schema_id(self, schema_id: i32) -> Self
 impl core::fmt::Debug for iceberg::spec::SchemaBuilder
 pub fn iceberg::spec::SchemaBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::spec::SerializedDataFile(_)
+impl iceberg::spec::SerializedDataFile
+pub fn iceberg::spec::SerializedDataFile::try_from(data_file: iceberg::spec::DataFile, partition_type: &iceberg::spec::StructType, format_version: iceberg::spec::FormatVersion) -> iceberg::Result<Self>
+pub fn iceberg::spec::SerializedDataFile::try_into(self, partition_spec_id: i32, partition_type: &iceberg::spec::StructType, schema: &iceberg::spec::Schema) -> iceberg::Result<iceberg::spec::DataFile>
+impl core::clone::Clone for iceberg::spec::SerializedDataFile
+pub fn iceberg::spec::SerializedDataFile::clone(&self) -> iceberg::spec::SerializedDataFile
+impl serde_core::ser::Serialize for iceberg::spec::SerializedDataFile
+pub fn iceberg::spec::SerializedDataFile::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for iceberg::spec::SerializedDataFile
+pub fn iceberg::spec::SerializedDataFile::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::spec::Snapshot
 impl iceberg::spec::Snapshot
 pub fn iceberg::spec::Snapshot::added_rows_count(&self) -> core::option::Option<u64>
