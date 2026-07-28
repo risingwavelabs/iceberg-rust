@@ -803,6 +803,14 @@ impl<'a> SnapshotProducer<'a> {
         self.new_data_file_sequence_number = Some(sequence_number);
     }
 
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub(crate) fn set_snapshot_properties(&mut self, snapshot_properties: HashMap<String, String>) {
+        self.snapshot_properties = snapshot_properties;
+    }
+
     pub(crate) fn set_target_branch(&mut self, target_branch: String) {
         self.target_branch = target_branch;
     }

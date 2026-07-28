@@ -3228,6 +3228,19 @@ pub struct iceberg::transaction::ManifestWriterContext
 impl iceberg::transaction::ManifestWriterContext
 pub fn iceberg::transaction::ManifestWriterContext::new(metadata_location: alloc::string::String, commit_uuid: uuid::Uuid, manifest_counter: alloc::sync::Arc<core::sync::atomic::AtomicU64>, format_version: iceberg::spec::FormatVersion, snapshot_id: i64, file_io: iceberg::io::FileIO, encryption_manager: core::option::Option<alloc::sync::Arc<iceberg::encryption::EncryptionManager>>) -> Self
 pub fn iceberg::transaction::ManifestWriterContext::new_manifest_writer(&self, content_type: iceberg::spec::ManifestContentType, table_schema: &iceberg::spec::Schema, partition_spec: &iceberg::spec::PartitionSpec) -> iceberg::Result<iceberg::spec::ManifestWriter>
+pub struct iceberg::transaction::RewriteManifestsAction
+impl iceberg::transaction::RewriteManifestsAction
+pub fn iceberg::transaction::RewriteManifestsAction::add_manifest(self, manifest: iceberg::spec::ManifestFile) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::cluster_by(self, func: alloc::boxed::Box<(dyn core::ops::function::Fn(&iceberg::spec::DataFile) -> alloc::string::String + core::marker::Send + core::marker::Sync)>) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::delete_manifest(self, manifest: iceberg::spec::ManifestFile) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::new() -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::rewrite_if(self, predicate: alloc::boxed::Box<(dyn core::ops::function::Fn(&iceberg::spec::ManifestFile) -> bool + core::marker::Send + core::marker::Sync)>) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_id(self, snapshot_id: i64) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_properties(self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::set_target_branch(self, target_branch: alloc::string::String) -> Self
+impl core::default::Default for iceberg::transaction::RewriteManifestsAction
+pub fn iceberg::transaction::RewriteManifestsAction::default() -> Self
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
@@ -3237,6 +3250,7 @@ pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> 
 pub fn iceberg::transaction::Transaction::overwrite_files(&self) -> iceberg::transaction::OverwriteFilesAction
 pub fn iceberg::transaction::Transaction::replace_sort_order(&self) -> iceberg::transaction::sort_order::ReplaceSortOrderAction
 pub fn iceberg::transaction::Transaction::rewrite_files(&self) -> iceberg::transaction::RewriteFilesAction
+pub fn iceberg::transaction::Transaction::rewrite_manifests(&self) -> iceberg::transaction::RewriteManifestsAction
 pub fn iceberg::transaction::Transaction::update_location(&self) -> iceberg::transaction::update_location::UpdateLocationAction
 pub fn iceberg::transaction::Transaction::update_schema(&self) -> iceberg::transaction::update_schema::UpdateSchemaAction
 pub fn iceberg::transaction::Transaction::update_statistics(&self) -> iceberg::transaction::update_statistics::UpdateStatisticsAction
@@ -3244,6 +3258,12 @@ pub fn iceberg::transaction::Transaction::update_table_properties(&self) -> iceb
 pub fn iceberg::transaction::Transaction::upgrade_table_version(&self) -> iceberg::transaction::upgrade_format_version::UpgradeFormatVersionAction
 impl core::clone::Clone for iceberg::transaction::Transaction
 pub fn iceberg::transaction::Transaction::clone(&self) -> iceberg::transaction::Transaction
+pub const iceberg::transaction::MANIFEST_MERGE_ENABLED: &str
+pub const iceberg::transaction::MANIFEST_MERGE_ENABLED_DEFAULT: bool
+pub const iceberg::transaction::MANIFEST_MIN_MERGE_COUNT: &str
+pub const iceberg::transaction::MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32
+pub const iceberg::transaction::MANIFEST_TARGET_SIZE_BYTES: &str
+pub const iceberg::transaction::MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32
 pub trait iceberg::transaction::ApplyTransactionAction
 pub fn iceberg::transaction::ApplyTransactionAction::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction>
 impl<T: TransactionAction + 'static> iceberg::transaction::ApplyTransactionAction for T

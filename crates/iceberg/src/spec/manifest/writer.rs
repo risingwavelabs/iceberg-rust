@@ -215,7 +215,82 @@ pub struct ManifestWriter {
 
     manifest_entries: Vec<ManifestEntry>,
 
+    /// Running estimate of the serialized Avro footprint of accumulated entries.
+    estimated_size: u64,
+
     metadata: ManifestMetadata,
+}
+
+fn datum_serialized_len(datum: &Datum) -> u64 {
+    match datum.literal() {
+        PrimitiveLiteral::Boolean(_) => 1,
+        PrimitiveLiteral::Int(_) => 4,
+        PrimitiveLiteral::Long(_) => 8,
+        PrimitiveLiteral::Float(_) => 4,
+        PrimitiveLiteral::Double(_) => 8,
+        PrimitiveLiteral::String(value) => value.len() as u64,
+        PrimitiveLiteral::Binary(value) => value.len() as u64,
+        PrimitiveLiteral::UInt128(_) => 16,
+        PrimitiveLiteral::Int128(value) => {
+            let bytes = value.to_be_bytes();
+            let is_negative = *value < 0;
+            let sign_byte = if is_negative { 0xff } else { 0x00 };
+            let mut start = 0;
+            while start < 15 && bytes[start] == sign_byte {
+                let next_is_negative = bytes[start + 1] & 0x80 != 0;
+                if next_is_negative == is_negative {
+                    start += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let minimal_len = (16 - start) as u64;
+            let max_len = match datum.data_type() {
+                PrimitiveType::Decimal { precision, .. } => {
+                    crate::spec::Type::decimal_required_bytes(*precision)
+                        .map(|size| size as u64)
+                        .unwrap_or(16)
+                }
+                _ => 16,
+            };
+            minimal_len.min(max_len)
+        }
+        PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => 0,
+    }
+}
+
+/// Cheap estimate of one manifest entry's uncompressed Avro footprint.
+///
+/// This tracks the dominant variable-width values and uses calibrated framing
+/// constants. Rewrite operations only need a monotonic signal near the target
+/// size, not an exact serialization.
+fn estimate_manifest_entry_size(entry: &ManifestEntry) -> u64 {
+    const FIXED_ENTRY_OVERHEAD: u64 = 80;
+    const PER_COUNT_KV: u64 = 4;
+    const PER_BOUND_KV_OVERHEAD: u64 = 4;
+
+    let file = &entry.data_file;
+    let mut size = FIXED_ENTRY_OVERHEAD + file.file_path.len() as u64 + 2;
+    size += (file.column_sizes.len()
+        + file.value_counts.len()
+        + file.null_value_counts.len()
+        + file.nan_value_counts.len()) as u64
+        * PER_COUNT_KV;
+    size += (file.lower_bounds.len() + file.upper_bounds.len()) as u64 * PER_BOUND_KV_OVERHEAD;
+    size += file
+        .lower_bounds
+        .values()
+        .chain(file.upper_bounds.values())
+        .map(datum_serialized_len)
+        .sum::<u64>();
+    if let Some(key_metadata) = &file.key_metadata {
+        size += key_metadata.len() as u64;
+    }
+    if let Some(split_offsets) = &file.split_offsets {
+        size += split_offsets.len() as u64 * 8;
+    }
+    size
 }
 
 impl ManifestWriter {
@@ -242,8 +317,14 @@ impl ManifestWriter {
             min_seq_num: None,
             key_metadata,
             manifest_entries: Vec::new(),
+            estimated_size: 0,
             metadata,
         }
+    }
+
+    /// Approximate serialized size of entries accumulated by this writer.
+    pub(crate) fn estimated_manifest_size(&self) -> u64 {
+        self.estimated_size
     }
 
     fn construct_partition_summaries(
@@ -434,6 +515,7 @@ impl ManifestWriter {
         {
             self.min_seq_num = Some(self.min_seq_num.map_or(seq_num, |v| min(v, seq_num)));
         }
+        self.estimated_size += estimate_manifest_entry_size(&entry);
         self.manifest_entries.push(entry);
         Ok(())
     }
@@ -839,6 +921,165 @@ mod tests {
         assert_eq!(
             actual_manifest.metadata().content,
             ManifestContentType::Deletes,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_estimated_manifest_size_tracks_entries() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "data",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("size_estimate_manifest.avro");
+        let io = FileIO::new_with_fs();
+        let output_file = io.new_output(path.to_str().unwrap()).unwrap();
+        let mut writer =
+            ManifestWriterBuilder::new(output_file, Some(1), schema.clone(), partition_spec)
+                .build_v2_data();
+
+        assert_eq!(writer.estimated_manifest_size(), 0);
+
+        let make_existing = |file_path: &str| ManifestEntry {
+            status: ManifestStatus::Existing,
+            snapshot_id: Some(1),
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: file_path.to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::empty(),
+                record_count: 1,
+                file_size_in_bytes: 1024,
+                column_sizes: HashMap::from([(1, 61), (2, 73)]),
+                value_counts: HashMap::from([(1, 1), (2, 1)]),
+                null_value_counts: HashMap::from([(1, 0), (2, 0)]),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: Some(vec![4]),
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        };
+
+        writer
+            .add_existing_entry(make_existing("s3://b/t/data/0000.parquet"))
+            .unwrap();
+        let after_one = writer.estimated_manifest_size();
+        assert!(after_one > 0);
+
+        writer
+            .add_existing_entry(make_existing("s3://b/t/data/0001.parquet"))
+            .unwrap();
+        assert_eq!(writer.estimated_manifest_size(), after_one * 2);
+    }
+
+    #[tokio::test]
+    async fn test_estimated_size_matches_on_disk_manifest() {
+        const NUM_COLS: i32 = 60;
+        const NUM_ENTRIES: usize = 80;
+
+        let fields: Vec<_> = (1..=NUM_COLS)
+            .map(|id| {
+                Arc::new(NestedField::optional(
+                    id,
+                    format!("c{id}"),
+                    Type::Primitive(PrimitiveType::String),
+                ))
+            })
+            .collect();
+        let schema = Arc::new(Schema::builder().with_fields(fields).build().unwrap());
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("calibration_manifest.avro");
+        let io = FileIO::new_with_fs();
+        let output_file = io.new_output(path.to_str().unwrap()).unwrap();
+        let mut writer =
+            ManifestWriterBuilder::new(output_file, Some(1), schema.clone(), partition_spec)
+                .build_v2_data();
+
+        for i in 0..NUM_ENTRIES {
+            let mut column_sizes = HashMap::new();
+            let mut value_counts = HashMap::new();
+            let mut null_value_counts = HashMap::new();
+            let mut lower_bounds = HashMap::new();
+            let mut upper_bounds = HashMap::new();
+            for id in 1..=NUM_COLS {
+                column_sizes.insert(id, 1234);
+                value_counts.insert(id, 100);
+                null_value_counts.insert(id, 0);
+                lower_bounds.insert(id, Datum::string("abcdefghijklmnop"));
+                upper_bounds.insert(id, Datum::string("abcdefghijklmnop"));
+            }
+            writer
+                .add_existing_entry(ManifestEntry {
+                    status: ManifestStatus::Existing,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    data_file: DataFile {
+                        content: DataContentType::Data,
+                        file_path: format!("s3://bucket/db/table/data/{i:05}-0-abcdef.parquet"),
+                        file_format: DataFileFormat::Parquet,
+                        partition: Struct::empty(),
+                        record_count: 100,
+                        file_size_in_bytes: 123456,
+                        column_sizes,
+                        value_counts,
+                        null_value_counts,
+                        nan_value_counts: HashMap::new(),
+                        lower_bounds,
+                        upper_bounds,
+                        key_metadata: None,
+                        split_offsets: Some(vec![4]),
+                        equality_ids: None,
+                        sort_order_id: None,
+                        partition_spec_id: 0,
+                        first_row_id: None,
+                        referenced_data_file: None,
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                    },
+                })
+                .unwrap();
+        }
+
+        let estimated = writer.estimated_manifest_size();
+        let actual = writer.write_manifest_file().await.unwrap().manifest_length as u64;
+        let ratio = estimated as f64 / actual as f64;
+        assert!(
+            (0.7..=1.4).contains(&ratio),
+            "estimate {estimated} should stay calibrated to actual length {actual}, ratio {ratio:.3}"
         );
     }
 }
