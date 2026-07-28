@@ -33,9 +33,9 @@ use iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::OpenDalStorage;
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
+use crate::{ConfiguredOpenDalStorage, OpenDalStorage};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -50,6 +50,7 @@ pub const SCHEME_ABFSS: &str = "abfss";
 pub const SCHEME_ABFS: &str = "abfs";
 pub const SCHEME_WASBS: &str = "wasbs";
 pub const SCHEME_WASB: &str = "wasb";
+pub const SCHEME_AZBLOB: &str = "azblob";
 pub const SCHEME_HF: &str = "hf";
 
 /// Parse a URL scheme string.
@@ -61,6 +62,7 @@ fn parse_scheme(scheme: &str) -> Result<&'static str> {
         SCHEME_GS | SCHEME_GCS => Ok("gcs"),
         SCHEME_OSS => Ok("oss"),
         SCHEME_ABFSS | SCHEME_ABFS | SCHEME_WASBS | SCHEME_WASB => Ok("azdls"),
+        SCHEME_AZBLOB => Ok("azblob"),
         SCHEME_HF => Ok("hf"),
         s => Err(Error::new(
             ErrorKind::FeatureUnsupported,
@@ -113,6 +115,13 @@ fn build_storage_for_scheme(
         "azdls" => {
             let config = crate::azdls::azdls_config_parse(props.clone())?;
             Ok(OpenDalStorage::Azdls {
+                config: Arc::new(config),
+            })
+        }
+        #[cfg(feature = "opendal-azblob")]
+        "azblob" => {
+            let config = crate::azblob::azblob_config_parse(props.clone());
+            Ok(OpenDalStorage::Azblob {
                 config: Arc::new(config),
             })
         }
@@ -207,7 +216,7 @@ pub struct OpenDalResolvingStorage {
     props: HashMap<String, String>,
     /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
-    storages: RwLock<HashMap<&'static str, Arc<OpenDalStorage>>>,
+    storages: RwLock<HashMap<&'static str, Arc<ConfiguredOpenDalStorage>>>,
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
@@ -217,7 +226,7 @@ pub struct OpenDalResolvingStorage {
 impl OpenDalResolvingStorage {
     /// Resolve the storage for the given path by extracting the canonical scheme and
     /// returning the cached or newly-created [`OpenDalStorage`].
-    fn resolve(&self, path: &str) -> Result<Arc<OpenDalStorage>> {
+    fn resolve(&self, path: &str) -> Result<Arc<ConfiguredOpenDalStorage>> {
         let scheme = extract_scheme(path)?;
 
         // Fast path: check read lock first.
@@ -248,7 +257,8 @@ impl OpenDalResolvingStorage {
             #[cfg(feature = "opendal-s3")]
             &self.customized_credential_load,
         )?;
-        let storage = Arc::new(storage);
+        let config = StorageConfig::from_props(self.props.clone());
+        let storage = Arc::new(ConfiguredOpenDalStorage::new(storage, &config)?);
         cache.insert(scheme, storage.clone());
         Ok(storage)
     }
@@ -378,5 +388,15 @@ mod tests {
             Arc::ptr_eq(&abfss, &abfs),
             "abfss and abfs should share one instance"
         );
+    }
+
+    #[cfg(feature = "opendal-azblob")]
+    #[test]
+    fn test_resolve_azblob() {
+        let storage = empty_resolving_storage();
+        let resolved = storage
+            .resolve("azblob://container/path/to/file.parquet")
+            .unwrap();
+        assert!(matches!(resolved.storage, OpenDalStorage::Azblob { .. }));
     }
 }

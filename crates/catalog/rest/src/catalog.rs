@@ -23,6 +23,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;
@@ -54,6 +55,11 @@ pub const REST_CATALOG_PROP_URI: &str = "uri";
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 /// Disable header redaction in error logs (defaults to false for security)
 pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-redaction";
+
+/// Google Cloud Storage credentials JSON string, plain or base64 encoded.
+pub use iceberg::io::GCS_CREDENTIALS_JSON;
+
+pub(crate) const GCP_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -339,6 +345,21 @@ impl RestCatalogConfig {
             .get(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Returns service-account JSON used to authenticate to BigLake REST.
+    ///
+    /// `gcs.credentials-json` is accepted as either raw JSON or base64-encoded
+    /// JSON because both forms are used by existing Iceberg integrations.
+    pub(crate) fn gcp_credential(&self) -> Option<String> {
+        let value = self.props.get(GCS_CREDENTIALS_JSON)?;
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value)
+            && let Ok(json) = String::from_utf8(decoded)
+            && serde_json::from_str::<serde_json::Value>(&json).is_ok()
+        {
+            return Some(json);
+        }
+        Some(value.clone())
     }
 
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
@@ -1386,6 +1407,73 @@ mod tests {
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
         assert_eq!(token, Some("ey000000000000".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_oauth_refreshes_token_after_unauthorized_response() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let expired_token_mock = server
+            .mock("GET", "/v1/namespaces")
+            .match_header("authorization", "Bearer expired-token")
+            .with_status(401)
+            .with_body(r#"{"error":{"message":"expired","type":"Unauthorized","code":401}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let refresh_oauth_mock =
+            create_oauth_mock_with_path(&mut server, "/v1/oauth/tokens", "refreshed-token", 200)
+                .await;
+        let refreshed_token_mock = server
+            .mock("GET", "/v1/namespaces")
+            .match_header("authorization", "Bearer refreshed-token")
+            .with_status(200)
+            .with_body(r#"{"namespaces":[["default"]]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([
+                    ("token".to_string(), "expired-token".to_string()),
+                    ("credential".to_string(), "client1:secret1".to_string()),
+                ]))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+
+        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
+            NamespaceIdent::new("default".to_string())
+        ]);
+        config_mock.assert_async().await;
+        expired_token_mock.assert_async().await;
+        refresh_oauth_mock.assert_async().await;
+        refreshed_token_mock.assert_async().await;
+        assert_eq!(
+            catalog.context().await.unwrap().client.token().await,
+            Some("refreshed-token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gcp_credential_accepts_plain_and_base64_json() {
+        use base64::Engine as _;
+
+        let json = r#"{"type":"service_account","project_id":"test"}"#;
+        for value in [
+            json.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(json),
+        ] {
+            let config = RestCatalogConfig::builder()
+                .uri("https://biglake.googleapis.com".to_string())
+                .props(HashMap::from([(GCS_CREDENTIALS_JSON.to_string(), value)]))
+                .build();
+            assert_eq!(config.gcp_credential().as_deref(), Some(json));
+        }
     }
 
     #[tokio::test]
