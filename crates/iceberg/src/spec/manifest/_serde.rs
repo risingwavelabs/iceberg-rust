@@ -97,7 +97,7 @@ impl ManifestEntryV1 {
 }
 
 #[serde_as]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct DataFileSerde {
     #[serde(default)]
     content: i32,
@@ -235,7 +235,7 @@ impl DataFileSerde {
 }
 
 #[serde_as]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct BytesEntry {
     key: i32,
@@ -281,7 +281,7 @@ fn to_bytes_entry(v: impl IntoIterator<Item = (i32, Datum)>) -> Result<Vec<Bytes
     Ok(bs)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct I64Entry {
     key: i32,
