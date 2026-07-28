@@ -19,6 +19,8 @@ mod _serde;
 
 mod data_file;
 pub use data_file::*;
+mod serialized_data_file;
+pub use serialized_data_file::*;
 mod entry;
 pub use entry::*;
 mod metadata;
