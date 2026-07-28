@@ -176,6 +176,7 @@ impl ManifestEntryContext {
                     .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
             )
             .with_deletes(deletes)
+            .with_sequence_number(self.manifest_entry.sequence_number().unwrap_or_default())
             .with_partition(Some(self.manifest_entry.data_file.partition.clone()))
             .with_partition_spec(self.partition_spec.clone())
             .with_name_mapping(self.name_mapping)
