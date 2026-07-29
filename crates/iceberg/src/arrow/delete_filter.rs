@@ -31,6 +31,13 @@ use crate::{Error, ErrorKind, Result};
 enum EqDelState {
     Loading(watch::Receiver<Option<EqDelLoadResult>>),
     Loaded(Predicate),
+    /// The load finished with an error. The entry is kept in the cache so that
+    /// consumers arriving after the failure still observe the original error
+    /// (with its `retryable` flag) instead of a generic "missing predicate".
+    /// Retryable failures may be reclaimed by [`DeleteFilter::try_start_eq_del_load`];
+    /// non-retryable failures stay cached to avoid re-reading a file that
+    /// cannot be read successfully.
+    Failed(EqDelLoadError),
 }
 
 type EqDelLoadResult = std::result::Result<Predicate, EqDelLoadError>;
@@ -163,9 +170,16 @@ impl DeleteFilter {
     pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<EqDelLoadGuard> {
         let mut state = self.state.write().unwrap();
 
-        // Skip if already loaded/loading - another task owns it
-        if state.equality_deletes.contains_key(file_path) {
-            return None;
+        match state.equality_deletes.get(file_path) {
+            // Skip if already loaded/loading - another task owns it
+            Some(EqDelState::Loading(_) | EqDelState::Loaded(_)) => return None,
+            // A non-retryable failure is cached: re-reading the file would fail
+            // identically, so keep serving the recorded error instead of
+            // re-issuing doomed reads.
+            Some(EqDelState::Failed(error)) if !error.retryable => return None,
+            // A retryable failure may be reclaimed so that this attempt can
+            // retry the load.
+            Some(EqDelState::Failed(_)) | None => {}
         }
 
         // Mark as loading to prevent duplicate work
@@ -234,6 +248,9 @@ impl DeleteFilter {
                 Some(EqDelState::Loading(receiver)) => receiver.clone(),
                 Some(EqDelState::Loaded(predicate)) => {
                     return Ok(Some(predicate.clone()));
+                }
+                Some(EqDelState::Failed(error)) => {
+                    return Err(error.clone().into_error(file_path));
                 }
             }
         };
@@ -320,7 +337,14 @@ impl DeleteFilter {
         sender: &watch::Sender<Option<EqDelLoadResult>>,
         result: EqDelLoadResult,
     ) {
-        let mut state = self.state.write().unwrap();
+        // This runs from `EqDelLoadGuard::drop` as well, so it must not panic on a
+        // poisoned lock: panicking while unwinding would abort the process. The
+        // guarded state stays consistent under poison recovery because the update
+        // below is a plain map insert.
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &result {
             Ok(predicate) => {
                 state.equality_deletes.insert(
@@ -328,8 +352,11 @@ impl DeleteFilter {
                     EqDelState::Loaded(predicate.clone()),
                 );
             }
-            Err(_) => {
-                state.equality_deletes.remove(delete_file_path);
+            Err(error) => {
+                state.equality_deletes.insert(
+                    delete_file_path.to_string(),
+                    EqDelState::Failed(error.clone()),
+                );
             }
         }
         sender.send_replace(Some(result));
@@ -418,6 +445,42 @@ pub(crate) mod tests {
                 .is_some(),
             "dropping an in-flight load must not leave a stale Loading entry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_late_consumers_observe_original_error_and_non_retryable_failures_are_cached() {
+        let filter = DeleteFilter::default();
+        let load_guard = filter.try_start_eq_del_load("eq-del.parquet").unwrap();
+
+        // Fail with a non-retryable error before any waiter registers.
+        let load_error = Error::new(ErrorKind::DataInvalid, "malformed equality delete file");
+        assert!(!load_error.retryable());
+        load_guard.fail(&load_error);
+
+        // A consumer arriving only after the failure (it never observed the
+        // `Loading` state) must still receive the original error with its
+        // retryable flag, not a generic "missing predicate" error.
+        let error = filter
+            .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
+            .await
+            .expect_err("cached equality delete failure should propagate");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(error.message(), "malformed equality delete file");
+        assert!(!error.retryable());
+
+        // Non-retryable failures are cached: re-reading the file would fail
+        // identically, so no new load may be claimed.
+        assert!(
+            filter.try_start_eq_del_load("eq-del.parquet").is_none(),
+            "non-retryable failures must not be reloaded"
+        );
+
+        // The cached error keeps being served on subsequent lookups.
+        let error = filter
+            .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
+            .await
+            .expect_err("cached equality delete failure should keep propagating");
+        assert_eq!(error.message(), "malformed equality delete file");
     }
 
     #[tokio::test]

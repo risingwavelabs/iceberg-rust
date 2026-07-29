@@ -108,8 +108,11 @@ impl CachingDeleteFileLoader {
     ///    another concurrently processing data file scan task. If it is, we skip it.
     ///    If not, the DeleteFilter records a shared result receiver and returns a load guard that
     ///    prevents other tasks from loading the same file. The task streams and parses the file,
-    ///    then uses the guard to publish success or failure to every waiter. Failed or cancelled
-    ///    loads are removed from the cache so a later call can retry them.
+    ///    then uses the guard to publish success or failure to every waiter. Failures stay cached
+    ///    so that consumers arriving later still observe the original error: retryable failures
+    ///    (including cancelled loads) can be reclaimed and retried by a later call, while
+    ///    non-retryable failures keep serving the recorded error instead of re-reading a file
+    ///    that cannot be read successfully.
     ///  * When this gets updated to add support for delete vectors, the load phase will return
     ///    a PuffinReader for them.
     ///  * The parse phase parses each record batch stream according to its associated data type.
@@ -780,11 +783,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_equality_delete_read_failure_allows_retry() {
+    async fn test_equality_delete_read_failure_is_cached_and_fresh_loader_retries() {
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
         let file_io = FileIO::from_path(table_location).unwrap().build().unwrap();
-        let delete_file_loader = CachingDeleteFileLoader::new(file_io, 10);
+        let delete_file_loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
 
         let table_schema = Arc::new(
             Schema::builder()
@@ -828,7 +831,7 @@ mod tests {
             case_sensitive: false,
         };
 
-        let first_result = tokio::time::timeout(
+        let first_error = tokio::time::timeout(
             Duration::from_secs(5),
             delete_file_loader.load_deletes(
                 &[Arc::new(equality_delete_task.clone())],
@@ -837,30 +840,10 @@ mod tests {
         )
         .await
         .expect("missing equality delete read hung")
-        .expect("delete loader task ended without a result");
-        assert!(first_result.is_err());
-
-        assert_eq!(
-            setup_write_equality_delete_file_1(table_location),
-            equality_delete_path
-        );
-        equality_delete_task.file_size_in_bytes =
-            std::fs::metadata(&equality_delete_path).unwrap().len();
-        let equality_delete_task = Arc::new(equality_delete_task);
-
-        let delete_filter = tokio::time::timeout(
-            Duration::from_secs(5),
-            delete_file_loader.load_deletes(
-                std::slice::from_ref(&equality_delete_task),
-                table_schema.clone(),
-            ),
-        )
-        .await
-        .expect("equality delete retry hung")
         .expect("delete loader task ended without a result")
-        .expect("equality delete retry failed");
+        .expect_err("reading a missing equality delete file should fail");
 
-        let data_file_task = FileScanTask {
+        let make_data_file_task = |equality_delete_task: Arc<FileScanTask>| FileScanTask {
             file_size_in_bytes: 0,
             start: 0,
             length: 0,
@@ -869,7 +852,7 @@ mod tests {
             referenced_data_file: None,
             data_file_content: DataContentType::Data,
             data_file_format: DataFileFormat::Parquet,
-            schema: table_schema,
+            schema: table_schema.clone(),
             project_field_ids: vec![2, 3],
             predicate: None,
             deletes: vec![equality_delete_task],
@@ -881,9 +864,61 @@ mod tests {
             case_sensitive: false,
         };
 
+        // The read failure is not retryable, so the same loader keeps serving the
+        // original error to consumers that arrive after the failure — even though
+        // they never observed the `Loading` state — instead of a generic missing
+        // predicate error or a doomed re-read.
+        let late_filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            delete_file_loader.load_deletes(
+                &[Arc::new(equality_delete_task.clone())],
+                table_schema.clone(),
+            ),
+        )
+        .await
+        .expect("second equality delete load hung")
+        .expect("delete loader task ended without a result")
+        .expect("skipping a cached failed load must not fail the load phase");
+        let cached_error = tokio::time::timeout(
+            Duration::from_secs(5),
+            late_filter.build_equality_delete_predicate(&make_data_file_task(Arc::new(
+                equality_delete_task.clone(),
+            ))),
+        )
+        .await
+        .expect("cached equality delete failure lookup hung")
+        .expect_err("cached equality delete failure should propagate to late consumers");
+        assert_eq!(cached_error.kind(), first_error.kind());
+        assert_eq!(cached_error.message(), first_error.message());
+        assert_eq!(cached_error.retryable(), first_error.retryable());
+
+        // A fresh loader (e.g. a new scan attempt) is unaffected by the cached
+        // failure and can load the file once it becomes readable.
+        assert_eq!(
+            setup_write_equality_delete_file_1(table_location),
+            equality_delete_path
+        );
+        equality_delete_task.file_size_in_bytes =
+            std::fs::metadata(&equality_delete_path).unwrap().len();
+        let equality_delete_task = Arc::new(equality_delete_task);
+
+        let fresh_loader = CachingDeleteFileLoader::new(file_io, 10);
+        let delete_filter = tokio::time::timeout(
+            Duration::from_secs(5),
+            fresh_loader.load_deletes(
+                std::slice::from_ref(&equality_delete_task),
+                table_schema.clone(),
+            ),
+        )
+        .await
+        .expect("equality delete retry hung")
+        .expect("delete loader task ended without a result")
+        .expect("equality delete retry failed");
+
         let predicate = tokio::time::timeout(
             Duration::from_secs(5),
-            delete_filter.build_equality_delete_predicate(&data_file_task),
+            delete_filter
+                .build_equality_delete_predicate(&make_data_file_task(equality_delete_task)),
         )
         .await
         .expect("equality delete predicate build hung")
