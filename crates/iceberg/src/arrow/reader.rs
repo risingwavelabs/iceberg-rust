@@ -353,6 +353,7 @@ impl ArrowReader {
                 ErrorKind::Unexpected,
                 "Delete file loader ended without publishing a result",
             )
+            .with_retryable(true)
         })??;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 

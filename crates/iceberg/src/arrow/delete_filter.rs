@@ -46,7 +46,7 @@ impl EqDelLoadError {
     fn from_error(error: &Error) -> Self {
         Self {
             kind: error.kind(),
-            message: error.to_string(),
+            message: error.message().to_string(),
             retryable: error.retryable(),
         }
     }
@@ -389,7 +389,8 @@ pub(crate) mod tests {
                 .await
                 .expect("equality delete waiter hung")
                 .expect_err("failed equality delete load should propagate an error");
-            assert!(error.to_string().contains("io timeout reached"));
+            assert_eq!(error.kind(), ErrorKind::Unexpected);
+            assert_eq!(error.message(), "io timeout reached");
             assert!(error.retryable());
         }
 

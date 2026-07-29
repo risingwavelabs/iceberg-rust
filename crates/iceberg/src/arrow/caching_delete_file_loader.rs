@@ -95,9 +95,9 @@ impl CachingDeleteFileLoader {
 
     /// Initiates loading of all deletes for all the specified tasks
     ///
-    /// Returned future completes once all positional deletes and delete vectors
-    /// have loaded. EQ deletes are not waited for in this method but the returned
-    /// DeleteFilter will await their loading when queried for them.
+    /// The returned future completes once all newly claimed delete files have loaded.
+    /// Equality deletes already being loaded by another concurrent call are shared; the
+    /// returned DeleteFilter awaits their published result when queried.
     ///
     ///  * Create a single stream of all delete file tasks irrespective of type,
     ///    so that we can respect the combined concurrency limit
@@ -106,18 +106,18 @@ impl CachingDeleteFileLoader {
     ///    stream the file contents out
     ///  * for eq deletes, we first check if the EQ delete is already loaded or being loaded by
     ///    another concurrently processing data file scan task. If it is, we skip it.
-    ///    If not, the DeleteFilter is updated to contain a notifier to prevent other data file
-    ///    tasks from starting to load the same equality delete file. We spawn a task to load
-    ///    the EQ delete's record batch stream, convert it to a predicate, update the delete filter,
-    ///    and notify any task that was waiting for it.
+    ///    If not, the DeleteFilter records a shared result receiver and returns a load guard that
+    ///    prevents other tasks from loading the same file. The task streams and parses the file,
+    ///    then uses the guard to publish success or failure to every waiter. Failed or cancelled
+    ///    loads are removed from the cache so a later call can retry them.
     ///  * When this gets updated to add support for delete vectors, the load phase will return
     ///    a PuffinReader for them.
     ///  * The parse phase parses each record batch stream according to its associated data type.
     ///    The result of this is a map of data file paths to delete vectors for the positional
     ///    delete tasks (and in future for the delete vector tasks). For equality delete
     ///    file tasks, this results in an unbound Predicate.
-    ///  * The unbound Predicates resulting from equality deletes are sent to their associated oneshot
-    ///    channel to store them in the right place in the delete file managers state.
+    ///  * The unbound Predicates resulting from equality deletes are committed through their load
+    ///    guards, which store successful predicates and publish the result to concurrent waiters.
     ///  * The results of all of these futures are awaited on in parallel with the specified
     ///    level of concurrency and collected into a vec. We then combine all the delete
     ///    vector maps that resulted from any positional delete or delete vector files into a
@@ -139,9 +139,9 @@ impl CachingDeleteFileLoader {
     ///                     Pos Del           Del Vec (Not yet Implemented)         EQ Del
     ///                       |                             |                          |
     ///              [parse pos del stream]         [parse del vec puffin]       [parse eq del]
-    ///          HashMap<String, RoaringTreeMap> HashMap<String, RoaringTreeMap>   (Predicate, Sender)
+    ///          HashMap<String, RoaringTreeMap> HashMap<String, RoaringTreeMap> (Predicate, LoadGuard)
     ///                       |                             |                          |
-    ///                       |                             |                 [persist to state]
+    ///                       |                             |              [publish result/state]
     ///                       |                             |                          ()
     ///                       |                             |                          |
     ///                       +-----------------------------+--------------------------+
