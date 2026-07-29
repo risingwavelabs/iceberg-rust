@@ -396,7 +396,9 @@ impl ArrowReader {
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
                 &predicate,
+                missing_field_ids && task.name_mapping.is_none(),
             )?;
 
             let row_filter = Self::get_row_filter(
@@ -504,6 +506,34 @@ impl ArrowReader {
         // Get the metadata for the Parquet file we need to read and build
         // a reader for the data within
         let parquet_file = file_io.new_input(data_file_path)?;
+
+        // Guard against truncated / partially-written data files.
+        //
+        // `ParquetMetaDataReader` trusts `file_size_in_bytes` (sourced from the
+        // manifest entry) to locate the footer at the end of the file. If the
+        // object actually present in storage is smaller than the manifest claims
+        // — e.g. an interrupted or aborted write left a truncated object behind —
+        // the footer read is issued for a byte range past the real end of the
+        // object. That out-of-bounds range read panics deep inside the
+        // object-store layer (`opendal::Buffer::slice`: "range end out of bounds")
+        // rather than returning an error we can propagate, which unwinds and takes
+        // down the whole reading process instead of failing just this file.
+        //
+        // Verify the real object size up front and fail with a clear, catchable
+        // error so callers (e.g. compaction) can classify it as bad input.
+        let actual_size = parquet_file.metadata().await?.size;
+        if actual_size < file_size_in_bytes {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Parquet data file is truncated: manifest recorded \
+                     file_size_in_bytes={file_size_in_bytes} but object store \
+                     reports {actual_size} bytes"
+                ),
+            )
+            .with_context("path", data_file_path.to_string()));
+        }
+
         let parquet_reader = parquet_file.reader().await?;
         let mut parquet_file_reader = ArrowFileReader::new(
             FileMetadata {
@@ -649,7 +679,9 @@ impl ArrowReader {
 
     fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
+        use_position_fallback: bool,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         // Collects all Iceberg field IDs referenced in the filter predicate
         let mut collector = CollectFieldIdVisitor {
@@ -659,10 +691,14 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
         let field_id_map = match build_field_id_map(parquet_schema)? {
             Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+            // The file genuinely carries no field IDs and no name mapping supplied them.
+            None if use_position_fallback => build_fallback_field_id_map(parquet_schema),
+            // Either a name mapping assigned the IDs on the Arrow side, or only some leaves
+            // carry one: a variant column's `metadata`/`value` sub-fields have no field ID,
+            // which would otherwise shift every following column under position fallback.
+            None => build_field_id_map_from_arrow_schema(arrow_schema),
         };
 
         Ok((iceberg_field_ids, field_id_map))
@@ -1190,6 +1226,30 @@ fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32
         column_map.insert(field_id, idx);
     }
 
+    column_map
+}
+
+/// Build the map of Iceberg field ID to Parquet leaf column index from the Arrow schema.
+///
+/// Used when the Parquet schema does not carry an ID on every leaf: either a name mapping
+/// assigned the IDs on the Arrow side, or the file mixes ID-carrying leaves with ID-less ones.
+/// A variant column is the latter — the field ID sits on the storage group while its
+/// `metadata`/`value` leaves have none. Leaves without an ID are skipped instead of shifting
+/// the leaves that have one, which position-based fallback would do.
+///
+/// `filter_leaves` defines the same leaf index space that Arrow projection masks use.
+fn build_field_id_map_from_arrow_schema(arrow_schema: &ArrowSchemaRef) -> HashMap<i32, usize> {
+    let mut column_map = HashMap::new();
+    arrow_schema.fields().filter_leaves(|idx, field| {
+        if let Some(field_id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|value| i32::from_str(value).ok())
+        {
+            column_map.insert(field_id, idx);
+        }
+        false
+    });
     column_map
 }
 
@@ -2742,6 +2802,44 @@ message schema {
             .iter()
             .map(|v| v.map(ToOwned::to_owned))
             .collect::<Vec<_>>()
+    }
+
+    #[tokio::test]
+    async fn test_truncated_data_file_errors_instead_of_panicking() {
+        // Regression test: a data file whose actual on-disk size is smaller than
+        // the `file_size_in_bytes` recorded in the manifest (i.e. a truncated /
+        // partially-written file) must surface a clean `DataInvalid` error rather
+        // than panicking with an out-of-bounds range read while locating the
+        // Parquet footer.
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::from_path(&table_location).unwrap().build().unwrap();
+
+        // Write a small object whose real size does not match the (much larger)
+        // size the manifest claims for it.
+        let data_file_path = format!("{table_location}/truncated.parquet");
+        std::fs::write(&data_file_path, vec![0u8; 41_470]).unwrap();
+        let manifest_recorded_size = 4_686_247u64;
+
+        let result = ArrowReader::create_parquet_record_batch_stream_builder(
+            &data_file_path,
+            file_io,
+            false,
+            None,
+            None,
+            manifest_recorded_size,
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected truncated data file to error, not succeed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("truncated"),
+            "unexpected error message: {err}"
+        );
     }
 
     fn setup_kleene_logic(
@@ -4666,6 +4764,125 @@ message schema {
 
         // Should return empty results
         assert!(result.is_empty() || result.iter().all(|batch| batch.num_rows() == 0));
+    }
+
+    /// A variant column's `metadata`/`value` Parquet leaves carry no field ID, so
+    /// `build_field_id_map` reports the whole file as ID-less. Falling back to position-based
+    /// IDs would then shift every column after the variant and evaluate the predicate against
+    /// the wrong Parquet column, silently dropping rows.
+    #[tokio::test]
+    async fn test_predicate_on_column_after_variant_resolves_correct_column() {
+        use arrow_array::{BinaryArray, Int32Array, StructArray};
+
+        // `payload` is deliberately first: its two ID-less leaves offset `a` and `b` from
+        // their field IDs (field ID 3 would resolve to leaf 2, which is `a`).
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "payload", Type::Variant(VariantType)).into(),
+                    NestedField::required(2, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(3, "b", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let field_id_meta =
+            |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let variant_fields = arrow_schema::Fields::from(vec![
+            Arc::new(Field::new("metadata", DataType::Binary, false)),
+            Arc::new(Field::new("value", DataType::Binary, false)),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("payload", DataType::Struct(variant_fields.clone()), false)
+                .with_metadata(field_id_meta(1)),
+            Field::new("a", DataType::Int32, false).with_metadata(field_id_meta(2)),
+            Field::new("b", DataType::Int32, false).with_metadata(field_id_meta(3)),
+        ]));
+
+        let variant_row = |_| (&[1_u8, 0, 0][..], &[0x09_u8, b'H', b'I'][..]);
+        let metadata = Arc::new(BinaryArray::from_iter_values(
+            (0..3).map(|i| variant_row(i).0),
+        )) as ArrayRef;
+        let value = Arc::new(BinaryArray::from_iter_values(
+            (0..3).map(|i| variant_row(i).1),
+        )) as ArrayRef;
+        let payload = Arc::new(StructArray::new(
+            variant_fields,
+            vec![metadata, value],
+            None,
+        )) as ArrayRef;
+        let a = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let b = Arc::new(Int32Array::from(vec![100, 200, 300])) as ArrayRef;
+
+        let to_write = RecordBatch::try_new(arrow_schema, vec![payload, a, b]).unwrap();
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::from_path(&table_location).unwrap().build().unwrap();
+        let path = format!("{table_location}/1.parquet");
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let predicate = Reference::new("b").equal_to(Datum::int(200));
+
+        let reader = ArrowReaderBuilder::new(file_io)
+            .with_row_group_filtering_enabled(true)
+            .with_row_selection_enabled(true)
+            .build();
+
+        let tasks = Box::pin(futures::stream::iter(
+            vec![Ok(FileScanTask {
+                file_size_in_bytes: std::fs::metadata(&path).unwrap().len(),
+                start: 0,
+                length: 0,
+                record_count: None,
+                data_file_path: path.clone(),
+                referenced_data_file: None,
+                data_file_format: DataFileFormat::Parquet,
+                schema: schema.clone(),
+                project_field_ids: vec![2, 3],
+                predicate: Some(predicate.bind(schema, true).unwrap()),
+                deletes: vec![],
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+                case_sensitive: false,
+                data_file_content: DataContentType::Data,
+                sequence_number: 0,
+                equality_ids: None,
+            })]
+            .into_iter(),
+        )) as FileScanTaskStream;
+
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let rows: Vec<(i32, i32)> = batches
+            .iter()
+            .flat_map(|batch| {
+                let a = batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>();
+                let b = batch
+                    .column(1)
+                    .as_primitive::<arrow_array::types::Int32Type>();
+                (0..batch.num_rows()).map(move |i| (a.value(i), b.value(i)))
+            })
+            .collect();
+
+        assert_eq!(rows, vec![(2, 200)]);
     }
 
     /// Test that concurrency=1 reads all files correctly and in deterministic order.
