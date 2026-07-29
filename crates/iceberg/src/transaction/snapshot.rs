@@ -885,6 +885,104 @@ impl<'a> SnapshotProducer<'a> {
         self.delete_filter_manager = Some(manager);
         Ok(())
     }
+
+    /// Fails if a delete file that targets one of the data files being removed was committed after
+    /// `starting_snapshot_id`.
+    ///
+    /// This is the conflict check an operation that *rewrites* data files needs. Such an operation
+    /// reads a snapshot, materializes the deletes that applied at that point into new data files,
+    /// and then removes the originals. If another writer adds deletes for one of those originals in
+    /// the meantime, those deletes are never materialized, and removing the data file also retires
+    /// the new delete file as dangling — so the rows it deleted come back. Detecting the conflict
+    /// lets the caller retry against the newer snapshot instead of silently losing the deletes.
+    ///
+    /// Only delete files that name their target via `referenced_data_file` (deletion vectors, and
+    /// position deletes written for a single data file) can be checked cheaply, because the
+    /// association is recorded in the manifest. Position delete files covering several data files
+    /// would require reading their contents and are not covered; equality deletes are not covered
+    /// either, since they are retired by sequence number rather than by data file.
+    pub(crate) async fn validate_no_new_deletes_for_data_files(
+        &self,
+        starting_snapshot_id: i64,
+    ) -> Result<()> {
+        if self.removed_data_file_paths.is_empty() {
+            return Ok(());
+        }
+
+        let table = &self.table;
+        let metadata = table.metadata();
+
+        // Nothing is committed on this branch yet, so nothing can conflict.
+        let Some(current_snapshot) = metadata.snapshot_for_ref(self.target_branch()) else {
+            return Ok(());
+        };
+
+        // Nobody else has committed since the operation read the table.
+        if current_snapshot.snapshot_id() == starting_snapshot_id {
+            return Ok(());
+        }
+
+        let starting_sequence_number = metadata
+            .snapshot_by_id(starting_snapshot_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot validate against snapshot {starting_snapshot_id}: it is not present in the table metadata."
+                    ),
+                )
+            })?
+            .sequence_number();
+
+        let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
+
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Deletes {
+                continue;
+            }
+
+            // A manifest added at or before the starting sequence number cannot hold entries newer
+            // than it, so it needs no inspection.
+            if manifest_file.sequence_number <= starting_sequence_number {
+                continue;
+            }
+
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+
+                // A newer manifest can still carry forward older entries as `Existing`, so filter
+                // on the entry's own sequence number rather than the manifest's.
+                if entry
+                    .sequence_number()
+                    .is_some_and(|sequence_number| sequence_number <= starting_sequence_number)
+                {
+                    continue;
+                }
+
+                let Some(referenced_data_file) = entry.data_file().referenced_data_file() else {
+                    continue;
+                };
+
+                if self.removed_data_file_paths.contains(&referenced_data_file) {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot commit: found new delete file {} for data file {} that this operation removes, added after snapshot {}. Retry against the current snapshot so the new deletes are applied.",
+                            entry.data_file().file_path(),
+                            referenced_data_file,
+                            starting_snapshot_id,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

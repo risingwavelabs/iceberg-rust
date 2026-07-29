@@ -237,6 +237,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     target_branch: Option<String>,
     enable_delete_filter_manager: bool,
     check_file_existence: bool,
+    validate_from_snapshot_id: Option<i64>,
 
     _mode: PhantomData<M>,
 }
@@ -263,6 +264,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             target_branch: None,
             enable_delete_filter_manager: true,
             check_file_existence: false,
+            validate_from_snapshot_id: None,
             _mode: PhantomData,
         }
     }
@@ -348,6 +350,22 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
 
     pub fn set_check_file_existence(mut self, check: bool) -> Self {
         self.check_file_existence = check;
+        self
+    }
+
+    /// Validate that no delete file targeting a removed data file was committed after
+    /// `snapshot_id`, which should be the snapshot this operation read.
+    ///
+    /// An operation that rewrites data files materializes the deletes that applied at the snapshot
+    /// it read. If a concurrent writer adds deletes for one of the data files being removed, those
+    /// deletes are never materialized, and removing the data file retires the new delete file as
+    /// dangling — resurrecting the rows it deleted. Setting this makes the commit fail instead, so
+    /// the operation can be retried against the current snapshot.
+    ///
+    /// Only delete files that record `referenced_data_file` are covered; see
+    /// [`SnapshotProducer::validate_no_new_deletes_for_data_files`].
+    pub fn validate_from_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.validate_from_snapshot_id = Some(snapshot_id);
         self
     }
 }
@@ -440,6 +458,12 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             snapshot_producer.validate_data_file_changes().await?;
         }
 
+        if let Some(starting_snapshot_id) = self.validate_from_snapshot_id {
+            snapshot_producer
+                .validate_no_new_deletes_for_data_files(starting_snapshot_id)
+                .await?;
+        }
+
         snapshot_producer
             .commit(ReplaceFilesOperation::<M>::new(), DefaultManifestProcess)
             .await
@@ -462,7 +486,7 @@ mod tests {
     use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
         ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
@@ -501,6 +525,197 @@ mod tests {
             );
         }
         statuses
+    }
+
+    /// The snapshot a concurrent writer adds *after* the one a rewrite read.
+    const NEW_SNAPSHOT_ID: i64 = 43;
+    const NEW_SEQUENCE_NUMBER: i64 = PARENT_SEQUENCE_NUMBER + 1;
+    const REWRITTEN_DATA_FILE: &str = "test/rewritten-data.parquet";
+    const UNTOUCHED_DATA_FILE: &str = "test/untouched-data.parquet";
+    const NEW_DELETION_VECTOR: &str = "memory:///test/location/data/new-dv.puffin";
+    const NEW_DELETE_MANIFEST: &str = "memory:///test/location/metadata/delete-manifest-2.avro";
+    const NEW_MANIFEST_LIST: &str = "memory:///test/location/metadata/manifest-list-2.avro";
+
+    /// A deletion vector: a Puffin position-delete that names the single data file it applies to.
+    fn deletion_vector(table: &Table, referenced_data_file: &str) -> DataFile {
+        DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::PositionDeletes)
+            .file_path(NEW_DELETION_VECTOR.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(128)
+            .record_count(3)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(Some(referenced_data_file.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(64))
+            .build()
+            .unwrap()
+    }
+
+    /// Extends [`make_v2_table_with_delete_manifest`] with a *newer* snapshot whose delete manifest
+    /// holds a deletion vector for `referenced_data_file` — i.e. the state left behind by a
+    /// concurrent writer that added deletes after a rewrite read the table.
+    async fn make_table_with_deletion_vector_added_after_parent(
+        referenced_data_file: &str,
+    ) -> Table {
+        let base = make_v2_table_with_delete_manifest().await;
+        let file_io = base.file_io().clone();
+
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            file_io.new_output(NEW_DELETE_MANIFEST).unwrap(),
+            Some(NEW_SNAPSHOT_ID),
+            base.metadata().current_schema().clone(),
+            base.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_deletes();
+
+        // Written as `Existing` with explicit numbers so the entry's own sequence number is pinned
+        // rather than inherited, which is what the validation filters on.
+        manifest_writer
+            .add_existing_file(
+                deletion_vector(&base, referenced_data_file),
+                NEW_SNAPSHOT_ID,
+                NEW_SEQUENCE_NUMBER,
+                Some(NEW_SEQUENCE_NUMBER),
+            )
+            .unwrap();
+        let delete_manifest = manifest_writer.write_manifest_file().await.unwrap();
+
+        let manifest_list_output = file_io
+            .new_output(NEW_MANIFEST_LIST)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut manifest_list_writer = ManifestListWriter::v2(
+            manifest_list_output,
+            NEW_SNAPSHOT_ID,
+            Some(PARENT_SNAPSHOT_ID),
+            NEW_SEQUENCE_NUMBER,
+        );
+        manifest_list_writer
+            .add_manifests(vec![delete_manifest].into_iter())
+            .unwrap();
+        manifest_list_writer.close().await.unwrap();
+
+        let new_snapshot = Snapshot::builder()
+            .with_snapshot_id(NEW_SNAPSHOT_ID)
+            .with_parent_snapshot_id(Some(PARENT_SNAPSHOT_ID))
+            .with_timestamp_ms(base.metadata().last_updated_ms() + 2)
+            .with_sequence_number(NEW_SEQUENCE_NUMBER)
+            .with_schema_id(0)
+            .with_manifest_list(NEW_MANIFEST_LIST)
+            .with_summary(Summary {
+                operation: Operation::Overwrite,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v2.json".into()))
+            .add_snapshot(new_snapshot)
+            .unwrap()
+            .set_ref(MAIN_BRANCH, SnapshotReference {
+                snapshot_id: NEW_SNAPSHOT_ID,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        base.with_metadata(Arc::new(metadata))
+    }
+
+    fn producer_removing<'a>(table: &'a Table, data_file_path: &str) -> SnapshotProducer<'a> {
+        let removed = DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::Data)
+            .file_path(data_file_path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        SnapshotProducer::new(
+            table,
+            Uuid::now_v7(),
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![removed],
+            vec![],
+        )
+    }
+
+    /// The conflict this validation exists for: a rewrite materialized the deletes that applied at
+    /// `PARENT_SNAPSHOT_ID`, then a concurrent writer added a deletion vector for one of the data
+    /// files being rewritten. Committing would drop that DV as dangling without ever applying its
+    /// deletes, so the deleted rows would come back.
+    #[tokio::test]
+    async fn test_validate_rejects_new_deletion_vector_for_a_rewritten_data_file() {
+        let table = make_table_with_deletion_vector_added_after_parent(REWRITTEN_DATA_FILE).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        let error = producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect_err("a delete added after the starting snapshot must be a conflict");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(REWRITTEN_DATA_FILE) && message.contains(NEW_DELETION_VECTOR),
+            "error should name both the data file and the new delete file, got: {message}"
+        );
+    }
+
+    /// A deletion vector for a data file this operation does not touch is not a conflict.
+    #[tokio::test]
+    async fn test_validate_allows_new_deletion_vector_for_an_untouched_data_file() {
+        let table = make_table_with_deletion_vector_added_after_parent(UNTOUCHED_DATA_FILE).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect("a delete for an unrelated data file must not conflict");
+    }
+
+    /// Validating against the current snapshot means nobody else committed, so the deletes already
+    /// present were visible to the operation and were materialized.
+    #[tokio::test]
+    async fn test_validate_allows_when_nothing_was_committed_concurrently() {
+        let table = make_table_with_deletion_vector_added_after_parent(REWRITTEN_DATA_FILE).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        producer
+            .validate_no_new_deletes_for_data_files(NEW_SNAPSHOT_ID)
+            .await
+            .expect("no concurrent commit means no conflict");
+    }
+
+    /// A starting snapshot that is not in the metadata means the caller's assumption is broken, so
+    /// this must fail loudly rather than silently validating nothing.
+    #[tokio::test]
+    async fn test_validate_rejects_unknown_starting_snapshot() {
+        let table = make_table_with_deletion_vector_added_after_parent(REWRITTEN_DATA_FILE).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        let error = producer
+            .validate_no_new_deletes_for_data_files(-999)
+            .await
+            .expect_err("an unknown starting snapshot must be rejected");
+        assert!(error.to_string().contains("-999"), "got: {error}");
     }
 
     #[test]
