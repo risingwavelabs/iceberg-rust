@@ -241,6 +241,83 @@ fn json_uuid() {
 }
 
 #[test]
+fn json_binary() {
+    // The leading zero byte is the interesting part: without zero-padding on write this
+    // serializes to "12ff" and no longer round-trips.
+    let record = r#""000102ff""#;
+
+    check_json_serde(
+        record,
+        Literal::Primitive(PrimitiveLiteral::Binary(vec![0x00, 0x01, 0x02, 0xff])),
+        &Type::Primitive(PrimitiveType::Binary),
+    );
+}
+
+#[test]
+fn json_binary_empty() {
+    check_json_serde(
+        r#""""#,
+        Literal::Primitive(PrimitiveLiteral::Binary(vec![])),
+        &Type::Primitive(PrimitiveType::Binary),
+    );
+}
+
+#[test]
+fn json_fixed() {
+    // Same byte pattern as the spec's example for `fixed(L)`.
+    let record = r#""000102ff""#;
+
+    check_json_serde(
+        record,
+        Literal::Primitive(PrimitiveLiteral::Binary(vec![0x00, 0x01, 0x02, 0xff])),
+        &Type::Primitive(PrimitiveType::Fixed(4)),
+    );
+}
+
+/// Every one of these used to hit a `todo!()` and panic, which meant a single malformed
+/// `initial-default` in customer table metadata could take down a service that only wanted to read
+/// the schema. They must all produce errors instead.
+#[test]
+fn json_fixed_and_binary_invalid_values_error_instead_of_panicking() {
+    let cases: Vec<(&str, Type)> = vec![
+        // Wrong length for the declared `fixed(L)`.
+        (r#""000102""#, Type::Primitive(PrimitiveType::Fixed(4))),
+        (r#""000102ffff""#, Type::Primitive(PrimitiveType::Fixed(4))),
+        // Odd number of hexadecimal digits, so the last byte is incomplete.
+        (r#""000""#, Type::Primitive(PrimitiveType::Binary)),
+        // Not hexadecimal at all.
+        (r#""zz""#, Type::Primitive(PrimitiveType::Binary)),
+        (r#""00 1""#, Type::Primitive(PrimitiveType::Binary)),
+        // Multi-byte UTF-8. This is an even number of *bytes*, so an even-length check alone
+        // would let it through and then panic when slicing across the char boundary.
+        (r#""0é0""#, Type::Primitive(PrimitiveType::Binary)),
+        (r#""éé""#, Type::Primitive(PrimitiveType::Binary)),
+    ];
+
+    for (json, ty) in cases {
+        let raw = serde_json::from_str::<JsonValue>(json).unwrap();
+        let result = Literal::try_from_json(raw, &ty);
+        assert!(
+            result.is_err(),
+            "expected {json} to be rejected for {ty}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn json_binary_accepts_upper_case_hex_digits() {
+    let raw = serde_json::from_str::<JsonValue>(r#""00AbFF""#).unwrap();
+    let literal = Literal::try_from_json(raw, &Type::Primitive(PrimitiveType::Binary)).unwrap();
+
+    assert_eq!(
+        literal,
+        Some(Literal::Primitive(PrimitiveLiteral::Binary(vec![
+            0x00, 0xab, 0xff
+        ])))
+    );
+}
+
+#[test]
 fn json_decimal() {
     let record = r#""14.20""#;
 

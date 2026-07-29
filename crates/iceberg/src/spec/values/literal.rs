@@ -499,8 +499,22 @@ impl Literal {
                 (PrimitiveType::Uuid, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
                     PrimitiveLiteral::UInt128(Uuid::parse_str(&s)?.as_u128()),
                 ))),
-                (PrimitiveType::Fixed(_), JsonValue::String(_)) => todo!(),
-                (PrimitiveType::Binary, JsonValue::String(_)) => todo!(),
+                (PrimitiveType::Fixed(len), JsonValue::String(s)) => {
+                    let bytes = hex_str_to_bytes(&s)?;
+                    if bytes.len() as u64 != *len {
+                        return Err(Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            format!(
+                                "Invalid value for fixed({len}): expected {len} bytes, got {} bytes from the hexadecimal string {s:?}.",
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Binary(bytes))))
+                }
+                (PrimitiveType::Binary, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
+                    PrimitiveLiteral::Binary(hex_str_to_bytes(&s)?),
+                ))),
                 (
                     PrimitiveType::Decimal {
                         precision: _,
@@ -663,10 +677,14 @@ impl Literal {
                 (_, PrimitiveLiteral::UInt128(val)) => {
                     Ok(JsonValue::String(Uuid::from_u128(val).to_string()))
                 }
+                // Each byte must be written as exactly two hexadecimal digits: the spec stores
+                // `fixed` and `binary` single values as hexadecimal strings such as "000102ff".
+                // Without zero-padding, [0x00, 0x01, 0x02, 0xff] would serialize to "012ff",
+                // which neither round-trips nor is readable by other engines.
                 (_, PrimitiveLiteral::Binary(val)) => Ok(JsonValue::String(val.iter().fold(
-                    String::new(),
+                    String::with_capacity(val.len() * 2),
                     |mut acc, x| {
-                        acc.push_str(&format!("{x:x}"));
+                        acc.push_str(&format!("{x:02x}"));
                         acc
                     },
                 ))),
@@ -747,4 +765,48 @@ impl Literal {
             _ => unimplemented!(),
         }
     }
+}
+
+/// Converts a single hexadecimal digit into its numeric value.
+fn hex_digit_value(digit: u8) -> Result<u8> {
+    match digit {
+        b'0'..=b'9' => Ok(digit - b'0'),
+        b'a'..=b'f' => Ok(digit - b'a' + 10),
+        b'A'..=b'F' => Ok(digit - b'A' + 10),
+        _ => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid hexadecimal digit {:?} in a `fixed` or `binary` value.",
+                char::from(digit)
+            ),
+        )),
+    }
+}
+
+/// Decodes a hexadecimal string into bytes.
+///
+/// The Iceberg spec stores `fixed` and `binary` single values as hexadecimal strings, for example
+/// `"000102ff"`, so each byte is represented by exactly two digits. Upper-case digits are accepted
+/// on read even though [`Literal::try_into_json`] always writes lower-case.
+///
+/// This operates on bytes rather than slicing the `&str`, because slicing at a fixed offset would
+/// panic on a multi-byte UTF-8 character (`"0é0"` is four bytes long, so an even-length check alone
+/// does not make `s[0..2]` safe). Values reaching here come from table metadata, which is
+/// attacker- or engine-controlled, so this must return an error rather than panic.
+fn hex_str_to_bytes(s: &str) -> Result<Vec<u8>> {
+    let digits = s.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "A `fixed` or `binary` value must be a hexadecimal string with an even number of digits, but {s:?} has {}.",
+                digits.len()
+            ),
+        ));
+    }
+
+    digits
+        .chunks(2)
+        .map(|pair| Ok((hex_digit_value(pair[0])? << 4) | hex_digit_value(pair[1])?))
+        .collect()
 }
