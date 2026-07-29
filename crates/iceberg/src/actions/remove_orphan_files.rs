@@ -40,6 +40,16 @@ const DEFAULT_LOAD_CONCURRENCY: usize = 16;
 /// Default concurrency limit for file deletion.
 const DEFAULT_DELETE_CONCURRENCY: usize = 10;
 
+/// A file under the table location that is not referenced by any snapshot
+/// or table metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanFile {
+    /// Absolute path of the orphan file.
+    pub path: String,
+    /// Size of the file in bytes, as reported by the storage listing.
+    pub size_bytes: u64,
+}
+
 /// Action to delete orphan files from a table's location.
 ///
 /// ```ignore
@@ -108,8 +118,8 @@ impl RemoveOrphanFilesAction {
         self
     }
 
-    /// Executes the action, returning the list of orphan files.
-    pub async fn execute(self) -> Result<Vec<String>> {
+    /// Executes the action, returning the list of orphan files with their sizes.
+    pub async fn execute(self) -> Result<Vec<OrphanFile>> {
         let file_io = self.table.file_io();
         let location = self.table.metadata().location();
 
@@ -121,7 +131,7 @@ impl RemoveOrphanFilesAction {
         let older_than_ms = self.older_than_ms;
 
         // Find orphan files: not reachable, not a directory, and older than threshold
-        let orphan_files: Vec<String> = file_stream
+        let orphan_files: Vec<OrphanFile> = file_stream
             .try_filter_map(|entry| {
                 let is_orphan =
                     // Must be a file (not directory)
@@ -132,7 +142,12 @@ impl RemoveOrphanFilesAction {
                     // (files without timestamp are skipped to protect in-progress writes)
                     && entry.metadata.last_modified_ms.is_some_and(|ts| ts < older_than_ms);
 
-                async move { Ok(is_orphan.then_some(entry.path)) }
+                async move {
+                    Ok(is_orphan.then_some(OrphanFile {
+                        path: entry.path,
+                        size_bytes: entry.metadata.size,
+                    }))
+                }
             })
             .try_collect()
             .await?;
@@ -146,7 +161,7 @@ impl RemoveOrphanFilesAction {
         // making the resulting future Send-safe (avoids HRTB lifetime issues
         // with borrowed references across await points).
         let file_io = file_io.clone();
-        stream::iter(orphan_files.clone())
+        stream::iter(orphan_files.iter().map(|f| f.path.clone()))
             .map(|path| {
                 let file_io = file_io.clone();
                 async move { file_io.delete(&path).await }

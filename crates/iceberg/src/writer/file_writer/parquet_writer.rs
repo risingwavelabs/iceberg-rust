@@ -110,6 +110,9 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            accumulated_compressed: 0,
+            accumulated_uncompressed_proxy: 0,
+            last_bytes_written: 0,
         })
     }
 }
@@ -247,6 +250,17 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    // Compression ratio tracking for `current_written_size`.
+    //
+    // On each write we sample in_progress_size() before and bytes_written() after.
+    // When bytes_written increases a row-group flush occurred: the pre-write
+    // in_progress value is a proxy for the uncompressed bytes that were flushed,
+    // and the delta in bytes_written is the compressed output. Accumulating both
+    // lets current_written_size() extrapolate the buffered bytes using the
+    // observed ratio rather than returning raw (compressed) flushed bytes only.
+    accumulated_compressed: usize,
+    accumulated_uncompressed_proxy: usize,
+    last_bytes_written: usize,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -549,6 +563,10 @@ impl FileWriter for ParquetWriter {
             self.inner_writer.as_mut().unwrap()
         };
 
+        // Sample in_progress BEFORE the write so we capture what was buffered
+        // at the moment the flush fires — not the stale value from the previous call.
+        let pre_in_progress = writer.in_progress_size();
+
         writer.write(batch).await.map_err(|err| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -556,6 +574,16 @@ impl FileWriter for ParquetWriter {
             )
             .with_source(err)
         })?;
+
+        let post_bytes = writer.bytes_written();
+
+        // bytes_written only grows when a row-group is committed to the output.
+        // pre_in_progress is the uncompressed proxy for what was flushed.
+        if post_bytes > self.last_bytes_written && pre_in_progress > 0 {
+            self.accumulated_compressed += post_bytes - self.last_bytes_written;
+            self.accumulated_uncompressed_proxy += pre_in_progress;
+        }
+        self.last_bytes_written = post_bytes;
 
         Ok(())
     }
@@ -605,13 +633,21 @@ impl CurrentFileStatus for ParquetWriter {
     }
 
     fn current_written_size(&self) -> usize {
-        if let Some(inner) = self.inner_writer.as_ref() {
-            // inner/AsyncArrowWriter contains sync and async writers
-            // written size = bytes flushed to inner's async writer + bytes buffered in the inner's sync writer
-            inner.bytes_written() + inner.in_progress_size()
+        let Some(inner) = self.inner_writer.as_ref() else {
+            return 0;
+        };
+        let flushed = inner.bytes_written();
+        let in_progress = inner.in_progress_size();
+
+        if self.accumulated_uncompressed_proxy > 0 {
+            // Observed ratio from row-group flushes: both terms are in writer API units.
+            let ratio =
+                self.accumulated_compressed as f64 / self.accumulated_uncompressed_proxy as f64;
+            flushed + (in_progress as f64 * ratio) as usize
         } else {
-            // inner writer is not initialized yet
-            0
+            // No row group has been flushed yet; return only committed bytes.
+            // should_roll won't fire until the first flush gives us a real ratio.
+            flushed
         }
     }
 }

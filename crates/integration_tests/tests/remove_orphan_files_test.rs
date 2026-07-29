@@ -150,9 +150,12 @@ async fn test_dry_run_and_delete() {
         .await
         .unwrap();
 
-    assert!(result.contains(&orphan_path), "Should find orphan file");
     assert!(
-        !result.iter().any(|p| valid_files.contains(p)),
+        result.iter().any(|f| f.path == orphan_path),
+        "Should find orphan file"
+    );
+    assert!(
+        !result.iter().any(|f| valid_files.contains(&f.path)),
         "Valid files not orphan"
     );
     assert!(
@@ -168,7 +171,10 @@ async fn test_dry_run_and_delete() {
         .await
         .unwrap();
 
-    assert!(result.contains(&orphan_path), "Should have deleted orphan");
+    assert!(
+        result.iter().any(|f| f.path == orphan_path),
+        "Should have deleted orphan"
+    );
     assert!(
         !table.file_io().exists(&orphan_path).await.unwrap(),
         "Orphan deleted"
@@ -221,7 +227,7 @@ async fn test_older_than_threshold() {
         .unwrap();
 
     assert!(
-        !result.contains(&orphan_path),
+        !result.iter().any(|f| f.path == orphan_path),
         "Should not find new orphan with past threshold"
     );
 
@@ -234,7 +240,7 @@ async fn test_older_than_threshold() {
         .unwrap();
 
     assert!(
-        result.contains(&orphan_path),
+        result.iter().any(|f| f.path == orphan_path),
         "Should find orphan with future threshold"
     );
 }
@@ -280,15 +286,15 @@ async fn test_preserves_metadata_files() {
         .await
         .unwrap();
 
-    let orphan_set: HashSet<_> = result.into_iter().collect();
+    let orphan_paths: HashSet<_> = result.iter().map(|f| f.path.as_str()).collect();
 
     // Verify metadata files NOT orphan
     if let Some(loc) = table.metadata_location() {
-        assert!(!orphan_set.contains(loc), "Current metadata not orphan");
+        assert!(!orphan_paths.contains(loc), "Current metadata not orphan");
     }
     for log in table.metadata().metadata_log() {
         assert!(
-            !orphan_set.contains(&log.metadata_file),
+            !orphan_paths.contains(log.metadata_file.as_str()),
             "Historical metadata not orphan"
         );
     }
@@ -296,14 +302,17 @@ async fn test_preserves_metadata_files() {
     // Verify manifest lists NOT orphan
     for snap in table.metadata().snapshots() {
         assert!(
-            !orphan_set.contains(snap.manifest_list()),
+            !orphan_paths.contains(snap.manifest_list()),
             "Manifest list not orphan"
         );
     }
 
     // Verify data files NOT orphan
     for f in &all_data_files {
-        assert!(!orphan_set.contains(f), "Data file not orphan: {f}");
+        assert!(
+            !orphan_paths.contains(f.as_str()),
+            "Data file not orphan: {f}"
+        );
     }
 }
 
@@ -358,15 +367,15 @@ async fn test_after_expire_snapshots() {
         .await
         .unwrap();
 
-    let orphan_set: HashSet<_> = result.into_iter().collect();
+    let orphan_paths: HashSet<_> = result.iter().map(|f| f.path.as_str()).collect();
 
     assert!(
-        !orphan_set.contains(&current_ml),
+        !orphan_paths.contains(current_ml.as_str()),
         "Current manifest list not orphan"
     );
     for ml in &expired_mls {
         assert!(
-            orphan_set.contains(ml),
+            orphan_paths.contains(ml.as_str()),
             "Expired manifest list should be orphan: {ml}"
         );
     }
@@ -490,18 +499,18 @@ async fn test_after_rewrite() {
         .await
         .unwrap();
 
-    let orphan_set: HashSet<_> = result.into_iter().collect();
+    let orphan_paths: HashSet<_> = result.iter().map(|f| f.path.as_str()).collect();
 
     // First manifest-list should be orphan
     assert!(
-        orphan_set.contains(&first_ml),
+        orphan_paths.contains(first_ml.as_str()),
         "First manifest-list should be orphan"
     );
 
     // First manifests should be orphan
     for m in &first_manifests {
         assert!(
-            orphan_set.contains(m),
+            orphan_paths.contains(m.as_str()),
             "First manifest should be orphan: {m}"
         );
     }
