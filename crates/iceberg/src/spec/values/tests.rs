@@ -356,6 +356,52 @@ fn json_uuid() {
     );
 }
 
+/// A default that cannot be represented must be **rejected**, not quietly turned into "no default".
+///
+/// The two are very different: a discarded default means a reader falls back to `null` for a field
+/// that is absent from a data file, so a *required* field can end up materializing `NULL`, and a
+/// writer that rewrites the file makes that permanent. `2263-01-01` is past the last instant an
+/// `i64` nanosecond timestamp can express, so it is invalid metadata and must say so.
+#[test]
+fn out_of_range_nanosecond_default_is_rejected_not_dropped() {
+    for default_kind in ["initial-default", "write-default"] {
+        let json = format!(
+            r#"{{
+                "id": 1,
+                "name": "created_at",
+                "required": true,
+                "type": "timestamp_ns",
+                "{default_kind}": "2263-01-01T00:00:00"
+            }}"#
+        );
+
+        let error = serde_json::from_str::<NestedField>(&json)
+            .expect_err("an unrepresentable default must fail deserialization");
+        let message = error.to_string();
+        assert!(
+            message.contains(default_kind) && message.contains("created_at"),
+            "the error should name the offending default and field, got: {message}"
+        );
+    }
+}
+
+/// Same requirement for a default whose JSON shape does not match the field type at all.
+#[test]
+fn mistyped_default_is_rejected_not_dropped() {
+    let json = r#"{
+        "id": 1,
+        "name": "label",
+        "required": false,
+        "type": "string",
+        "initial-default": 5
+    }"#;
+
+    assert!(
+        serde_json::from_str::<NestedField>(json).is_err(),
+        "a default whose type does not match the field must be rejected"
+    );
+}
+
 #[test]
 fn json_decimal() {
     let record = r#""14.20""#;
