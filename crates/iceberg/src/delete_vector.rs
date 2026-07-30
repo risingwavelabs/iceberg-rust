@@ -296,9 +296,9 @@ impl DeleteVectorIterator<'_> {
     }
 }
 
-impl Into<RoaringTreemap> for DeleteVector {
-    fn into(self) -> RoaringTreemap {
-        self.inner
+impl From<DeleteVector> for RoaringTreemap {
+    fn from(val: DeleteVector) -> RoaringTreemap {
+        val.inner
     }
 }
 
@@ -330,7 +330,7 @@ impl<'a> Extend<&'a u64> for DeleteVector {
 
 impl<const N: usize> From<[u64; N]> for DeleteVector {
     fn from(arr: [u64; N]) -> Self {
-        DeleteVector::from_iter(arr.into_iter())
+        DeleteVector::from_iter(arr)
     }
 }
 
