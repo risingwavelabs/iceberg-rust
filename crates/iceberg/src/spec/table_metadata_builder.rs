@@ -340,8 +340,12 @@ impl TableMetadataBuilder {
     /// - Snapshot id already exists.
     /// - For format version > 1: the sequence number of the snapshot is lower than the highest sequence number specified so far.
     /// - For format version >= 3: the first-row-id of the snapshot is lower than the next-row-id of the table.
-    /// - For format version >= 3: added-rows is null or first-row-id is null.
     /// - For format version >= 3: next-row-id would overflow when adding added-rows.
+    ///
+    /// A v3 snapshot **without** a row range is accepted, not rejected: engines adopted format
+    /// version 3 before implementing row lineage, and the spec already defines how to read such a
+    /// snapshot (null `first_row_id`, `_row_id` null for every row). `next-row-id` does not advance
+    /// for it. See the comment in the body.
     pub fn add_snapshot(mut self, snapshot: Snapshot) -> Result<Self> {
         if self
             .metadata
@@ -398,28 +402,36 @@ impl TableMetadataBuilder {
             ));
         }
 
+        // A v3 snapshot *without* a row range is accepted rather than rejected.
+        //
+        // The spec requires writers to set `first-row-id` from v3 onwards, but engines adopted
+        // format version 3 before they implemented row lineage -- Iceberg 1.8.1, for one, writes v3
+        // tables and omits the field entirely. Rejecting those commits makes a v3 table unwritable
+        // by those engines through this library, which is a much worse outcome than tolerating
+        // metadata the spec already defines how to read: for snapshots without `first-row-id`, data
+        // files and manifests have null `first_row_id` and `_row_id` reads as null for every row.
+        // That is the same shape the spec prescribes for snapshots predating a v2->v3 upgrade, so
+        // readers must cope with it regardless.
+        //
+        // Only the *absent* case is relaxed. A snapshot that does carry a row range is still
+        // validated against `next_row_id` below, so engines implementing row lineage keep exactly
+        // the same guarantees. `next_row_id` simply does not advance for a snapshot that assigns no
+        // row IDs, which is self-consistent.
         let mut added_rows = None;
-        if self.metadata.format_version >= MIN_FORMAT_VERSION_ROW_LINEAGE {
-            if let Some((first_row_id, added_rows_count)) = snapshot.row_range() {
-                if first_row_id < self.metadata.next_row_id {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Cannot add a snapshot, first-row-id is behind table next-row-id: {first_row_id} < {}",
-                            self.metadata.next_row_id
-                        ),
-                    ));
-                }
-
-                added_rows = Some(added_rows_count);
-            } else {
+        if self.metadata.format_version >= MIN_FORMAT_VERSION_ROW_LINEAGE
+            && let Some((first_row_id, added_rows_count)) = snapshot.row_range()
+        {
+            if first_row_id < self.metadata.next_row_id {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Cannot add a snapshot: first-row-id is null. first-row-id must be set for format version >= {MIN_FORMAT_VERSION_ROW_LINEAGE}",
+                        "Cannot add a snapshot, first-row-id is behind table next-row-id: {first_row_id} < {}",
+                        self.metadata.next_row_id
                     ),
                 ));
             }
+
+            added_rows = Some(added_rows_count);
         }
 
         if let Some(added_rows) = added_rows {
@@ -3224,6 +3236,110 @@ mod tests {
             .unwrap()
             .metadata;
         assert_eq!(second_addition.next_row_id(), new_rows * 2);
+    }
+
+    /// A v3 snapshot **without** a row range must be accepted, and must leave `next-row-id` alone.
+    ///
+    /// Engines adopted format version 3 before implementing row lineage — Iceberg 1.8.1 writes v3
+    /// tables and omits `first-row-id` entirely — so rejecting these commits makes a v3 table
+    /// unwritable by those engines. The spec already defines how to read the result: null
+    /// `first_row_id`, and `_row_id` null for every row, exactly as for snapshots predating a
+    /// v2→v3 upgrade.
+    #[test]
+    fn test_row_lineage_snapshot_without_row_range_is_accepted() {
+        let base = builder_without_changes(FormatVersion::V3)
+            .build()
+            .unwrap()
+            .metadata;
+        let next_row_id_before = base.next_row_id();
+
+        let no_row_range = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(base.last_updated_ms + 1)
+            .with_sequence_number(0)
+            .with_schema_id(0)
+            .with_manifest_list("foo")
+            .with_parent_snapshot_id(None)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+        assert!(
+            no_row_range.row_range().is_none(),
+            "precondition: the fixture must actually omit the row range"
+        );
+
+        let updated = base
+            .into_builder(None)
+            .add_snapshot(no_row_range)
+            .expect("a v3 snapshot without a row range must be accepted")
+            .build()
+            .unwrap()
+            .metadata;
+
+        assert_eq!(
+            updated.next_row_id(),
+            next_row_id_before,
+            "a snapshot that assigns no row IDs must not advance next-row-id"
+        );
+    }
+
+    /// Relaxing the absent case must not relax the *present* one: a row range that starts behind
+    /// `next-row-id` is still a hard error, so engines that do implement row lineage keep the same
+    /// guarantees.
+    #[test]
+    fn test_row_lineage_snapshot_with_stale_first_row_id_is_still_rejected() {
+        let base = builder_without_changes(FormatVersion::V3)
+            .build()
+            .unwrap()
+            .metadata;
+
+        let base_ts = base.last_updated_ms;
+        let advanced = base
+            .into_builder(None)
+            .add_snapshot(
+                Snapshot::builder()
+                    .with_snapshot_id(1)
+                    .with_timestamp_ms(base_ts + 1)
+                    .with_sequence_number(0)
+                    .with_schema_id(0)
+                    .with_manifest_list("foo")
+                    .with_parent_snapshot_id(None)
+                    .with_summary(Summary {
+                        operation: Operation::Append,
+                        additional_properties: HashMap::new(),
+                    })
+                    .with_row_range(0, 50)
+                    .build(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(advanced.next_row_id(), 50);
+
+        let stale = advanced.into_builder(None).add_snapshot(
+            Snapshot::builder()
+                .with_snapshot_id(2)
+                .with_timestamp_ms(base_ts + 2)
+                .with_sequence_number(1)
+                .with_schema_id(0)
+                .with_manifest_list("bar")
+                .with_parent_snapshot_id(Some(1))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_row_range(10, 5)
+                .build(),
+        );
+
+        let error = stale.expect_err("a first-row-id behind next-row-id must still be rejected");
+        assert!(
+            error.to_string().contains("behind table next-row-id"),
+            "got: {error}"
+        );
     }
 
     #[test]
