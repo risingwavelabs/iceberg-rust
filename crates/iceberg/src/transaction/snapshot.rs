@@ -896,11 +896,27 @@ impl<'a> SnapshotProducer<'a> {
     /// the new delete file as dangling — so the rows it deleted come back. Detecting the conflict
     /// lets the caller retry against the newer snapshot instead of silently losing the deletes.
     ///
-    /// Only delete files that name their target via `referenced_data_file` (deletion vectors, and
-    /// position deletes written for a single data file) can be checked cheaply, because the
-    /// association is recorded in the manifest. Position delete files covering several data files
-    /// would require reading their contents and are not covered; equality deletes are not covered
-    /// either, since they are retired by sequence number rather than by data file.
+    /// The check is deliberately conservative: anything it cannot *prove* is safe is reported as a
+    /// conflict, because the alternative is losing deletes silently.
+    ///
+    /// # What is checked
+    ///
+    /// * **Position deletes** (including deletion vectors) are attributed to a data file either by
+    ///   `referenced_data_file` or, failing that, by equal lower/upper bounds on the delete file's
+    ///   path column — the same inference the scan side uses. A new delete file that cannot be
+    ///   attributed at all is treated as a conflict, since it may target a file being removed.
+    /// * **Equality deletes** are not attributable to a data file, and are handled by sequence
+    ///   number instead: they apply to data files older than themselves, so they continue to apply
+    ///   to the replacement files as long as those files keep the starting snapshot's sequence
+    ///   number. That prerequisite is *enforced* here rather than assumed — see below.
+    ///
+    /// # Requirements on the caller
+    ///
+    /// * `starting_snapshot_id` must be an ancestor of the target branch's current snapshot.
+    ///   Validating against an unrelated lineage would compare sequence numbers that have no
+    ///   relationship to the branch being committed to.
+    /// * The new data file sequence number must be set to the starting snapshot's sequence number,
+    ///   which is what keeps pre-existing equality deletes applicable to the replacement files.
     pub(crate) async fn validate_no_new_deletes_for_data_files(
         &self,
         starting_snapshot_id: i64,
@@ -911,28 +927,61 @@ impl<'a> SnapshotProducer<'a> {
 
         let table = &self.table;
         let metadata = table.metadata();
+        let branch = self.target_branch();
 
-        // Nothing is committed on this branch yet, so nothing can conflict.
-        let Some(current_snapshot) = metadata.snapshot_for_ref(self.target_branch()) else {
-            return Ok(());
+        let Some(current_snapshot) = metadata.snapshot_for_ref(branch) else {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot validate against snapshot {starting_snapshot_id}: branch {branch} has no current snapshot."
+                ),
+            ));
         };
 
-        // Nobody else has committed since the operation read the table.
-        if current_snapshot.snapshot_id() == starting_snapshot_id {
-            return Ok(());
-        }
+        // The starting snapshot must be on this branch's history, or the sequence-number comparisons
+        // below are meaningless.
+        let starting_sequence_number = {
+            let mut cursor = Some(current_snapshot.snapshot_id());
+            let mut found = None;
+            while let Some(snapshot_id) = cursor {
+                let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
+                    break;
+                };
+                if snapshot_id == starting_snapshot_id {
+                    found = Some(snapshot.sequence_number());
+                    break;
+                }
+                cursor = snapshot.parent_snapshot_id();
+            }
 
-        let starting_sequence_number = metadata
-            .snapshot_by_id(starting_snapshot_id)
-            .ok_or_else(|| {
+            found.ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Cannot validate against snapshot {starting_snapshot_id}: it is not present in the table metadata."
+                        "Cannot validate against snapshot {starting_snapshot_id}: it is not an ancestor of the current snapshot {} on branch {branch}.",
+                        current_snapshot.snapshot_id()
                     ),
                 )
             })?
-            .sequence_number();
+        };
+
+        if current_snapshot.snapshot_id() == starting_snapshot_id {
+            // Nobody else has committed since the operation read the table.
+            return Ok(());
+        }
+
+        // Equality deletes apply to data files older than themselves, so they only keep applying to
+        // the replacement files if those files carry the starting snapshot's sequence number. Refuse
+        // to claim a guarantee that this has not been arranged.
+        if self.new_data_file_sequence_number != Some(starting_sequence_number) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot validate against snapshot {starting_snapshot_id}: the new data file sequence number must be set to that snapshot's sequence number ({starting_sequence_number}) so that existing equality deletes still apply to the replacement files, but it is {:?}.",
+                    self.new_data_file_sequence_number
+                ),
+            ));
+        }
 
         let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
 
@@ -963,20 +1012,46 @@ impl<'a> SnapshotProducer<'a> {
                     continue;
                 }
 
-                let Some(referenced_data_file) = entry.data_file().referenced_data_file() else {
+                let data_file = entry.data_file();
+                if data_file.content_type() == DataContentType::EqualityDeletes {
+                    // Safe by sequence number, enforced above.
                     continue;
-                };
+                }
 
-                if self.removed_data_file_paths.contains(&referenced_data_file) {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Cannot commit: found new delete file {} for data file {} that this operation removes, added after snapshot {}. Retry against the current snapshot so the new deletes are applied.",
-                            entry.data_file().file_path(),
-                            referenced_data_file,
-                            starting_snapshot_id,
-                        ),
-                    ));
+                let referenced_data_file = data_file.referenced_data_file().or_else(|| {
+                    crate::delete_file_index::try_infer_single_referenced_data_file_from_bounds(
+                        data_file,
+                    )
+                });
+
+                match referenced_data_file {
+                    Some(referenced_data_file) => {
+                        if self.removed_data_file_paths.contains(&referenced_data_file) {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "Cannot commit: found new delete file {} for data file {} that this operation removes, added after snapshot {}. Retry against the current snapshot so the new deletes are applied.",
+                                    data_file.file_path(),
+                                    referenced_data_file,
+                                    starting_snapshot_id,
+                                ),
+                            ));
+                        }
+                    }
+                    None => {
+                        // The delete file spans more than one data file, or does not record which
+                        // file it targets. It cannot be shown to leave the removed files alone, and
+                        // proving otherwise would mean reading its contents, so treat it as a
+                        // conflict rather than assume it is harmless.
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Cannot commit: delete file {} was added after snapshot {} and does not identify the data file it targets, so it may apply to a data file this operation removes. Retry against the current snapshot.",
+                                data_file.file_path(),
+                                starting_snapshot_id,
+                            ),
+                        ));
+                    }
                 }
             }
         }

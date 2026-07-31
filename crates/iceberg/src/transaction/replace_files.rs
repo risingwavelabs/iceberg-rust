@@ -484,9 +484,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
+    use crate::delete_file_index::POSITION_DELETE_FILE_PATH_FIELD_ID;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
         ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
@@ -560,6 +561,16 @@ mod tests {
         referenced_data_file: &str,
     ) -> Table {
         let base = make_v2_table_with_delete_manifest().await;
+        let delete_file = deletion_vector(&base, referenced_data_file);
+        make_table_with_delete_added_after_parent(base, delete_file).await
+    }
+
+    /// Extends [`make_v2_table_with_delete_manifest`] with a newer snapshot whose delete manifest
+    /// holds `delete_file` — the state a concurrent writer leaves behind.
+    async fn make_table_with_delete_added_after_parent(
+        base: Table,
+        delete_file: DataFile,
+    ) -> Table {
         let file_io = base.file_io().clone();
 
         let mut manifest_writer = ManifestWriterBuilder::new(
@@ -574,7 +585,7 @@ mod tests {
         // rather than inherited, which is what the validation filters on.
         manifest_writer
             .add_existing_file(
-                deletion_vector(&base, referenced_data_file),
+                delete_file,
                 NEW_SNAPSHOT_ID,
                 NEW_SEQUENCE_NUMBER,
                 Some(NEW_SEQUENCE_NUMBER),
@@ -646,7 +657,7 @@ mod tests {
             .build()
             .unwrap();
 
-        SnapshotProducer::new(
+        let mut producer = SnapshotProducer::new(
             table,
             Uuid::now_v7(),
             None,
@@ -655,7 +666,53 @@ mod tests {
             vec![],
             vec![removed],
             vec![],
-        )
+        );
+        // Rewrites must keep the starting snapshot's sequence number so existing equality deletes
+        // still apply to the replacement files; the validation enforces it.
+        producer.set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER);
+        producer
+    }
+
+    /// A position delete that records no `referenced_data_file` but whose path bounds identify a
+    /// single target — the shape Iceberg Java infers from, and which the scan side already handles.
+    fn position_delete_with_path_bounds(
+        table: &Table,
+        path: &str,
+        lower: &str,
+        upper: &str,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(128)
+            .record_count(3)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .lower_bounds(HashMap::from([(
+                POSITION_DELETE_FILE_PATH_FIELD_ID,
+                Datum::string(lower),
+            )]))
+            .upper_bounds(HashMap::from([(
+                POSITION_DELETE_FILE_PATH_FIELD_ID,
+                Datum::string(upper),
+            )]))
+            .build()
+            .unwrap()
+    }
+
+    fn equality_delete(table: &Table, path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(128)
+            .record_count(3)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .equality_ids(Some(vec![1]))
+            .build()
+            .unwrap()
     }
 
     /// The conflict this validation exists for: a rewrite materialized the deletes that applied at
@@ -702,6 +759,162 @@ mod tests {
             .validate_no_new_deletes_for_data_files(NEW_SNAPSHOT_ID)
             .await
             .expect("no concurrent commit means no conflict");
+    }
+
+    /// Review of #202, point 1: a position delete with no `referenced_data_file` whose path bounds
+    /// identify a single target must still be attributed. Skipping it means "no conflict found",
+    /// which loses the deletes — the opposite of fail-safe.
+    #[tokio::test]
+    async fn test_validate_rejects_bounds_identified_position_delete_for_a_rewritten_data_file() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let delete_file = position_delete_with_path_bounds(
+            &base,
+            "test/new-position-delete.parquet",
+            REWRITTEN_DATA_FILE,
+            REWRITTEN_DATA_FILE,
+        );
+        let table = make_table_with_delete_added_after_parent(base, delete_file).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        let error = producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect_err("a bounds-identified delete for a removed data file must conflict");
+        assert!(
+            error.to_string().contains(REWRITTEN_DATA_FILE),
+            "got: {error}"
+        );
+    }
+
+    /// The same inference must not over-reject: bounds pointing at a file we keep is not a conflict.
+    #[tokio::test]
+    async fn test_validate_allows_bounds_identified_position_delete_for_an_untouched_data_file() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let delete_file = position_delete_with_path_bounds(
+            &base,
+            "test/new-position-delete.parquet",
+            UNTOUCHED_DATA_FILE,
+            UNTOUCHED_DATA_FILE,
+        );
+        let table = make_table_with_delete_added_after_parent(base, delete_file).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect("a delete bounded to an unrelated data file must not conflict");
+    }
+
+    /// A new position delete that names no target and whose bounds span several files cannot be shown
+    /// to leave the removed files alone, so it must be treated as a conflict rather than assumed safe.
+    #[tokio::test]
+    async fn test_validate_rejects_unattributable_position_delete() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let delete_file = position_delete_with_path_bounds(
+            &base,
+            "test/new-multi-file-position-delete.parquet",
+            "test/aaa.parquet",
+            "test/zzz.parquet",
+        );
+        let table = make_table_with_delete_added_after_parent(base, delete_file).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        let error = producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect_err("an unattributable new delete file must be treated as a conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("does not identify the data file"),
+            "got: {error}"
+        );
+    }
+
+    /// Review of #202, point 2: equality deletes are safe *because* the replacement files keep the
+    /// starting snapshot's sequence number, so a new one must not be reported as a conflict once that
+    /// prerequisite holds — otherwise every equality-delete table would be unrewritable.
+    #[tokio::test]
+    async fn test_validate_allows_new_equality_delete_when_sequence_number_is_preserved() {
+        let base = make_v2_table_with_delete_manifest().await;
+        let delete_file = equality_delete(&base, "test/new-equality-delete.parquet");
+        let table = make_table_with_delete_added_after_parent(base, delete_file).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect("a new equality delete is handled by sequence number, not by data file");
+    }
+
+    /// Review of #202, point 2: that prerequisite is enforced, not assumed. Without the starting
+    /// snapshot's sequence number on the replacement files, pre-existing equality deletes would stop
+    /// applying to them, so the guarantee would be false.
+    #[tokio::test]
+    async fn test_validate_requires_the_starting_sequence_number_to_be_preserved() {
+        let table = make_table_with_deletion_vector_added_after_parent(UNTOUCHED_DATA_FILE).await;
+        let removed = DataFileBuilder::default()
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .content(DataContentType::Data)
+            .file_path(REWRITTEN_DATA_FILE.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        // Deliberately *not* calling `set_new_data_file_sequence_number`.
+        let producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![removed],
+            vec![],
+        );
+
+        let error = producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect_err("validation must refuse to promise anything without the sequence number");
+        assert!(
+            error.to_string().contains("sequence number"),
+            "got: {error}"
+        );
+    }
+
+    /// Review of #202, point 3: a snapshot that exists but is not on the branch's history would make
+    /// every sequence-number comparison meaningless, so it must be rejected.
+    #[tokio::test]
+    async fn test_validate_rejects_starting_snapshot_that_is_not_an_ancestor() {
+        let table = make_table_with_deletion_vector_added_after_parent(REWRITTEN_DATA_FILE).await;
+        let producer = producer_removing(&table, REWRITTEN_DATA_FILE);
+
+        // Sanity: the genuine ancestor passes the ancestry check (and then trips the DV conflict).
+        let ancestor_error = producer
+            .validate_no_new_deletes_for_data_files(PARENT_SNAPSHOT_ID)
+            .await
+            .expect_err("this fixture conflicts on the DV");
+        assert!(
+            !ancestor_error.to_string().contains("not an ancestor"),
+            "PARENT_SNAPSHOT_ID must be recognised as an ancestor, got: {ancestor_error}"
+        );
+
+        let error = producer
+            .validate_no_new_deletes_for_data_files(-12345)
+            .await
+            .expect_err("a snapshot outside the branch history must be rejected");
+        let message = error.to_string();
+        // Assert on the ancestry wording specifically. Accepting "contains the snapshot id" would
+        // also match the sequence-number error, which made this test pass with the ancestry check
+        // removed entirely.
+        assert!(
+            message.contains("not an ancestor"),
+            "expected an ancestry rejection, got: {message}"
+        );
     }
 
     /// A starting snapshot that is not in the metadata means the caller's assumption is broken, so
