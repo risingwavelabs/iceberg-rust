@@ -59,5 +59,5 @@ pub(crate) fn azblob_config_build(cfg: &AzblobConfig, path: &str) -> Result<Oper
 
     let mut cfg = cfg.clone();
     cfg.container = container.to_string();
-    Ok(Operator::from_config(cfg)?.finish())
+    Ok(Operator::from_config(cfg)?)
 }

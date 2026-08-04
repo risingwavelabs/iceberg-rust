@@ -149,7 +149,7 @@ impl FileIO {
         } else {
             format!("{relative_path}/")
         };
-        Ok(op.remove_all(&path).await?)
+        Ok(op.delete_with(&path).recursive(true).await?)
     }
 
     /// Check file exists.

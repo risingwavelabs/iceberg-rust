@@ -201,7 +201,7 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
     }
     builder = builder.filesystem(&path.filesystem);
 
-    Ok(opendal::Operator::new(builder)?.finish())
+    Ok(opendal::Operator::new(builder)?)
 }
 
 /// Represents a fully qualified path to blob/ file in Azure Storage.

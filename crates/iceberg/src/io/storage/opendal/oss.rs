@@ -52,5 +52,5 @@ pub(crate) fn oss_config_build(cfg: &OssConfig, path: &str) -> Result<Operator> 
 
     let builder = cfg.clone().into_builder().bucket(bucket);
 
-    Ok(Operator::new(builder)?.finish())
+    Ok(Operator::new(builder)?)
 }

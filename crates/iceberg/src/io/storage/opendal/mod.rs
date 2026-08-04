@@ -39,9 +39,7 @@ use opendal::services::GcsConfig;
 use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
-use opendal::{Operator, Scheme};
-#[cfg(feature = "storage-s3")]
-pub use s3::CustomAwsCredentialLoader;
+use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use crate::io::{
@@ -75,7 +73,9 @@ use memory::*;
 #[cfg(feature = "storage-oss")]
 use oss::*;
 #[cfg(feature = "storage-s3")]
-pub use s3::*;
+pub use s3::{AwsCredential, CustomAwsCredentialLoader, ProvideCredential};
+#[cfg(feature = "storage-s3")]
+use s3::*;
 
 /// OpenDAL-based storage factory.
 ///
@@ -230,6 +230,28 @@ pub enum OpenDalStorage {
     },
 }
 
+/// Storage scheme used to construct OpenDAL-backed [`FileIO`].
+///
+/// OpenDAL no longer exposes a typed `Scheme` enum; Iceberg keeps a local
+/// mapping from scheme strings to storage backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageScheme {
+    #[cfg(feature = "storage-memory")]
+    Memory,
+    #[cfg(feature = "storage-fs")]
+    Fs,
+    #[cfg(feature = "storage-s3")]
+    S3,
+    #[cfg(feature = "storage-gcs")]
+    Gcs,
+    #[cfg(feature = "storage-azblob")]
+    Azblob,
+    #[cfg(feature = "storage-oss")]
+    Oss,
+    #[cfg(feature = "storage-azdls")]
+    Azdls,
+}
+
 impl OpenDalStorage {
     /// Convert iceberg config to opendal config.
     ///
@@ -241,11 +263,11 @@ impl OpenDalStorage {
 
         match scheme {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory(memory_config_build()?)),
+            StorageScheme::Memory => Ok(Self::Memory(memory_config_build()?)),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs),
+            StorageScheme::Fs => Ok(Self::LocalFs),
             #[cfg(feature = "storage-s3")]
-            Scheme::S3 => Ok(Self::S3 {
+            StorageScheme::S3 => Ok(Self::S3 {
                 configured_scheme: scheme_str,
                 config: s3_config_parse(props)?.into(),
                 customized_credential_load: extensions
@@ -253,30 +275,25 @@ impl OpenDalStorage {
                     .map(Arc::unwrap_or_clone),
             }),
             #[cfg(feature = "storage-gcs")]
-            Scheme::Gcs => Ok(Self::Gcs {
+            StorageScheme::Gcs => Ok(Self::Gcs {
                 config: gcs_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-azblob")]
-            Scheme::Azblob => Ok(Self::Azblob {
+            StorageScheme::Azblob => Ok(Self::Azblob {
                 config: crate::io::azblob_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-oss")]
-            Scheme::Oss => Ok(Self::Oss {
+            StorageScheme::Oss => Ok(Self::Oss {
                 config: oss_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-azdls")]
-            Scheme::Azdls => {
+            StorageScheme::Azdls => {
                 let scheme = scheme_str.parse::<AzureStorageScheme>()?;
                 Ok(Self::Azdls {
                     config: azdls_config_parse(props)?.into(),
                     configured_scheme: scheme,
                 })
             }
-            // Update doc on [`FileIO`] when adding new schemes.
-            _ => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("Constructing file io from scheme: {scheme} not supported now",),
-            )),
         }
     }
 
@@ -439,15 +456,27 @@ impl OpenDalStorage {
     }
 
     /// Parse scheme.
-    fn parse_scheme(scheme: &str) -> Result<Scheme> {
+    fn parse_scheme(scheme: &str) -> Result<StorageScheme> {
         match scheme {
-            "memory" => Ok(Scheme::Memory),
-            "file" | "" => Ok(Scheme::Fs),
-            "s3" | "s3a" => Ok(Scheme::S3),
-            "gs" | "gcs" => Ok(Scheme::Gcs),
-            "oss" => Ok(Scheme::Oss),
-            "abfss" | "abfs" | "wasbs" | "wasb" => Ok(Scheme::Azdls),
-            s => Ok(s.parse::<Scheme>()?),
+            #[cfg(feature = "storage-memory")]
+            "memory" => Ok(StorageScheme::Memory),
+            #[cfg(feature = "storage-fs")]
+            "file" | "" => Ok(StorageScheme::Fs),
+            #[cfg(feature = "storage-s3")]
+            "s3" | "s3a" => Ok(StorageScheme::S3),
+            #[cfg(feature = "storage-gcs")]
+            "gs" | "gcs" => Ok(StorageScheme::Gcs),
+            #[cfg(feature = "storage-azblob")]
+            "azblob" => Ok(StorageScheme::Azblob),
+            #[cfg(feature = "storage-oss")]
+            "oss" => Ok(StorageScheme::Oss),
+            #[cfg(feature = "storage-azdls")]
+            "abfss" | "abfs" | "wasbs" | "wasb" => Ok(StorageScheme::Azdls),
+            // Update doc on [`FileIO`] when adding new schemes.
+            s => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!("Constructing file io from scheme: {s} not supported now"),
+            )),
         }
     }
 }
@@ -523,7 +552,7 @@ impl Storage for OpenDalStorage {
         } else {
             format!("{relative_path}/")
         };
-        Ok(op.remove_all(&path).await?)
+        Ok(op.delete_with(&path).recursive(true).await?)
     }
 
     #[allow(unreachable_code, unused_variables)]

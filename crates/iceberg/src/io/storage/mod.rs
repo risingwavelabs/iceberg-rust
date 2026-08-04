@@ -31,7 +31,7 @@ pub use config::*;
 pub use local_fs::{LocalFsStorage, LocalFsStorageFactory};
 pub use memory::{MemoryStorage, MemoryStorageFactory};
 #[cfg(feature = "storage-s3")]
-pub use opendal::CustomAwsCredentialLoader;
+pub use opendal::{AwsCredential, CustomAwsCredentialLoader, ProvideCredential};
 pub use opendal::{OpenDalStorage, OpenDalStorageFactory};
 
 use super::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile};
