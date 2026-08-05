@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use aws_sdk_glue::types::Column;
 use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, VariantType, visit_schema};
-use iceberg::{Error, ErrorKind, Result};
+use iceberg::Result;
 
 use crate::error::from_aws_build_error;
 
