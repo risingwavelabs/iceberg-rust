@@ -702,13 +702,24 @@ impl TableMetadata {
         Ok(())
     }
 
+    /// Whether `timestamp_ms` precedes `reference_ms` by more than the tolerance
+    /// allowed for clock skew between concurrently committing machines.
+    ///
+    /// The difference is taken with `saturating_sub` because both operands are
+    /// parsed from untrusted metadata. The direct `reference_ms - timestamp_ms`
+    /// form overflows for extreme values (e.g. `last-updated-ms` of `i64::MIN`),
+    /// which panics in debug builds and, worse, silently wraps in release: a
+    /// wrapped difference compares as "in order", so the malformed metadata this
+    /// check exists to reject is accepted instead.
+    fn is_out_of_order(timestamp_ms: i64, reference_ms: i64) -> bool {
+        reference_ms.saturating_sub(timestamp_ms) > ONE_MINUTE_MS
+    }
+
     /// Validate snapshots logs are chronological and last updated is after the last snapshot log.
     fn validate_chronological_snapshot_logs(&self) -> Result<()> {
         for window in self.snapshot_log.windows(2) {
             let (prev, curr) = (&window[0], &window[1]);
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
-            if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
+            if Self::is_out_of_order(curr.timestamp_ms, prev.timestamp_ms) {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Expected sorted snapshot log entries",
@@ -716,18 +727,16 @@ impl TableMetadata {
             }
         }
 
-        if let Some(last) = self.snapshot_log.last() {
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
-            if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid update timestamp {}: before last snapshot log entry at {}",
-                        self.last_updated_ms, last.timestamp_ms
-                    ),
-                ));
-            }
+        if let Some(last) = self.snapshot_log.last()
+            && Self::is_out_of_order(self.last_updated_ms, last.timestamp_ms)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid update timestamp {}: before last snapshot log entry at {}",
+                    self.last_updated_ms, last.timestamp_ms
+                ),
+            ));
         }
         Ok(())
     }
@@ -735,9 +744,7 @@ impl TableMetadata {
     fn validate_chronological_metadata_logs(&self) -> Result<()> {
         for window in self.metadata_log.windows(2) {
             let (prev, curr) = (&window[0], &window[1]);
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
-            if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
+            if Self::is_out_of_order(curr.timestamp_ms, prev.timestamp_ms) {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Expected sorted metadata log entries",
@@ -745,18 +752,16 @@ impl TableMetadata {
             }
         }
 
-        if let Some(last) = self.metadata_log.last() {
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
-            if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid update timestamp {}: before last metadata log entry at {}",
-                        self.last_updated_ms, last.timestamp_ms
-                    ),
-                ));
-            }
+        if let Some(last) = self.metadata_log.last()
+            && Self::is_out_of_order(self.last_updated_ms, last.timestamp_ms)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid update timestamp {}: before last metadata log entry at {}",
+                    self.last_updated_ms, last.timestamp_ms
+                ),
+            ));
         }
 
         Ok(())
@@ -1629,7 +1634,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::{FormatVersion, MetadataLog, SnapshotLog, TableMetadataBuilder};
+    use super::{FormatVersion, MetadataLog, ONE_MINUTE_MS, SnapshotLog, TableMetadataBuilder};
     use crate::catalog::MetadataLocation;
     use crate::compression::CompressionCodec;
     use crate::io::FileIO;
@@ -4361,6 +4366,276 @@ mod tests {
         assert_eq!(
             metadata.metadata_location().unwrap(),
             "s3://other-bucket/custom-meta"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // robustness of V3 metadata parsing against malformed input
+    //
+    // `metadata.json` is read from object storage, so its contents are not
+    // trusted: parsing must reject bad documents, never panic on them, and never
+    // let an extreme value slip past a validation that a moderate value fails.
+    // ----------------------------------------------------------------------
+
+    /// A V3 document exercising the fields V3 added (row lineage, encryption keys)
+    /// alongside both chronological logs. Used as the seed for the mutation sweep.
+    const V3_ROBUSTNESS_SEED: &str = r#"
+    {
+      "format-version": 3,
+      "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+      "location": "s3://b/wh/data.db/table",
+      "last-sequence-number": 1,
+      "last-updated-ms": 1515100955770,
+      "last-column-id": 6,
+      "next-row-id": 5,
+      "schemas": [
+        {
+          "schema-id": 1,
+          "type": "struct",
+          "fields": [
+            { "id": 4, "name": "ts", "required": true, "type": "timestamp" },
+            { "id": 5, "name": "payload", "required": false, "type": "variant" },
+            { "id": 6, "name": "ns", "required": false, "type": "timestamp_ns" }
+          ]
+        }
+      ],
+      "current-schema-id": 1,
+      "partition-specs": [
+        { "spec-id": 0, "fields": [
+          { "source-id": 4, "field-id": 1000, "name": "ts_day", "transform": "day" } ] }
+      ],
+      "default-spec-id": 0,
+      "last-partition-id": 1000,
+      "properties": { "commit.retry.num-retries": "1" },
+      "metadata-log": [
+        { "metadata-file": "s3://bucket/v1.json", "timestamp-ms": 1515100 },
+        { "metadata-file": "s3://bucket/v2.json", "timestamp-ms": 1515200 }
+      ],
+      "snapshot-log": [
+        { "snapshot-id": 1, "timestamp-ms": 1515100900000 }
+      ],
+      "current-snapshot-id": 1,
+      "refs": { "main": { "snapshot-id": 1, "type": "branch" } },
+      "snapshots": [
+        {
+          "snapshot-id": 1,
+          "timestamp-ms": 1662532818843,
+          "sequence-number": 0,
+          "first-row-id": 0,
+          "added-rows": 4,
+          "key-id": "key1",
+          "summary": { "operation": "append" },
+          "manifest-list": "/wh/nyc/taxis/metadata/snap-1.avro",
+          "schema-id": 1
+        }
+      ],
+      "encryption-keys": [
+        {
+          "key-id": "key1",
+          "encrypted-by-id": "KMS",
+          "encrypted-key-metadata": "c29tZS1lbmNyeXB0aW9uLWtleQ==",
+          "properties": { "p1": "v1" }
+        }
+      ],
+      "sort-orders": [ { "order-id": 0, "fields": [] } ],
+      "default-sort-order-id": 0
+    }
+    "#;
+
+    #[test]
+    fn test_is_out_of_order_does_not_overflow_on_extreme_timestamps() {
+        // Ordinary skew within tolerance is accepted, beyond it is not.
+        assert!(!TableMetadata::is_out_of_order(1_000, 1_000));
+        assert!(!TableMetadata::is_out_of_order(
+            1_000,
+            1_000 + ONE_MINUTE_MS
+        ));
+        assert!(TableMetadata::is_out_of_order(
+            1_000,
+            1_000 + ONE_MINUTE_MS + 1
+        ));
+
+        // The extremes must be answered, not panicked on. `i64::MIN` really is
+        // far before `i64::MAX`, and `i64::MAX` really is not before `i64::MIN`.
+        assert!(TableMetadata::is_out_of_order(i64::MIN, i64::MAX));
+        assert!(TableMetadata::is_out_of_order(i64::MIN, 0));
+        assert!(!TableMetadata::is_out_of_order(i64::MAX, i64::MIN));
+        assert!(!TableMetadata::is_out_of_order(0, i64::MIN));
+    }
+
+    /// An out-of-order timestamp must be rejected however extreme it is.
+    ///
+    /// Regression test: the comparison used to subtract directly, so an extreme
+    /// `last-updated-ms` overflowed. In release builds the difference wrapped to a
+    /// positive number, the entry read as chronological, and the document was
+    /// **accepted** — even though a merely-old timestamp was correctly rejected.
+    /// Debug builds panicked instead.
+    #[test]
+    fn test_chronology_validation_rejects_extreme_out_of_order_timestamps() {
+        for log in ["metadata-log", "snapshot-log"] {
+            let mut doc: serde_json::Value = serde_json::from_str(V3_ROBUSTNESS_SEED).unwrap();
+
+            // A moderately stale `last-updated-ms` is rejected today; establish that
+            // first so the extreme case below cannot pass for an unrelated reason.
+            doc["last-updated-ms"] = serde_json::json!(0);
+            let moderate = serde_json::from_value::<TableMetadata>(doc.clone());
+            assert!(
+                moderate.is_err(),
+                "a last-updated-ms of 0, before every {log} entry, should be rejected"
+            );
+
+            // The same document with a far more invalid timestamp must also be rejected.
+            doc["last-updated-ms"] = serde_json::json!(i64::MIN);
+            let extreme = serde_json::from_value::<TableMetadata>(doc);
+            assert!(
+                extreme.is_err(),
+                "a last-updated-ms of i64::MIN was ACCEPTED while 0 was rejected: the \
+                 {log} chronology check overflowed and wrapped instead of comparing"
+            );
+        }
+    }
+
+    /// Parsing arbitrarily damaged V3 metadata must fail cleanly, never panic.
+    ///
+    /// A deterministic sweep rather than a randomised fuzzer: every field of the
+    /// seed is replaced with each of a set of hostile values, so the case that
+    /// breaks is named in the failure output and reproduces exactly. This is what
+    /// surfaced the chronology overflow above, at four separate call sites.
+    #[test]
+    fn test_v3_metadata_parsing_never_panics_on_mutated_input() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        /// Every JSON pointer in `v`, depth first.
+        fn pointers(v: &serde_json::Value, base: String, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, child) in m {
+                        let p = format!("{base}/{}", k.replace('~', "~0").replace('/', "~1"));
+                        out.push(p.clone());
+                        pointers(child, p, out);
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for (i, child) in a.iter().enumerate() {
+                        let p = format!("{base}/{i}");
+                        out.push(p.clone());
+                        pointers(child, p, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// Replace the value at `ptr` with `new`, or remove it when `new` is `None`.
+        /// Returns false if the pointer no longer resolves.
+        fn apply(root: &mut serde_json::Value, ptr: &str, new: Option<serde_json::Value>) -> bool {
+            let Some((parent_ptr, raw_key)) = ptr.rsplit_once('/') else {
+                return false;
+            };
+            let key = raw_key.replace("~1", "/").replace("~0", "~");
+            let Some(parent) = root.pointer_mut(parent_ptr) else {
+                return false;
+            };
+            match parent {
+                serde_json::Value::Object(m) => match new {
+                    Some(val) => {
+                        m.insert(key, val);
+                    }
+                    None => {
+                        m.remove(&key);
+                    }
+                },
+                serde_json::Value::Array(a) => {
+                    let Ok(i) = key.parse::<usize>() else {
+                        return false;
+                    };
+                    if i >= a.len() {
+                        return false;
+                    }
+                    match new {
+                        Some(val) => a[i] = val,
+                        None => {
+                            a.remove(i);
+                        }
+                    }
+                }
+                _ => return false,
+            }
+            true
+        }
+
+        let seed: serde_json::Value = serde_json::from_str(V3_ROBUSTNESS_SEED).unwrap();
+        // If the seed itself stops being valid V3 the sweep proves nothing.
+        serde_json::from_value::<TableMetadata>(seed.clone())
+            .expect("the robustness seed must be a valid V3 document");
+
+        let hostile: Vec<(&str, Option<serde_json::Value>)> = vec![
+            ("remove", None),
+            ("null", Some(serde_json::json!(null))),
+            ("empty-string", Some(serde_json::json!(""))),
+            ("empty-array", Some(serde_json::json!([]))),
+            ("empty-object", Some(serde_json::json!({}))),
+            ("string", Some(serde_json::json!("abc"))),
+            ("bool", Some(serde_json::json!(true))),
+            ("zero", Some(serde_json::json!(0))),
+            ("one", Some(serde_json::json!(1))),
+            ("negative", Some(serde_json::json!(-1))),
+            ("i32-min", Some(serde_json::json!(i32::MIN))),
+            ("i64-min", Some(serde_json::json!(i64::MIN))),
+            ("i64-max", Some(serde_json::json!(i64::MAX))),
+            ("u64-max", Some(serde_json::json!(u64::MAX))),
+            ("huge-float", Some(serde_json::json!(1e308))),
+            (
+                "numeric-string",
+                Some(serde_json::json!("99999999999999999999")),
+            ),
+            ("nested-array", Some(serde_json::json!([[[[]]]]))),
+        ];
+
+        let mut paths = Vec::new();
+        pointers(&seed, String::new(), &mut paths);
+        assert!(
+            paths.len() > 50,
+            "expected the seed to expose a wide surface, found only {} paths",
+            paths.len()
+        );
+
+        // Panics are expected to be absent; keep the harness quiet so a genuine
+        // failure is not buried in unwind output.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let mut panicked: Vec<String> = Vec::new();
+        let mut considered = 0usize;
+        for ptr in &paths {
+            for (label, replacement) in &hostile {
+                let mut doc = seed.clone();
+                if !apply(&mut doc, ptr, replacement.clone()) {
+                    continue;
+                }
+                considered += 1;
+                let text = doc.to_string();
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    serde_json::from_str::<TableMetadata>(&text)
+                }));
+                if let Err(payload) = outcome {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    panicked.push(format!("{ptr} replaced with {label}: {msg}"));
+                }
+            }
+        }
+
+        std::panic::set_hook(hook);
+
+        assert!(
+            panicked.is_empty(),
+            "{} of {considered} mutated documents panicked instead of failing to parse:\n{}",
+            panicked.len(),
+            panicked.join("\n")
         );
     }
 }
