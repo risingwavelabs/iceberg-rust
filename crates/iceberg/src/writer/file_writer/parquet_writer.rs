@@ -971,6 +971,189 @@ mod tests {
         assert_eq!(visitor.name_to_id, expect);
     }
 
+    /// A variant column must survive a real write byte-for-byte, and the written file must
+    /// identify the column as a variant.
+    ///
+    /// This closes the last untested leg of the variant round-trip. Everything else that
+    /// exercises variants either reads files written by *another* engine or asserts structure and
+    /// row counts rather than payload bytes — so nothing verified that a variant written through
+    /// this writer comes back unchanged, nor that the output is self-describing as a variant to a
+    /// reader that does not have the Iceberg schema to hand.
+    ///
+    /// Three properties are pinned:
+    ///
+    /// 1. **Byte fidelity** of both variant leaves, including across a null row. The payloads are
+    ///    opaque to the writer, so a corruption here would be silent.
+    /// 2. **`LogicalType::Variant` and the field id on the variant group.** These do hold today,
+    ///    but nothing asserted them; losing either would make our files unidentifiable as
+    ///    variants without out-of-band schema.
+    /// 3. **The two sub-leaves carry no field id.** That absence is not incidental — it is the
+    ///    exact property that made variant statistics get dropped (the path index has to map both
+    ///    physical leaves onto the group's field id, because the leaves cannot be resolved by id).
+    ///    Pinned deliberately so that if arrow/parquet ever starts emitting sub-field ids, this
+    ///    test fails and points at the statistics logic that assumes they are absent.
+    #[tokio::test]
+    async fn test_parquet_writer_variant_round_trip() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let variant_fields = match arrow_schema.field(1).data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("variant must lower to a struct, got {other:?}"),
+        };
+
+        // Deliberately awkward payloads: varying lengths, a zero byte, a high byte, and an empty
+        // value. Fixed-width or ASCII-only payloads would hide off-by-one and truncation bugs.
+        let metadata_payloads: Vec<&[u8]> = vec![
+            &[0x01, 0x00, 0x00],
+            &[0x01, 0x01, 0x00, 0x02, 0x61, 0x62],
+            &[0x01, 0x00, 0x00],
+            &[0x01, 0x00, 0x00],
+        ];
+        let value_payloads: Vec<&[u8]> =
+            vec![&[0x0c, 0x00], &[0x02, 0x01, 0x00, 0x00, 0xff], &[], &[
+                0x0c, 0x7f,
+            ]];
+        let metadata_arr = Arc::new(arrow_array::BinaryArray::from_vec(
+            metadata_payloads.clone(),
+        )) as ArrayRef;
+        let value_arr =
+            Arc::new(arrow_array::BinaryArray::from_vec(value_payloads.clone())) as ArrayRef;
+
+        // Row 2 is a null variant. The child arrays still hold bytes underneath, so this also
+        // checks that a null entry does not disturb its neighbours' payloads.
+        let validity = arrow_buffer::NullBuffer::from(vec![true, true, false, true]);
+        let variant_arr = Arc::new(StructArray::new(
+            variant_fields,
+            vec![metadata_arr, value_arr],
+            Some(validity),
+        )) as ArrayRef;
+        let id_arr = Arc::new(Int64Array::from_iter_values(0..4)) as ArrayRef;
+
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id_arr, variant_arr])?;
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let file_path = output_file.location().to_string();
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone())
+            .build(output_file)
+            .await?;
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+
+        let bytes = file_io.new_input(&file_path)?.read().await?;
+
+        // ---- 1. byte fidelity, read back through Arrow ----
+        {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                .unwrap()
+                .build()
+                .unwrap();
+            let batches = reader.map(|b| b.unwrap()).collect::<Vec<_>>();
+            let read = concat_batches(&batches[0].schema(), &batches).unwrap();
+            assert_eq!(read.num_rows(), 4);
+
+            let v = read
+                .column_by_name("v")
+                .expect("variant column must be present")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("variant must read back as a struct");
+            assert!(v.is_null(2), "row 2 must read back as a null variant");
+            for (row, expected_null) in [false, false, true, false].into_iter().enumerate() {
+                assert_eq!(v.is_null(row), expected_null, "null mask at row {row}");
+            }
+
+            let md = v
+                .column_by_name(VARIANT_METADATA_LEAF)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .unwrap();
+            let vv = v
+                .column_by_name(VARIANT_VALUE_LEAF)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .unwrap();
+
+            // Compare the non-null rows byte-for-byte. The null row's payload is not meaningful.
+            for row in [0usize, 1, 3] {
+                assert_eq!(
+                    md.value(row),
+                    metadata_payloads[row],
+                    "variant metadata bytes differ at row {row}"
+                );
+                assert_eq!(
+                    vv.value(row),
+                    value_payloads[row],
+                    "variant value bytes differ at row {row}"
+                );
+            }
+        }
+
+        // ---- 2 & 3. the written file identifies the column as a variant ----
+        {
+            use parquet::basic::LogicalType;
+            use parquet::file::reader::{FileReader, SerializedFileReader};
+            let reader = SerializedFileReader::new(bytes).unwrap();
+            let schema_descr = reader.metadata().file_metadata().schema_descr();
+
+            let variant_group = schema_descr
+                .root_schema()
+                .get_fields()
+                .iter()
+                .find(|f| f.name() == "v")
+                .expect("variant group must be present in the parquet schema")
+                .clone();
+            let info = variant_group.get_basic_info();
+
+            assert!(
+                matches!(info.logical_type_ref(), Some(LogicalType::Variant { .. })),
+                "variant group must carry LogicalType::Variant, got {:?}",
+                info.logical_type_ref()
+            );
+            assert!(info.has_id(), "variant group must carry a parquet field id");
+            assert_eq!(
+                info.id(),
+                2,
+                "variant group field id must be the iceberg field id"
+            );
+
+            // The two physical leaves deliberately have no field id -- see the doc comment.
+            for leaf in schema_descr.columns() {
+                let path = leaf.path().string();
+                if path.starts_with("v.") {
+                    assert!(
+                        !leaf.self_type().get_basic_info().has_id(),
+                        "{path} unexpectedly has a field id; the statistics path index assumes \
+                         variant leaves cannot be resolved by id and maps them by path instead"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_index_by_parquet_path_variant() {
         // A variant is logically one column but is *stored* as two physical Parquet leaves,
