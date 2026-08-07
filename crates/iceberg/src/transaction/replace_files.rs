@@ -421,11 +421,12 @@ mod tests {
         ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
     };
+    use crate::test_utils::make_encrypted_table;
     use crate::transaction::snapshot::{SnapshotProduceOperation, SnapshotProducer};
     use crate::transaction::tests::{
         PARENT_SEQUENCE_NUMBER, PARENT_SNAPSHOT_ID, REMOVED_DELETE_FILE, RETAINED_DELETE_FILE,
-        make_encrypted_table, make_v2_minimal_table, make_v2_table_with_delete_manifest,
-        make_v3_minimal_table, position_delete_file,
+        make_v2_minimal_table, make_v2_table_with_delete_manifest, make_v3_minimal_table,
+        position_delete_file,
     };
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{ErrorKind, TableRequirement, TableUpdate};
@@ -1064,7 +1065,9 @@ mod tests {
             .unwrap();
         assert!(data_manifest.key_metadata.is_some());
         let manifest = data_manifest.load_manifest(table.file_io()).await.unwrap();
-        assert_eq!(manifest.entries()[0].data_file(), &data_file);
+        let mut expected_data_file = data_file;
+        expected_data_file.first_row_id = Some(0);
+        assert_eq!(manifest.entries()[0].data_file(), &expected_data_file);
     }
 
     #[tokio::test]

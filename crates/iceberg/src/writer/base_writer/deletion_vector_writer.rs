@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(file.referenced_data_file().as_deref(), Some("data.parquet"));
         assert_eq!(file.record_count(), 2);
 
-        let reader = PuffinReader::new(file_io.new_input(file.file_path())?);
+        let reader = PuffinReader::new(file_io.new_input(file.file_path())?).await?;
         let metadata = reader.file_metadata().await?;
         let blob_metadata = metadata
             .blobs

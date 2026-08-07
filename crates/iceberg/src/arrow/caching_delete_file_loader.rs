@@ -539,7 +539,7 @@ impl CachingDeleteFileLoader {
             return Ok(HashMap::from([(referenced_data_file, delete_vector)]));
         }
 
-        let puffin_reader = PuffinReader::new(input_file);
+        let puffin_reader = PuffinReader::new(input_file).await?;
         let file_metadata = puffin_reader.file_metadata().await?;
         let blob_metadata = file_metadata
             .blobs
@@ -838,7 +838,7 @@ mod tests {
     };
     use crate::puffin::{CompressionCodec, PuffinWriter};
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
-    use crate::spec::{DataContentType, DataFileFormat, Schema};
+    use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 
     #[tokio::test]
     async fn test_delete_file_loader_parse_equality_deletes() {
@@ -993,25 +993,15 @@ mod tests {
     async fn test_equality_delete_read_failure_is_cached_and_fresh_loader_retries() {
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
-        let file_io = FileIO::from_path(table_location).unwrap().build().unwrap();
+        let file_io = FileIO::new_with_fs();
         let delete_file_loader =
             CachingDeleteFileLoader::new(file_io.clone(), 10, Runtime::current());
 
         let table_schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
-                    crate::spec::NestedField::optional(
-                        2,
-                        "y",
-                        crate::spec::Type::Primitive(crate::spec::PrimitiveType::Long),
-                    )
-                    .into(),
-                    crate::spec::NestedField::optional(
-                        3,
-                        "z",
-                        crate::spec::Type::Primitive(crate::spec::PrimitiveType::Long),
-                    )
-                    .into(),
+                    NestedField::optional(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
                 ])
                 .build()
                 .unwrap(),

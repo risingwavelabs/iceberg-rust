@@ -428,7 +428,7 @@ pub(crate) mod tests {
         // Loader completes and signals before the waiter awaits.
         filter.finish_pos_del_load(path);
 
-        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+        let waited = tokio::time::timeout(Duration::from_secs(5), notified).await;
         assert!(
             waited.is_ok(),
             "WaitFor future must resolve after finish_pos_del_load"

@@ -958,7 +958,7 @@ mod test {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-    use super::field_with_id;
+    use super::{PARQUET_FIELD_ID_META_KEY, field_with_id};
     use crate::arrow::build_partition_constant;
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
@@ -966,6 +966,13 @@ mod test {
     use crate::spec::{
         ListType, Literal, MapType, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
     };
+
+    fn simple_field(name: &str, data_type: DataType, nullable: bool, field_id: &str) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
     /// Returns empty string for null values

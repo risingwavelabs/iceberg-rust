@@ -47,9 +47,7 @@ pub(crate) fn azblob_config_build(config: &AzblobConfig, path: &str) -> Result<O
 
     let mut config = config.clone();
     config.container = container.to_string();
-    Ok(Operator::from_config(config)
-        .map_err(from_opendal_error)?
-        .finish())
+    Operator::from_config(config).map_err(from_opendal_error)
 }
 
 #[cfg(test)]

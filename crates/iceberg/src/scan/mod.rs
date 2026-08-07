@@ -738,10 +738,9 @@ pub mod tests {
     use crate::spec::{
         DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, DataFileBuilder, DataFileFormat, Datum,
         FormatVersion, Literal, MAIN_BRANCH, ManifestEntry, ManifestFile, ManifestListWriter,
-        ManifestStatus,
-        ManifestWriterBuilder, NestedField, Operation, PartitionSpec, PrimitiveType, Schema,
-        Snapshot, Struct, StructType, Summary, TableMetadata, TableMetadataBuilder, Type,
-        UnboundPartitionSpec,
+        ManifestStatus, ManifestWriterBuilder, NestedField, Operation, PartitionSpec,
+        PrimitiveType, Schema, Snapshot, Struct, StructType, Summary, TableMetadata,
+        TableMetadataBuilder, Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::test_utils::test_runtime;

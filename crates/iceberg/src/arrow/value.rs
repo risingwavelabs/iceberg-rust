@@ -927,24 +927,6 @@ pub(crate) fn create_primitive_array_repeated(
         (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => {
             Arc::new(LargeBinaryArray::from_vec(vec![value; num_rows]))
         }
-        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::Binary(value))) => {
-            let repeated: Vec<&[u8]> = vec![value.as_slice(); num_rows];
-            Arc::new(FixedSizeBinaryArray::try_from_iter(repeated.into_iter()).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Failed to create FixedSizeBinary({len}) array: {e}"),
-                )
-            })?)
-        }
-        (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
-            Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))
-        }
-        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => {
-            Arc::new(LargeBinaryArray::from_iter_values(std::iter::repeat_n(
-                value.as_slice(),
-                num_rows,
-            )))
-        }
         (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))
         }

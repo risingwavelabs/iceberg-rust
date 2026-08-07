@@ -196,14 +196,92 @@ pub fn iceberg::delete_vector::DeleteVector::new(roaring_treemap: roaring::treem
 pub fn iceberg::delete_vector::DeleteVector::to_puffin_blob(&self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> iceberg::Result<iceberg::puffin::Blob>
 impl core::clone::Clone for iceberg::delete_vector::DeleteVector
 pub fn iceberg::delete_vector::DeleteVector::clone(&self) -> iceberg::delete_vector::DeleteVector
+impl core::cmp::PartialEq for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::eq(&self, other: &iceberg::delete_vector::DeleteVector) -> bool
+impl core::convert::From<iceberg::delete_vector::DeleteVector> for roaring::treemap::RoaringTreemap
+pub fn roaring::treemap::RoaringTreemap::from(val: iceberg::delete_vector::DeleteVector) -> roaring::treemap::RoaringTreemap
 impl core::default::Default for iceberg::delete_vector::DeleteVector
 pub fn iceberg::delete_vector::DeleteVector::default() -> iceberg::delete_vector::DeleteVector
 impl core::fmt::Debug for iceberg::delete_vector::DeleteVector
 pub fn iceberg::delete_vector::DeleteVector::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::collect::Extend<u64> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::extend<I: core::iter::traits::collect::IntoIterator<Item = u64>>(&mut self, iterator: I)
+impl core::iter::traits::collect::FromIterator<u64> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::from_iter<I: core::iter::traits::collect::IntoIterator<Item = u64>>(iterator: I) -> iceberg::delete_vector::DeleteVector
+impl core::marker::StructuralPartialEq for iceberg::delete_vector::DeleteVector
+impl core::ops::arith::Sub for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::sub(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::arith::Sub<&iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::sub(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::arith::Sub<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::sub(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::arith::Sub<iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::sub(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::arith::SubAssign for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::sub_assign(&mut self, rhs: iceberg::delete_vector::DeleteVector)
+impl core::ops::arith::SubAssign<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::sub_assign(&mut self, rhs: &iceberg::delete_vector::DeleteVector)
+impl core::ops::bit::BitAnd for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitand(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitAnd<&iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::bitand(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitAnd<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitand(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitAnd<iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::bitand(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitAndAssign for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitand_assign(&mut self, rhs: iceberg::delete_vector::DeleteVector)
+impl core::ops::bit::BitAndAssign<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitand_assign(&mut self, rhs: &iceberg::delete_vector::DeleteVector)
+impl core::ops::bit::BitOr for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitor(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitOr<&iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::bitor(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitOr<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitor(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitOr<iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::bitor(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
 impl core::ops::bit::BitOrAssign for iceberg::delete_vector::DeleteVector
-pub fn iceberg::delete_vector::DeleteVector::bitor_assign(&mut self, other: Self)
+pub fn iceberg::delete_vector::DeleteVector::bitor_assign(&mut self, rhs: iceberg::delete_vector::DeleteVector)
 impl core::ops::bit::BitOrAssign<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
-pub fn iceberg::delete_vector::DeleteVector::bitor_assign(&mut self, other: &iceberg::delete_vector::DeleteVector)
+pub fn iceberg::delete_vector::DeleteVector::bitor_assign(&mut self, rhs: &iceberg::delete_vector::DeleteVector)
+impl core::ops::bit::BitXor for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitxor(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitXor<&iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::bitxor(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitXor<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitxor(self, rhs: &iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitXor<iceberg::delete_vector::DeleteVector> for &iceberg::delete_vector::DeleteVector
+pub type &iceberg::delete_vector::DeleteVector::Output = iceberg::delete_vector::DeleteVector
+pub fn &iceberg::delete_vector::DeleteVector::bitxor(self, rhs: iceberg::delete_vector::DeleteVector) -> Self::Output
+impl core::ops::bit::BitXorAssign for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitxor_assign(&mut self, rhs: iceberg::delete_vector::DeleteVector)
+impl core::ops::bit::BitXorAssign<&iceberg::delete_vector::DeleteVector> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::bitxor_assign(&mut self, rhs: &iceberg::delete_vector::DeleteVector)
+impl core::ops::deref::Deref for iceberg::delete_vector::DeleteVector
+pub type iceberg::delete_vector::DeleteVector::Target = roaring::treemap::RoaringTreemap
+pub fn iceberg::delete_vector::DeleteVector::deref(&self) -> &Self::Target
+impl core::ops::deref::DerefMut for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::deref_mut(&mut self) -> &mut Self::Target
+impl<'a> core::iter::traits::collect::Extend<&'a u64> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::extend<I: core::iter::traits::collect::IntoIterator<Item = &'a u64>>(&mut self, iterator: I)
+impl<const N: usize> core::convert::From<[u64; N]> for iceberg::delete_vector::DeleteVector
+pub fn iceberg::delete_vector::DeleteVector::from(arr: [u64; N]) -> Self
 pub struct iceberg::delete_vector::DeleteVectorIterator<'a>
 impl iceberg::delete_vector::DeleteVectorIterator<'_>
 pub fn iceberg::delete_vector::DeleteVectorIterator<'_>::advance_to(&mut self, pos: u64)
@@ -1405,7 +1483,7 @@ impl core::fmt::Debug for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTask
 impl iceberg::scan::FileScanTask
-pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
+pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
 impl serde_core::ser::Serialize for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTask
