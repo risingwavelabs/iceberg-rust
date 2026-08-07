@@ -17,6 +17,8 @@
 
 //! End-to-end coverage for a Spark-written Iceberg Variant column.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
@@ -26,11 +28,15 @@ use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_integration_tests::get_test_fixture;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use parquet::variant::variant_to_json;
 
 async fn load_variant_table() -> Table {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
