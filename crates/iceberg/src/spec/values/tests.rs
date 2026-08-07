@@ -274,6 +274,51 @@ fn json_fixed() {
     );
 }
 
+/// A wrong-length `fixed(L)` value must be rejected when *writing*, not only when reading.
+///
+/// The length is part of the type, so the two directions have to agree. If writing accepted what
+/// reading rejects, a value could be serialized into `metadata.json` and then fail to parse on the
+/// way back, so the default would be silently lost on a round-trip instead of being refused at the
+/// point it was set.
+#[test]
+fn json_fixed_rejects_a_wrong_length_value_in_both_directions() {
+    let ty = Type::Primitive(PrimitiveType::Fixed(4));
+
+    for bytes in [
+        vec![0x00, 0x01, 0x02],             // too short
+        vec![0x00, 0x01, 0x02, 0xff, 0xff], // too long
+        vec![],                             // empty is still the wrong length for fixed(4)
+    ] {
+        let written =
+            Literal::Primitive(PrimitiveLiteral::Binary(bytes.clone())).try_into_json(&ty);
+        assert!(
+            written.is_err(),
+            "expected fixed(4) to reject writing {} bytes, got {written:?}",
+            bytes.len()
+        );
+
+        // The same value is rejected on read, which is what makes the write-side check necessary:
+        // without it the two directions disagree. Encoding via `binary` sidesteps the check under
+        // test so that the read path receives the hexadecimal string it would have written.
+        let json = Literal::Primitive(PrimitiveLiteral::Binary(bytes.clone()))
+            .try_into_json(&Type::Primitive(PrimitiveType::Binary))
+            .unwrap();
+        assert!(
+            Literal::try_from_json(json, &ty).is_err(),
+            "expected fixed(4) to reject reading {} bytes",
+            bytes.len()
+        );
+    }
+
+    // The correct length still round-trips, so the check is not simply refusing everything.
+    assert_eq!(
+        Literal::Primitive(PrimitiveLiteral::Binary(vec![0x00, 0x01, 0x02, 0xff]))
+            .try_into_json(&ty)
+            .unwrap(),
+        JsonValue::String("000102ff".to_string())
+    );
+}
+
 /// Every one of these used to hit a `todo!()` and panic, which meant a single malformed
 /// `initial-default` in customer table metadata could take down a service that only wanted to read
 /// the schema. They must all produce errors instead.

@@ -677,17 +677,26 @@ impl Literal {
                 (_, PrimitiveLiteral::UInt128(val)) => {
                     Ok(JsonValue::String(Uuid::from_u128(val).to_string()))
                 }
-                // Each byte must be written as exactly two hexadecimal digits: the spec stores
-                // `fixed` and `binary` single values as hexadecimal strings such as "000102ff".
-                // Without zero-padding, [0x00, 0x01, 0x02, 0xff] would serialize to "012ff",
-                // which neither round-trips nor is readable by other engines.
-                (_, PrimitiveLiteral::Binary(val)) => Ok(JsonValue::String(val.iter().fold(
-                    String::with_capacity(val.len() * 2),
-                    |mut acc, x| {
-                        acc.push_str(&format!("{x:02x}"));
-                        acc
-                    },
-                ))),
+                // `fixed` and `binary` share a literal representation but not their constraints, so
+                // they are matched separately: the length of a `fixed(L)` value is part of its type
+                // and is enforced on write as well as on read. Writing a wrong-length value would
+                // otherwise succeed here and then be rejected by `try_from_json`, so a
+                // metadata round-trip would silently drop the default.
+                (PrimitiveType::Fixed(len), PrimitiveLiteral::Binary(val)) => {
+                    if val.len() as u64 != *len {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Invalid value for fixed({len}): expected {len} bytes, got {} bytes.",
+                                val.len()
+                            ),
+                        ));
+                    }
+                    Ok(JsonValue::String(bytes_to_hex_str(&val)))
+                }
+                (PrimitiveType::Binary, PrimitiveLiteral::Binary(val)) => {
+                    Ok(JsonValue::String(bytes_to_hex_str(&val)))
+                }
                 (_, PrimitiveLiteral::Int128(val)) => match r#type {
                     Type::Primitive(PrimitiveType::Decimal {
                         precision: _precision,
@@ -809,4 +818,17 @@ fn hex_str_to_bytes(s: &str) -> Result<Vec<u8>> {
         .chunks(2)
         .map(|pair| Ok((hex_digit_value(pair[0])? << 4) | hex_digit_value(pair[1])?))
         .collect()
+}
+
+/// Encodes bytes as a hexadecimal string, the inverse of [`hex_str_to_bytes`].
+///
+/// Each byte is written as exactly two lower-case digits. The zero-padding is load-bearing: without
+/// it `[0x00, 0x01, 0x02, 0xff]` would produce `"012ff"`, which neither round-trips nor is readable
+/// by other engines.
+fn bytes_to_hex_str(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
