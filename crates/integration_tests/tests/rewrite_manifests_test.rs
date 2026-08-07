@@ -38,6 +38,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, TableCreation};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use iceberg_integration_tests::get_test_fixture;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use parquet::file::properties::WriterProperties;
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +102,9 @@ async fn create_table_with_manifests_and_properties(
 ) -> (RestCatalog, Table) {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
@@ -680,6 +684,9 @@ async fn test_rewrite_manifests_multiple_rounds() {
 async fn test_rewrite_manifests_empty_table() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
