@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-#[cfg(feature = "storage-gcs")]
+#[cfg(any(feature = "storage-gcs", feature = "storage-s3"))]
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -134,6 +134,7 @@ impl StorageFactory for OpenDalStorageFactory {
                 configured_scheme: "s3".to_string(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
+                operator_cache: default_operator_cache(),
             })),
             #[cfg(feature = "storage-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
@@ -178,17 +179,17 @@ fn default_memory_operator() -> Operator {
     memory_config_build().expect("Failed to create default memory operator")
 }
 
-#[cfg(feature = "storage-gcs")]
+#[cfg(any(feature = "storage-gcs", feature = "storage-s3"))]
 type OperatorCache = Arc<RwLock<HashMap<String, Operator>>>;
 
 /// Default empty operator cache for serde deserialization.
-#[cfg(feature = "storage-gcs")]
+#[cfg(any(feature = "storage-gcs", feature = "storage-s3"))]
 fn default_operator_cache() -> OperatorCache {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
 /// Returns the cached operator for `key`, creating it while holding the write lock if absent.
-#[cfg(feature = "storage-gcs")]
+#[cfg(any(feature = "storage-gcs", feature = "storage-s3"))]
 fn get_or_create_operator(
     cache: &RwLock<HashMap<String, Operator>>,
     key: &str,
@@ -243,6 +244,9 @@ pub enum OpenDalStorage {
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<CustomAwsCredentialLoader>,
+        /// Operators keyed by bucket so credential and token caches are reused.
+        #[serde(skip, default = "default_operator_cache")]
+        operator_cache: OperatorCache,
     },
     /// GCS storage variant.
     #[cfg(feature = "storage-gcs")]
@@ -302,6 +306,7 @@ impl OpenDalStorage {
                 customized_credential_load: extensions
                     .get::<CustomAwsCredentialLoader>()
                     .map(Arc::unwrap_or_clone),
+                operator_cache: default_operator_cache(),
             }),
             #[cfg(feature = "storage-gcs")]
             Scheme::Gcs => Ok(Self::Gcs {
@@ -384,8 +389,18 @@ impl OpenDalStorage {
                 configured_scheme,
                 config,
                 customized_credential_load,
+                operator_cache,
             } => {
-                let op = s3_config_build(config, customized_credential_load, path)?;
+                let url = url::Url::parse(path)?;
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid s3 url: {path}, missing bucket"),
+                    )
+                })?;
+                let op = get_or_create_operator(operator_cache, bucket, || {
+                    s3_config_build(config, customized_credential_load, path)
+                })?;
                 let op_info = op.info();
 
                 // Check prefix of s3 path.
@@ -624,9 +639,9 @@ impl FileWrite for opendal::Writer {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "storage-gcs")]
+    #[cfg(any(feature = "storage-gcs", feature = "storage-s3"))]
     use std::sync::Barrier;
-    #[cfg(feature = "storage-gcs")]
+    #[cfg(any(feature = "storage-gcs", feature = "storage-s3"))]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -636,6 +651,100 @@ mod tests {
     fn test_default_memory_operator() {
         let op = default_memory_operator();
         assert_eq!(op.info().scheme().to_string(), "memory");
+    }
+
+    #[cfg(feature = "storage-s3")]
+    fn test_s3_config() -> S3Config {
+        let mut config = S3Config::default();
+        config.region = Some("us-east-1".to_string());
+        config
+    }
+
+    #[cfg(feature = "storage-s3")]
+    fn test_s3_storage() -> OpenDalStorage {
+        OpenDalStorage::S3 {
+            configured_scheme: "s3".to_string(),
+            config: Arc::new(test_s3_config()),
+            customized_credential_load: None,
+            operator_cache: default_operator_cache(),
+        }
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn test_s3_operator_cache_coalesces_concurrent_builds() {
+        const CONCURRENCY: usize = 16;
+
+        let cache = default_operator_cache();
+        let barrier = Arc::new(Barrier::new(CONCURRENCY));
+        let build_count = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..CONCURRENCY {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let build_count = build_count.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    get_or_create_operator(&cache, "test-bucket", || {
+                        build_count.fetch_add(1, Ordering::SeqCst);
+                        s3_config_build(&test_s3_config(), &None, "s3://test-bucket/path/to/file")
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.read().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn test_s3_operator_cache_is_shared_by_clones_and_scoped_to_bucket() {
+        let storage = test_s3_storage();
+        let cloned_storage = storage.clone();
+
+        storage
+            .create_operator(&"s3://bucket-a/path/to/first-file")
+            .unwrap();
+        cloned_storage
+            .create_operator(&"s3://bucket-a/path/to/second-file")
+            .unwrap();
+        cloned_storage
+            .create_operator(&"s3://bucket-b/path/to/third-file")
+            .unwrap();
+
+        let OpenDalStorage::S3 { operator_cache, .. } = &storage else {
+            unreachable!()
+        };
+        let OpenDalStorage::S3 {
+            operator_cache: cloned_operator_cache,
+            ..
+        } = &cloned_storage
+        else {
+            unreachable!()
+        };
+
+        assert!(Arc::ptr_eq(operator_cache, cloned_operator_cache));
+        assert_eq!(operator_cache.read().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn test_s3_operator_cache_is_reset_after_deserialization() {
+        let storage = test_s3_storage();
+        storage
+            .create_operator(&"s3://test-bucket/path/to/file")
+            .unwrap();
+
+        let serialized = serde_json::to_string(&storage).unwrap();
+        let deserialized: OpenDalStorage = serde_json::from_str(&serialized).unwrap();
+        let OpenDalStorage::S3 { operator_cache, .. } = deserialized else {
+            unreachable!()
+        };
+
+        assert!(operator_cache.read().unwrap().is_empty());
     }
 
     #[cfg(feature = "storage-gcs")]
