@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+#[cfg(feature = "storage-gcs")]
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -136,6 +138,7 @@ impl StorageFactory for OpenDalStorageFactory {
             #[cfg(feature = "storage-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
+                operator_cache: default_operator_cache(),
             })),
             #[cfg(feature = "storage-azblob")]
             OpenDalStorageFactory::Azblob => Ok(Arc::new(OpenDalStorage::Azblob {
@@ -175,6 +178,51 @@ fn default_memory_operator() -> Operator {
     memory_config_build().expect("Failed to create default memory operator")
 }
 
+#[cfg(feature = "storage-gcs")]
+type OperatorCache = Arc<RwLock<HashMap<String, Operator>>>;
+
+/// Default empty operator cache for serde deserialization.
+#[cfg(feature = "storage-gcs")]
+fn default_operator_cache() -> OperatorCache {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Returns the cached operator for `key`, creating it while holding the write lock if absent.
+#[cfg(feature = "storage-gcs")]
+fn get_or_create_operator(
+    cache: &RwLock<HashMap<String, Operator>>,
+    key: &str,
+    build: impl FnOnce() -> Result<Operator>,
+) -> Result<Operator> {
+    {
+        let cache = cache.read().map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Operator cache lock poisoned: {error}"),
+            )
+        })?;
+        if let Some(operator) = cache.get(key) {
+            return Ok(operator.clone());
+        }
+    }
+
+    let mut cache = cache.write().map_err(|error| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Operator cache lock poisoned: {error}"),
+        )
+    })?;
+
+    // Another caller may have populated the cache while this caller waited for the write lock.
+    if let Some(operator) = cache.get(key) {
+        return Ok(operator.clone());
+    }
+
+    let operator = build()?;
+    cache.insert(key.to_string(), operator.clone());
+    Ok(operator)
+}
+
 /// OpenDAL-based storage implementation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorage {
@@ -201,6 +249,9 @@ pub enum OpenDalStorage {
     Gcs {
         /// GCS configuration.
         config: Arc<GcsConfig>,
+        /// Operators keyed by bucket so credential and token caches are reused.
+        #[serde(skip, default = "default_operator_cache")]
+        operator_cache: OperatorCache,
     },
     /// AZBLOB storage variant.
     #[cfg(feature = "storage-azblob")]
@@ -255,6 +306,7 @@ impl OpenDalStorage {
             #[cfg(feature = "storage-gcs")]
             Scheme::Gcs => Ok(Self::Gcs {
                 config: gcs_config_parse(props)?.into(),
+                operator_cache: default_operator_cache(),
             }),
             #[cfg(feature = "storage-azblob")]
             Scheme::Azblob => Ok(Self::Azblob {
@@ -348,8 +400,20 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "storage-gcs")]
-            OpenDalStorage::Gcs { config } => {
-                let operator = gcs_config_build(config, path)?;
+            OpenDalStorage::Gcs {
+                config,
+                operator_cache,
+            } => {
+                let url = url::Url::parse(path)?;
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid gcs url: {path}, bucket is required"),
+                    )
+                })?;
+                let operator = get_or_create_operator(operator_cache, bucket, || {
+                    gcs_config_build(config, path)
+                })?;
                 let prefix = format!("gs://{}/", operator.info().name());
                 if path.starts_with(&prefix) {
                     (operator, &path[prefix.len()..])
@@ -560,6 +624,11 @@ impl FileWrite for opendal::Writer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "storage-gcs")]
+    use std::sync::Barrier;
+    #[cfg(feature = "storage-gcs")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[cfg(feature = "storage-memory")]
@@ -567,5 +636,90 @@ mod tests {
     fn test_default_memory_operator() {
         let op = default_memory_operator();
         assert_eq!(op.info().scheme().to_string(), "memory");
+    }
+
+    #[cfg(feature = "storage-gcs")]
+    fn test_gcs_storage() -> OpenDalStorage {
+        OpenDalStorage::Gcs {
+            config: Arc::new(GcsConfig::default()),
+            operator_cache: default_operator_cache(),
+        }
+    }
+
+    #[cfg(feature = "storage-gcs")]
+    #[test]
+    fn test_gcs_operator_cache_coalesces_concurrent_builds() {
+        const CONCURRENCY: usize = 16;
+
+        let cache = default_operator_cache();
+        let barrier = Arc::new(Barrier::new(CONCURRENCY));
+        let build_count = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..CONCURRENCY {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let build_count = build_count.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    get_or_create_operator(&cache, "test-bucket", || {
+                        build_count.fetch_add(1, Ordering::SeqCst);
+                        gcs_config_build(&GcsConfig::default(), "gs://test-bucket/path/to/file")
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.read().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "storage-gcs")]
+    #[test]
+    fn test_gcs_operator_cache_is_shared_by_clones_and_scoped_to_bucket() {
+        let storage = test_gcs_storage();
+        let cloned_storage = storage.clone();
+
+        storage
+            .create_operator(&"gs://bucket-a/path/to/first-file")
+            .unwrap();
+        cloned_storage
+            .create_operator(&"gs://bucket-a/path/to/second-file")
+            .unwrap();
+        cloned_storage
+            .create_operator(&"gs://bucket-b/path/to/third-file")
+            .unwrap();
+
+        let OpenDalStorage::Gcs { operator_cache, .. } = &storage else {
+            unreachable!()
+        };
+        let OpenDalStorage::Gcs {
+            operator_cache: cloned_operator_cache,
+            ..
+        } = &cloned_storage
+        else {
+            unreachable!()
+        };
+
+        assert!(Arc::ptr_eq(operator_cache, cloned_operator_cache));
+        assert_eq!(operator_cache.read().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "storage-gcs")]
+    #[test]
+    fn test_gcs_operator_cache_is_reset_after_deserialization() {
+        let storage = test_gcs_storage();
+        storage
+            .create_operator(&"gs://test-bucket/path/to/file")
+            .unwrap();
+
+        let serialized = serde_json::to_string(&storage).unwrap();
+        let deserialized: OpenDalStorage = serde_json::from_str(&serialized).unwrap();
+        let OpenDalStorage::Gcs { operator_cache, .. } = deserialized else {
+            unreachable!()
+        };
+
+        assert!(operator_cache.read().unwrap().is_empty());
     }
 }
