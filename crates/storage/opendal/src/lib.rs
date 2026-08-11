@@ -26,7 +26,7 @@ mod utils;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -167,10 +167,51 @@ where T: std::str::FromStr {
         .transpose()
 }
 
+type OperatorCache = Arc<RwLock<HashMap<String, Operator>>>;
+
+fn default_operator_cache() -> OperatorCache {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+fn get_or_create_operator(
+    cache: &RwLock<HashMap<String, Operator>>,
+    key: &str,
+    build: impl FnOnce() -> Result<Operator>,
+) -> Result<Operator> {
+    {
+        let cache = cache.read().map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Operator cache lock poisoned: {error}"),
+            )
+        })?;
+        if let Some(operator) = cache.get(key) {
+            return Ok(operator.clone());
+        }
+    }
+
+    let mut cache = cache.write().map_err(|error| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Operator cache lock poisoned: {error}"),
+        )
+    })?;
+    if let Some(operator) = cache.get(key) {
+        return Ok(operator.clone());
+    }
+
+    let operator = build()?;
+    cache.insert(key.to_string(), operator.clone());
+    Ok(operator)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConfiguredOpenDalStorage {
     storage: OpenDalStorage,
     options: OpenDalStorageOptions,
+    /// Fully configured S3 and GCS operators keyed by bucket.
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: OperatorCache,
 }
 
 impl ConfiguredOpenDalStorage {
@@ -178,6 +219,7 @@ impl ConfiguredOpenDalStorage {
         Ok(Self {
             storage,
             options: OpenDalStorageOptions::try_from(config)?,
+            operator_cache: default_operator_cache(),
         })
     }
 }
@@ -344,6 +386,26 @@ pub enum OpenDalStorage {
 }
 
 impl OpenDalStorage {
+    #[allow(unreachable_patterns)]
+    fn operator_cache_key(&self, path: &str) -> Result<Option<String>> {
+        match self {
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorage::S3 { .. } => {}
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorage::Gcs { .. } => {}
+            _ => return Ok(None),
+        }
+
+        let url = url::Url::parse(path)?;
+        let bucket = url.host_str().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid object storage url: {path}, missing bucket"),
+            )
+        })?;
+        Ok(Some(bucket.to_string()))
+    }
+
     /// Creates operator from path.
     ///
     /// # Arguments
@@ -361,8 +423,31 @@ impl OpenDalStorage {
         &self,
         path: &'a impl AsRef<str>,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
+        if let Some(operator_cache) = operator_cache
+            && let Some(cache_key) = self.operator_cache_key(path)?
+        {
+            // Validate and relativize before consulting the cache so a cached operator
+            // cannot make a malformed path appear valid.
+            let relative_path = self.relativize_path(path)?;
+            let operator = get_or_create_operator(operator_cache, &cache_key, || {
+                self.build_operator_with_options(path, options)
+                    .map(|(operator, _)| operator)
+            })?;
+            return Ok((operator, relative_path));
+        }
+
+        self.build_operator_with_options(path, options)
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn build_operator_with_options<'a>(
+        &self,
+        path: &'a str,
+        options: &OpenDalStorageOptions,
+    ) -> Result<(Operator, &'a str)> {
         let (operator, relative_path): (Operator, &str) = match self {
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(op) => {
@@ -649,8 +734,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<bool> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         operator
             .exists(relative_path)
             .await
@@ -661,8 +748,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<FileMetadata> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let metadata = operator
             .stat(relative_path)
             .await
@@ -676,8 +765,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<Bytes> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(operator
             .read(relative_path)
             .await
@@ -689,8 +780,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<Box<dyn FileRead>> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(Box::new(OpenDalReader(
             operator
                 .reader(relative_path)
@@ -704,8 +797,11 @@ impl OpenDalStorage {
         path: &str,
         bytes: Bytes,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
-        let mut writer = self.writer_with_options(path, options).await?;
+        let mut writer = self
+            .writer_with_options(path, options, operator_cache)
+            .await?;
         writer.write(bytes).await?;
         writer.close().await
     }
@@ -714,8 +810,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<Box<dyn FileWrite>> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let mut writer = operator.writer_with(relative_path);
         if self.uses_append_mode() {
             writer = writer.append(true);
@@ -728,8 +826,14 @@ impl OpenDalStorage {
         )))
     }
 
-    async fn delete_with_options(&self, path: &str, options: &OpenDalStorageOptions) -> Result<()> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+    async fn delete_with_options(
+        &self,
+        path: &str,
+        options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
+    ) -> Result<()> {
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         operator
             .delete(relative_path)
             .await
@@ -740,8 +844,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let path = if relative_path.ends_with('/') {
             relative_path.to_string()
         } else {
@@ -758,6 +864,7 @@ impl OpenDalStorage {
         &self,
         mut paths: BoxStream<'static, String>,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
@@ -769,7 +876,7 @@ impl OpenDalStorage {
                 }
                 Entry::Vacant(entry) => {
                     let (operator, relative_path) =
-                        self.create_operator_with_options(&path, options)?;
+                        self.create_operator_with_options(&path, options, operator_cache)?;
                     let relative_path = relative_path.to_string();
                     let deleter = operator.deleter().await.map_err(from_opendal_error)?;
                     (relative_path, entry.insert(deleter))
@@ -792,9 +899,11 @@ impl OpenDalStorage {
         path: &str,
         recursive: bool,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
         let path: Arc<str> = Arc::from(path);
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let absolute_prefix: Arc<str> =
             Arc::from(&path[..path.len().saturating_sub(relative_path.len())]);
         let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
@@ -835,47 +944,47 @@ impl OpenDalStorage {
 #[async_trait]
 impl Storage for OpenDalStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        self.exists_with_options(path, &OpenDalStorageOptions::default())
+        self.exists_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.metadata_with_options(path, &OpenDalStorageOptions::default())
+        self.metadata_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        self.read_with_options(path, &OpenDalStorageOptions::default())
+        self.read_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.reader_with_options(path, &OpenDalStorageOptions::default())
+        self.reader_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.write_with_options(path, bs, &OpenDalStorageOptions::default())
+        self.write_with_options(path, bs, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.writer_with_options(path, &OpenDalStorageOptions::default())
+        self.writer_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        self.delete_with_options(path, &OpenDalStorageOptions::default())
+        self.delete_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
-        self.delete_prefix_with_options(path, &OpenDalStorageOptions::default())
+        self.delete_prefix_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
-        self.delete_stream_with_options(paths, &OpenDalStorageOptions::default())
+        self.delete_stream_with_options(paths, &OpenDalStorageOptions::default(), None)
             .await
     }
 
@@ -884,7 +993,7 @@ impl Storage for OpenDalStorage {
         path: &str,
         recursive: bool,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
-        self.list_with_options(path, recursive, &OpenDalStorageOptions::default())
+        self.list_with_options(path, recursive, &OpenDalStorageOptions::default(), None)
             .await
     }
 
@@ -903,46 +1012,56 @@ impl Storage for OpenDalStorage {
 #[async_trait]
 impl Storage for ConfiguredOpenDalStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        self.storage.exists_with_options(path, &self.options).await
+        self.storage
+            .exists_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.storage
-            .metadata_with_options(path, &self.options)
+            .metadata_with_options(path, &self.options, Some(&self.operator_cache))
             .await
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        self.storage.read_with_options(path, &self.options).await
+        self.storage
+            .read_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.storage.reader_with_options(path, &self.options).await
+        self.storage
+            .reader_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn write(&self, path: &str, bytes: Bytes) -> Result<()> {
         self.storage
-            .write_with_options(path, bytes, &self.options)
+            .write_with_options(path, bytes, &self.options, Some(&self.operator_cache))
             .await
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.storage.writer_with_options(path, &self.options).await
+        self.storage
+            .writer_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        self.storage.delete_with_options(path, &self.options).await
+        self.storage
+            .delete_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
         self.storage
-            .delete_prefix_with_options(path, &self.options)
+            .delete_prefix_with_options(path, &self.options, Some(&self.operator_cache))
             .await
     }
 
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
         self.storage
-            .delete_stream_with_options(paths, &self.options)
+            .delete_stream_with_options(paths, &self.options, Some(&self.operator_cache))
             .await
     }
 
@@ -952,7 +1071,7 @@ impl Storage for ConfiguredOpenDalStorage {
         recursive: bool,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
         self.storage
-            .list_with_options(path, recursive, &self.options)
+            .list_with_options(path, recursive, &self.options, Some(&self.operator_cache))
             .await
     }
 
@@ -1003,7 +1122,148 @@ impl FileWrite for OpenDalWriter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "opendal-s3")]
+    use std::sync::Barrier;
+    #[cfg(feature = "opendal-s3")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[cfg(feature = "opendal-s3")]
+    fn test_configured_s3_storage() -> ConfiguredOpenDalStorage {
+        let mut config = S3Config::default();
+        config.region = Some("us-east-1".to_string());
+        ConfiguredOpenDalStorage::new(
+            OpenDalStorage::S3 {
+                config: Arc::new(config),
+                customized_credential_load: None,
+            },
+            &StorageConfig::new(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_coalesces_concurrent_builds() {
+        const CONCURRENCY: usize = 16;
+
+        let cache = default_operator_cache();
+        let barrier = Arc::new(Barrier::new(CONCURRENCY));
+        let build_count = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..CONCURRENCY {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let build_count = build_count.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    get_or_create_operator(&cache, "test-bucket", || {
+                        build_count.fetch_add(1, Ordering::SeqCst);
+                        let mut config = S3Config::default();
+                        config.region = Some("us-east-1".to_string());
+                        s3_config_build(&config, &None, "s3://test-bucket/path/to/file")
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.read().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_configured_operator_cache_is_shared_and_bucket_scoped() {
+        let storage = test_configured_s3_storage();
+        let cloned_storage = storage.clone();
+
+        storage
+            .storage
+            .create_operator_with_options(
+                &"s3://bucket-a/path/to/first-file",
+                &storage.options,
+                Some(&storage.operator_cache),
+            )
+            .unwrap();
+        cloned_storage
+            .storage
+            .create_operator_with_options(
+                &"s3://bucket-a/path/to/second-file",
+                &cloned_storage.options,
+                Some(&cloned_storage.operator_cache),
+            )
+            .unwrap();
+        cloned_storage
+            .storage
+            .create_operator_with_options(
+                &"s3://bucket-b/path/to/third-file",
+                &cloned_storage.options,
+                Some(&cloned_storage.operator_cache),
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(
+            &storage.operator_cache,
+            &cloned_storage.operator_cache
+        ));
+        assert_eq!(storage.operator_cache.read().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_configured_operator_cache_is_reset_after_deserialization() {
+        let storage = test_configured_s3_storage();
+        storage
+            .storage
+            .create_operator_with_options(
+                &"s3://test-bucket/path/to/file",
+                &storage.options,
+                Some(&storage.operator_cache),
+            )
+            .unwrap();
+
+        let serialized = serde_json::to_string(&storage).unwrap();
+        let deserialized: ConfiguredOpenDalStorage = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(storage.operator_cache.read().unwrap().len(), 1);
+        assert!(deserialized.operator_cache.read().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "opendal-gcs")]
+    #[test]
+    fn test_cached_gcs_operator_does_not_bypass_path_validation() {
+        let storage = ConfiguredOpenDalStorage::new(
+            OpenDalStorage::Gcs {
+                config: Arc::new(GcsConfig::default()),
+            },
+            &StorageConfig::new(),
+        )
+        .unwrap();
+
+        storage
+            .storage
+            .create_operator_with_options(
+                &"gs://test-bucket/path/to/file",
+                &storage.options,
+                Some(&storage.operator_cache),
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .storage
+                .create_operator_with_options(
+                    &"s3://test-bucket/path/to/file",
+                    &storage.options,
+                    Some(&storage.operator_cache),
+                )
+                .is_err()
+        );
+        assert_eq!(storage.operator_cache.read().unwrap().len(), 1);
+    }
 
     #[cfg(feature = "opendal-memory")]
     #[test]
