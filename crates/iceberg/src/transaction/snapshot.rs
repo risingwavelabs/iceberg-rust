@@ -37,7 +37,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
 use crate::utils::bin::ListPacker;
-use crate::utils::load_manifests;
+use crate::utils::{DeleteFileKey, delete_file_key, load_manifests};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
@@ -127,12 +127,16 @@ pub(crate) struct SnapshotProducer<'a> {
 
     // for filtering out files that are removed by action
     pub removed_data_file_paths: HashSet<String>,
-    pub removed_delete_file_paths: HashSet<String>,
+    // Keyed by `(file_path, content_offset, content_size_in_bytes)` rather than
+    // `file_path` alone: several deletion vectors may share one Puffin file, so
+    // a path-only key would drop a still-live DV whenever another DV in the
+    // same physical file is removed.
+    pub removed_delete_file_keys: HashSet<DeleteFileKey>,
     // Full DataFile objects for removed files. Retained so the snapshot summary
     // can roll up `deleted-records`, `removed-files-size`, etc. from the file
-    // metadata. Only paths are needed for manifest filtering, but the summary
-    // collector needs the full records to produce accurate `total-*` fields
-    // on the new snapshot.
+    // metadata. Only identity keys are needed for manifest filtering, but the
+    // summary collector needs the full records to produce accurate `total-*`
+    // fields on the new snapshot.
     pub removed_data_files: Vec<DataFile>,
     pub removed_delete_files: Vec<DataFile>,
 
@@ -165,10 +169,7 @@ impl<'a> SnapshotProducer<'a> {
             .iter()
             .map(|df| df.file_path.clone())
             .collect();
-        let removed_delete_file_paths = removed_delete_files
-            .iter()
-            .map(|df| df.file_path.clone())
-            .collect();
+        let removed_delete_file_keys = removed_delete_files.iter().map(delete_file_key).collect();
 
         let manifest_counter = Arc::new(AtomicU64::new(0));
 
@@ -185,7 +186,7 @@ impl<'a> SnapshotProducer<'a> {
             added_data_files,
             added_delete_files,
             removed_data_file_paths,
-            removed_delete_file_paths,
+            removed_delete_file_keys,
             removed_data_files,
             removed_delete_files,
             new_data_file_sequence_number: None,
@@ -197,7 +198,7 @@ impl<'a> SnapshotProducer<'a> {
     pub(crate) fn has_removed_files_for_manifest_type(&self, content: ManifestContentType) -> bool {
         match content {
             ManifestContentType::Data => !self.removed_data_file_paths.is_empty(),
-            ManifestContentType::Deletes => !self.removed_delete_file_paths.is_empty(),
+            ManifestContentType::Deletes => !self.removed_delete_file_keys.is_empty(),
         }
     }
 
@@ -529,7 +530,7 @@ partition_struct: {:?}, partition_type: {:?}",
             && self.snapshot_properties.is_empty()
             && self.added_delete_files.is_empty()
             && self.removed_data_file_paths.is_empty()
-            && self.removed_delete_file_paths.is_empty()
+            && self.removed_delete_file_keys.is_empty()
         {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,

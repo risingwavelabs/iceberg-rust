@@ -25,9 +25,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::delete_file_index::try_infer_single_referenced_data_file_from_bounds;
 use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, Struct};
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, for_each_manifest};
+use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, delete_file_key, for_each_manifest};
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
 /// Action to remove dangling delete files from a table.
@@ -138,6 +139,13 @@ impl RemoveDanglingDeleteFilesAction {
                     if let Some(ref_path) = df.referenced_data_file() {
                         // Path-based: dangling if the referenced data file no longer exists
                         !data_file_paths.contains(&ref_path)
+                    } else if let Some(inferred_path) =
+                        try_infer_single_referenced_data_file_from_bounds(df)
+                    {
+                        // V2 position deletes may omit `referenced_data_file` while their
+                        // `file_path` column's lower/upper bounds still prove a single
+                        // target (the same heuristic the reader uses to scope deletes).
+                        !data_file_paths.contains(&inferred_path)
                     } else if let Some(s) = df_seq {
                         // Sequence-based: dangling if seq < min_data_seq in this partition
                         let key = (df.partition_spec_id(), df.partition().clone());
@@ -171,8 +179,12 @@ impl RemoveDanglingDeleteFilesAction {
                 .map(|(df, _)| df),
         );
 
-        let mut seen: HashSet<String> = HashSet::new();
-        dangling.retain(|df| seen.insert(df.file_path().to_string()));
+        // Dedup by `(file_path, content_offset, content_size_in_bytes)`, not
+        // `file_path` alone: several deletion vectors can share one Puffin
+        // file, so a path-only key would collapse a dangling DV and a
+        // still-live DV in the same file into one entry.
+        let mut seen = HashSet::new();
+        dangling.retain(|df| seen.insert(delete_file_key(df)));
 
         if dangling.is_empty() {
             return Ok(0);
@@ -343,6 +355,28 @@ mod tests {
             let manifest = mf.load_manifest(table.file_io()).await.unwrap();
             for entry in manifest.entries() {
                 if entry.is_alive() && entry.data_file().file_path() == file_path {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Like [`delete_file_is_live`], but also matches on `content_offset` — the
+    /// identity of a specific deletion-vector blob within a shared Puffin file.
+    async fn dv_entry_is_live(table: &Table, file_path: &str, content_offset: i64) -> bool {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        for mf in manifest_list.entries() {
+            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.is_alive()
+                    && entry.data_file().file_path() == file_path
+                    && entry.data_file().content_offset() == Some(content_offset)
+                {
                     return true;
                 }
             }
@@ -803,6 +837,211 @@ mod tests {
         assert!(
             !delete_file_is_live(&table, "memory://test/pos-p2.parquet").await,
             "partition-2 position delete should be removed"
+        );
+    }
+
+    /// Iceberg identifies a deletion-vector blob by
+    /// `(file_path, content_offset, content_size_in_bytes)`, because several DVs
+    /// can share one physical Puffin file. A dangling DV for one data file must
+    /// not drop a still-live DV for another data file that happens to share the
+    /// same Puffin `file_path`.
+    #[tokio::test]
+    async fn test_shared_puffin_file_keeps_live_dv_removes_dangling_dv() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_shared_puffin").await;
+
+        let live_data_path = "memory://test/data-a.parquet";
+        let table = commit_data_file(&catalog, &table, live_data_path).await;
+
+        let shared_puffin_path = "memory://test/shared.puffin";
+
+        let live_dv = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(shared_puffin_path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .record_count(1)
+            .file_size_in_bytes(200)
+            .referenced_data_file(Some(live_data_path.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(64))
+            .build()
+            .unwrap();
+
+        let dangling_dv = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(shared_puffin_path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .record_count(1)
+            .file_size_in_bytes(200)
+            .referenced_data_file(Some("memory://test/nonexistent.parquet".to_string()))
+            .content_offset(Some(200))
+            .content_size_in_bytes(Some(64))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![live_dv, dangling_dv])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "only the dangling DV blob should be removed");
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        assert!(
+            dv_entry_is_live(&table, shared_puffin_path, 4).await,
+            "the live DV blob sharing the Puffin file must survive"
+        );
+        assert!(
+            !dv_entry_is_live(&table, shared_puffin_path, 200).await,
+            "the dangling DV blob should be removed"
+        );
+    }
+
+    /// Two *dangling* DVs sharing one Puffin file must both be identified and
+    /// removed as distinct entries. Before deduping by identity instead of
+    /// path, the scan would collapse them into a single `DataFile`, so only
+    /// one of the two manifest entries would end up in the removal set —
+    /// leaving the other to survive even though it is dangling too.
+    #[tokio::test]
+    async fn test_shared_puffin_file_removes_both_dangling_dvs() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_shared_puffin_both").await;
+
+        let shared_puffin_path = "memory://test/shared.puffin";
+
+        let dangling_dv_a = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(shared_puffin_path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .record_count(1)
+            .file_size_in_bytes(200)
+            .referenced_data_file(Some("memory://test/nonexistent-a.parquet".to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(64))
+            .build()
+            .unwrap();
+
+        let dangling_dv_b = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(shared_puffin_path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .record_count(1)
+            .file_size_in_bytes(200)
+            .referenced_data_file(Some("memory://test/nonexistent-b.parquet".to_string()))
+            .content_offset(Some(200))
+            .content_size_in_bytes(Some(64))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![dangling_dv_a, dangling_dv_b])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 2,
+            "both dangling DV blobs must be counted and removed, not collapsed into one"
+        );
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        assert!(
+            !dv_entry_is_live(&table, shared_puffin_path, 4).await,
+            "dangling DV blob A should be removed"
+        );
+        assert!(
+            !dv_entry_is_live(&table, shared_puffin_path, 200).await,
+            "dangling DV blob B should be removed"
+        );
+    }
+
+    /// V2 position deletes may omit `referenced_data_file` while their
+    /// `file_path` column's lower/upper bounds still prove a single target (the
+    /// same heuristic the reader uses, see `delete_file_index`). A delete
+    /// scoped this way to an already-removed data file is provably dangling
+    /// even when a partition-wide sequence check alone would keep it, because
+    /// another still-live data file with a lower sequence number sits in the
+    /// same partition.
+    #[tokio::test]
+    async fn test_position_delete_without_ref_removed_by_bounds_inference() {
+        use crate::delete_file_index::FIELD_ID_POSITIONAL_DELETE_FILE_PATH;
+        use crate::spec::Datum;
+
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_partitioned_table(&catalog, "test_pos_bounds").await;
+
+        // seq 1: data-a in partition 1, stays alive with the lowest sequence
+        // number in the partition.
+        let table = commit_partitioned_file(
+            &catalog,
+            &table,
+            "memory://test/data-a.parquet",
+            DataContentType::Data,
+            1,
+        )
+        .await;
+
+        // seq 2: position delete in partition 1 whose bounds prove it targets
+        // only "nonexistent-data-b.parquet" (a data file that was already
+        // compacted away and never re-appears). Its sequence (2) is not below
+        // the partition's min data sequence (1), so a sequence-only check
+        // would wrongly keep it.
+        let target_path = "memory://test/nonexistent-data-b.parquet";
+        let spec_id = table.metadata().default_partition_spec_id();
+        let pos_delete = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("memory://test/pos-bounds.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .partition_spec_id(spec_id)
+            .partition(Struct::from_iter([Some(Literal::int(1))]))
+            .lower_bounds(HashMap::from([(
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(target_path),
+            )]))
+            .upper_bounds(HashMap::from([(
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+                Datum::string(target_path),
+            )]))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![pos_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 1,
+            "bounds prove the delete targets an already-removed data file, so it is dangling \
+             even though the partition-wide sequence check alone would keep it"
+        );
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        assert!(
+            !delete_file_is_live(&table, "memory://test/pos-bounds.parquet").await,
+            "the bounds-scoped dangling position delete should be removed"
         );
     }
 }

@@ -34,6 +34,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::utils::{delete_file_key, delete_file_paths};
 
 /// Which snapshot [`Operation`] a file replacement records.
 ///
@@ -105,6 +106,11 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
             let mut deleted_entries = Vec::new();
 
+            // Cheap, allocation-free path pre-filter: only entries whose path
+            // is even a candidate pay for the allocating `delete_file_key`.
+            let removed_delete_paths =
+                delete_file_paths(&snapshot_produce.removed_delete_file_keys);
+
             for manifest_file in manifest_list.entries() {
                 if !snapshot_produce.has_removed_files_for_manifest_type(manifest_file.content) {
                     continue;
@@ -129,9 +135,10 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
                     if (entry.content_type() == DataContentType::PositionDeletes
                         || entry.content_type() == DataContentType::EqualityDeletes)
+                        && removed_delete_paths.contains(entry.data_file().file_path())
                         && snapshot_produce
-                            .removed_delete_file_paths
-                            .contains(entry.data_file().file_path())
+                            .removed_delete_file_keys
+                            .contains(&delete_file_key(entry.data_file()))
                     {
                         deleted_entries.push(gen_manifest_entry(entry));
                     }
@@ -165,6 +172,8 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
         let mut existing_files = Vec::new();
 
+        let removed_delete_paths = delete_file_paths(&snapshot_produce.removed_delete_file_keys);
+
         for manifest_file in manifest_list.entries() {
             if !snapshot_produce.has_removed_files_for_manifest_type(manifest_file.content) {
                 existing_files.push(manifest_file.clone());
@@ -173,6 +182,10 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
             let manifest = manifest_file.load_manifest(file_io_ref).await?;
 
+            // Keyed by `(file_path, content_offset, content_size_in_bytes)`, not
+            // `file_path` alone: several deletion vectors can share one Puffin
+            // file, and a path-only key would drop every DV in that file once
+            // any one of them is found deleted.
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()
@@ -180,26 +193,33 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                     if !entry.is_alive() {
                         return None;
                     }
-                    if snapshot_produce
-                        .removed_data_file_paths
-                        .contains(entry.data_file().file_path())
-                        || snapshot_produce
-                            .removed_delete_file_paths
-                            .contains(entry.data_file().file_path())
-                    {
-                        Some(entry.data_file().file_path().to_string())
-                    } else {
-                        None
+                    let path = entry.data_file().file_path();
+                    if snapshot_produce.removed_data_file_paths.contains(path) {
+                        return Some(delete_file_key(entry.data_file()));
                     }
+                    if removed_delete_paths.contains(path) {
+                        let key = delete_file_key(entry.data_file());
+                        if snapshot_produce.removed_delete_file_keys.contains(&key) {
+                            return Some(key);
+                        }
+                    }
+                    None
                 })
                 .collect();
 
             if found_deleted_files.is_empty() {
                 existing_files.push(manifest_file.clone());
             } else {
-                // Rewrite the manifest file without the deleted data files
+                // Rewrite the manifest file without the deleted data files.
+                // `found_deleted_files` only ever holds a handful of entries
+                // (the ones actually removed from this manifest), so the same
+                // path pre-filter trick keeps this allocation-free for most
+                // surviving entries too.
+                let found_deleted_paths = delete_file_paths(&found_deleted_files);
                 let survives = |entry: &ManifestEntry| {
-                    entry.is_alive() && !found_deleted_files.contains(entry.data_file().file_path())
+                    entry.is_alive()
+                        && !(found_deleted_paths.contains(entry.data_file().file_path())
+                            && found_deleted_files.contains(&delete_file_key(entry.data_file())))
                 };
 
                 if manifest.entries().iter().any(|entry| survives(entry)) {
@@ -462,7 +482,7 @@ mod tests {
     /// `delete_entries` once guarded the delete-file branch with
     ///   `content == PositionDeletes || content == EqualityDeletes && removed.contains(path)`
     /// and because `&&` binds tighter than `||`, every `PositionDeletes` entry in
-    /// the parent snapshot matched regardless of `removed_delete_file_paths`.
+    /// the parent snapshot matched regardless of `removed_delete_file_keys`.
     async fn assert_only_removed_delete_files_marked<M: ReplaceFilesMode>() {
         let table = make_v2_table_with_delete_manifest().await;
         let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
