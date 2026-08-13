@@ -63,11 +63,9 @@ async fn get_catalog() -> HmsCatalog {
     ]);
 
     // Wait for bucket to actually exist
-    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-        customized_credential_load: None,
-    }))
-    .with_props(props.clone())
-    .build();
+    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
+        .with_props(props.clone())
+        .build();
 
     let mut retries = 0;
     while retries < 30 {
@@ -81,9 +79,7 @@ async fn get_catalog() -> HmsCatalog {
     }
 
     HmsCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
         .load("hms", props)
         .await
         .unwrap()

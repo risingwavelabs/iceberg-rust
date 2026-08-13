@@ -696,7 +696,7 @@ use iceberg::io::FileIOBuilder;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
 // Create FileIO with explicit S3 factory
-let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3))
+let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
     .with_prop("s3.region", "us-east-1")
     .with_prop("s3.access-key-id", "my-access-key")
     .with_prop("s3.secret-access-key", "my-secret-key")
@@ -721,7 +721,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 
 // Inject S3 storage factory for cloud storage support
 let catalog = GlueCatalogBuilder::default()
-    .with_storage_factory(Arc::new(OpenDalStorageFactory::S3))
+    .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
     .load("my_catalog", HashMap::from([
         ("warehouse".to_string(), "s3://my-bucket/warehouse".to_string()),
         ("s3.region".to_string(), "us-east-1".to_string()),
@@ -746,7 +746,7 @@ use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
 // Create a custom StorageFactory
-let storage_factory = Arc::new(OpenDalStorageFactory::S3);
+let storage_factory = Arc::new(OpenDalStorageFactory::s3());
 
 // Inject StorageFactory into catalog
 let catalog = GlueCatalogBuilder::default()

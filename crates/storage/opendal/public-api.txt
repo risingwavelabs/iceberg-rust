@@ -38,26 +38,6 @@ impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalStorage
 pub fn iceberg_storage_opendal::OpenDalStorage::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalStorage
 pub fn iceberg_storage_opendal::OpenDalStorage::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
-pub enum iceberg_storage_opendal::OpenDalStorageFactory
-pub iceberg_storage_opendal::OpenDalStorageFactory::Azblob
-pub iceberg_storage_opendal::OpenDalStorageFactory::Azdls
-pub iceberg_storage_opendal::OpenDalStorageFactory::Fs
-pub iceberg_storage_opendal::OpenDalStorageFactory::Gcs
-pub iceberg_storage_opendal::OpenDalStorageFactory::Hf
-pub iceberg_storage_opendal::OpenDalStorageFactory::Memory
-pub iceberg_storage_opendal::OpenDalStorageFactory::Oss
-pub iceberg_storage_opendal::OpenDalStorageFactory::S3
-pub iceberg_storage_opendal::OpenDalStorageFactory::S3::customized_credential_load: core::option::Option<iceberg_storage_opendal::CustomAwsCredentialLoader>
-impl core::clone::Clone for iceberg_storage_opendal::OpenDalStorageFactory
-pub fn iceberg_storage_opendal::OpenDalStorageFactory::clone(&self) -> iceberg_storage_opendal::OpenDalStorageFactory
-impl core::fmt::Debug for iceberg_storage_opendal::OpenDalStorageFactory
-pub fn iceberg_storage_opendal::OpenDalStorageFactory::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl iceberg::io::storage::StorageFactory for iceberg_storage_opendal::OpenDalStorageFactory
-pub fn iceberg_storage_opendal::OpenDalStorageFactory::build(&self, config: &iceberg::io::storage::config::StorageConfig) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
-impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalStorageFactory
-pub fn iceberg_storage_opendal::OpenDalStorageFactory::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalStorageFactory
-pub fn iceberg_storage_opendal::OpenDalStorageFactory::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg_storage_opendal::CustomAwsCredentialLoader(_)
 impl iceberg_storage_opendal::CustomAwsCredentialLoader
 pub fn iceberg_storage_opendal::CustomAwsCredentialLoader::new(provider: impl reqsign_core::api::ProvideCredential<Credential = reqsign_aws_core::credential::Credential> + 'static) -> Self
@@ -101,3 +81,24 @@ impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalResolvingSto
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalResolvingStorageFactory
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub struct iceberg_storage_opendal::OpenDalStorageFactory
+impl iceberg_storage_opendal::OpenDalStorageFactory
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::azblob() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::azdls() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::fs() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::gcs() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::hf() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::memory() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::oss() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::s3() -> Self
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::s3_with_credential_loader(loader: iceberg_storage_opendal::CustomAwsCredentialLoader) -> Self
+impl core::clone::Clone for iceberg_storage_opendal::OpenDalStorageFactory
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::clone(&self) -> iceberg_storage_opendal::OpenDalStorageFactory
+impl core::fmt::Debug for iceberg_storage_opendal::OpenDalStorageFactory
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl iceberg::io::storage::StorageFactory for iceberg_storage_opendal::OpenDalStorageFactory
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::build(&self, config: &iceberg::io::storage::config::StorageConfig) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
+impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalStorageFactory
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalStorageFactory
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>

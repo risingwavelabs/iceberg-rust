@@ -157,7 +157,7 @@ pub(crate) fn s3_config_build(
 ///
 /// Wraps any [`ProvideCredential`] implementation for use with the S3 storage backend.
 /// Use [`CustomAwsCredentialLoader::new`] to create one, then pass it to
-/// [`OpenDalStorageFactory::S3`](crate::OpenDalStorageFactory).
+/// [`OpenDalStorageFactory::s3`](crate::OpenDalStorageFactory::s3).
 pub struct CustomAwsCredentialLoader(Arc<dyn ProvideCredentialDyn<Credential = AwsCredential>>);
 
 impl Clone for CustomAwsCredentialLoader {

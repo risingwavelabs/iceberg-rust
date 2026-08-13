@@ -227,12 +227,8 @@ impl GlueCatalog {
 
         let client = aws_sdk_glue::Client::new(&sdk_config);
 
-        // Use provided factory or default to OpenDalStorageFactory::S3
-        let factory = storage_factory.unwrap_or_else(|| {
-            Arc::new(OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
-            })
-        });
+        // Use the provided factory or the default S3 factory.
+        let factory = storage_factory.unwrap_or_else(|| Arc::new(OpenDalStorageFactory::s3()));
         let file_io = FileIOBuilder::new(factory)
             .with_props(file_io_props)
             .build();

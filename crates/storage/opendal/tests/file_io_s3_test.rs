@@ -39,17 +39,15 @@ mod tests {
 
         let minio_endpoint = get_minio_endpoint();
 
-        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
-        .with_props(vec![
-            (S3_ENDPOINT, minio_endpoint),
-            (S3_ACCESS_KEY_ID, "admin".to_string()),
-            (S3_SECRET_ACCESS_KEY, "password".to_string()),
-            (S3_REGION, "us-east-1".to_string()),
-            (S3_PATH_STYLE_ACCESS, "true".to_string()),
-        ])
-        .build()
+        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
+            .with_props(vec![
+                (S3_ENDPOINT, minio_endpoint),
+                (S3_ACCESS_KEY_ID, "admin".to_string()),
+                (S3_SECRET_ACCESS_KEY, "password".to_string()),
+                (S3_REGION, "us-east-1".to_string()),
+                (S3_PATH_STYLE_ACCESS, "true".to_string()),
+            ])
+            .build()
     }
 
     #[tokio::test]
@@ -137,9 +135,9 @@ mod tests {
         let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
 
         // Test that the loader can be used in FileIOBuilder with OpenDalStorageFactory
-        let _builder = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: Some(custom_loader),
-        }))
+        let _builder = FileIOBuilder::new(Arc::new(
+            OpenDalStorageFactory::s3_with_credential_loader(custom_loader),
+        ))
         .with_props(vec![
             (S3_ENDPOINT, "http://localhost:9000".to_string()),
             ("bucket", "test-bucket".to_string()),
@@ -159,9 +157,9 @@ mod tests {
         let minio_endpoint = get_minio_endpoint();
 
         // Build FileIO with custom credential loader via OpenDalStorageFactory
-        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: Some(custom_loader),
-        }))
+        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(
+            OpenDalStorageFactory::s3_with_credential_loader(custom_loader),
+        ))
         .with_props(vec![
             (S3_ENDPOINT, minio_endpoint),
             (S3_REGION, "us-east-1".to_string()),
@@ -187,9 +185,9 @@ mod tests {
         let minio_endpoint = get_minio_endpoint();
 
         // Build FileIO with custom credential loader via OpenDalStorageFactory
-        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: Some(custom_loader),
-        }))
+        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(
+            OpenDalStorageFactory::s3_with_credential_loader(custom_loader),
+        ))
         .with_props(vec![
             (S3_ENDPOINT, minio_endpoint),
             (S3_REGION, "us-east-1".to_string()),

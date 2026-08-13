@@ -62,9 +62,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 #[tokio::main]
 async fn main() -> iceberg::Result<()> {
     let catalog = RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
         .load(
             "my_catalog",
             HashMap::from([

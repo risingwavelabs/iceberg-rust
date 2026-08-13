@@ -39,7 +39,7 @@ mod tests {
         // A bucket must exist for FileIO
         create_bucket(FAKE_GCS_BUCKET, &gcs_endpoint).await.unwrap();
 
-        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Gcs))
+        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::gcs()))
             .with_props(vec![
                 (GCS_SERVICE_PATH, gcs_endpoint),
                 (GCS_NO_AUTH, "true".to_string()),

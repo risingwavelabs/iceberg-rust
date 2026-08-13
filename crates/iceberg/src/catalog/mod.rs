@@ -147,9 +147,7 @@ pub trait CatalogBuilder: Default + Debug + Send + Sync {
     /// use std::sync::Arc;
     ///
     /// let catalog = MyCatalogBuilder::default()
-    ///     .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-    ///         customized_credential_load: None,
-    ///     }))
+    ///     .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
     ///     .load("my_catalog", props)
     ///     .await?;
     /// ```
