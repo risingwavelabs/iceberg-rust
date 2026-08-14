@@ -35,7 +35,9 @@ use url::Url;
 
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
-use crate::{ConfiguredOpenDalStorage, OpenDalStorage};
+use crate::{
+    ConfiguredOpenDalStorage, OpenDalStorage, SharedOperatorCache, default_operator_cache,
+};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -167,6 +169,9 @@ pub struct OpenDalResolvingStorageFactory {
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
     customized_credential_load: Option<CustomAwsCredentialLoader>,
+    /// Operator cache shared by all resolving storages built by this factory.
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: SharedOperatorCache,
 }
 
 impl Default for OpenDalResolvingStorageFactory {
@@ -181,6 +186,7 @@ impl OpenDalResolvingStorageFactory {
         Self {
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: None,
+            operator_cache: default_operator_cache(),
         }
     }
 
@@ -200,6 +206,7 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: self.customized_credential_load.clone(),
+            operator_cache: self.operator_cache.clone(),
         }))
     }
 }
@@ -221,6 +228,9 @@ pub struct OpenDalResolvingStorage {
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
     customized_credential_load: Option<CustomAwsCredentialLoader>,
+    /// Operator cache inherited from the resolving factory.
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: SharedOperatorCache,
 }
 
 impl OpenDalResolvingStorage {
@@ -258,7 +268,11 @@ impl OpenDalResolvingStorage {
             &self.customized_credential_load,
         )?;
         let config = StorageConfig::from_props(self.props.clone());
-        let storage = Arc::new(ConfiguredOpenDalStorage::new(storage, &config)?);
+        let storage = Arc::new(ConfiguredOpenDalStorage::new(
+            storage,
+            &config,
+            self.operator_cache.clone(),
+        )?);
         cache.insert(scheme, storage.clone());
         Ok(storage)
     }
@@ -350,6 +364,7 @@ mod tests {
         OpenDalResolvingStorage {
             props: HashMap::new(),
             storages: RwLock::new(HashMap::new()),
+            operator_cache: default_operator_cache(),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: None,
         }

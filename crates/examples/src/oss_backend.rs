@@ -45,7 +45,7 @@ static OSS_ACCESS_KEY_SECRET: &str = "99999999999999999999999999999999";
 async fn main() {
     // Create the REST iceberg catalog with explicit OSS storage factory.
     let catalog = RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::Oss))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::oss()))
         .load(
             "rest",
             HashMap::from([

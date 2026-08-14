@@ -226,12 +226,8 @@ impl S3TablesCatalog {
             aws_sdk_s3tables::Client::new(&aws_config)
         };
 
-        // Use provided factory or default to OpenDalStorageFactory::S3
-        let factory = storage_factory.unwrap_or_else(|| {
-            Arc::new(OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
-            })
-        });
+        // Use the provided factory or the default S3 factory.
+        let factory = storage_factory.unwrap_or_else(|| Arc::new(OpenDalStorageFactory::s3()));
         let file_io = FileIOBuilder::new(factory)
             .with_props(&config.props)
             .build();

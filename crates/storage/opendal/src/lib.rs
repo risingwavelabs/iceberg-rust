@@ -26,7 +26,7 @@ mod utils;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -40,6 +40,7 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
+use once_cell::sync::OnceCell;
 use opendal::Operator;
 use opendal::layers::RetryLayer;
 #[cfg(not(madsim))]
@@ -167,27 +168,168 @@ where T: std::str::FromStr {
         .transpose()
 }
 
+type SharedOperatorCache = Arc<OperatorCache>;
+
+/// The subset of [`OpenDalStorageOptions`] that changes a configured operator.
+///
+/// `write_chunk_size` is intentionally excluded because it is applied to each
+/// writer after the operator is selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OperatorLayerOptions {
+    timeout_seconds: Option<u64>,
+    max_retries: Option<usize>,
+    retry_min_delay_ms: Option<u64>,
+    retry_max_delay_ms: Option<u64>,
+}
+
+impl From<&OpenDalStorageOptions> for OperatorLayerOptions {
+    fn from(options: &OpenDalStorageOptions) -> Self {
+        Self {
+            timeout_seconds: options.timeout_seconds,
+            max_retries: options.max_retries,
+            retry_min_delay_ms: options.retry_min_delay_ms,
+            retry_max_delay_ms: options.retry_max_delay_ms,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum OperatorBackendConfig {
+    #[cfg(feature = "opendal-s3")]
+    S3(Arc<S3Config>),
+    #[cfg(feature = "opendal-gcs")]
+    Gcs(Arc<GcsConfig>),
+}
+
+/// Cache entries are scoped by everything that affects the resulting operator.
+/// Keeping the parsed backend config in the key also normalizes aliases and
+/// defaults before equality is evaluated.
+#[derive(Clone, PartialEq, Eq)]
+struct OperatorCacheKey {
+    backend_config: OperatorBackendConfig,
+    bucket: String,
+    layer_options: OperatorLayerOptions,
+}
+
+struct OperatorCacheEntry {
+    key: OperatorCacheKey,
+    operator: Arc<OnceCell<Operator>>,
+}
+
+#[derive(Default)]
+struct OperatorCache {
+    // OpenDAL config types intentionally do not implement `Hash`. The number of
+    // distinct bucket/config pairs owned by one catalog factory is expected to
+    // be small, so a vector keeps equality exact without hashing credentials.
+    entries: RwLock<Vec<OperatorCacheEntry>>,
+}
+
+impl std::fmt::Debug for OperatorCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entry_count = self.entries.read().map(|entries| entries.len()).ok();
+        formatter
+            .debug_struct("OperatorCache")
+            .field("entry_count", &entry_count)
+            .finish()
+    }
+}
+
+impl OperatorCache {
+    fn get_or_create(
+        &self,
+        key: OperatorCacheKey,
+        build: impl FnOnce() -> Result<Operator>,
+    ) -> Result<Operator> {
+        let operator = {
+            let entries = self.entries.read().map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Operator cache lock poisoned: {error}"),
+                )
+            })?;
+            entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.operator.clone())
+        };
+
+        let operator = match operator {
+            Some(operator) => operator,
+            None => {
+                let mut entries = self.entries.write().map_err(|error| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Operator cache lock poisoned: {error}"),
+                    )
+                })?;
+                if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
+                    entry.operator.clone()
+                } else {
+                    let operator = Arc::new(OnceCell::new());
+                    entries.push(OperatorCacheEntry {
+                        key,
+                        operator: operator.clone(),
+                    });
+                    operator
+                }
+            }
+        };
+
+        // `get_or_try_init` coalesces concurrent construction for this key,
+        // while a failed build leaves the cell empty so a later call can retry.
+        operator.get_or_try_init(build).cloned()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.read().unwrap().len()
+    }
+}
+
+fn default_operator_cache() -> SharedOperatorCache {
+    Arc::new(OperatorCache::default())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConfiguredOpenDalStorage {
     storage: OpenDalStorage,
     options: OpenDalStorageOptions,
+    /// Shared factory-owned cache for fully configured S3 and GCS operators.
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: SharedOperatorCache,
 }
 
 impl ConfiguredOpenDalStorage {
-    fn new(storage: OpenDalStorage, config: &StorageConfig) -> Result<Self> {
+    fn new(
+        storage: OpenDalStorage,
+        config: &StorageConfig,
+        operator_cache: SharedOperatorCache,
+    ) -> Result<Self> {
         Ok(Self {
             storage,
             options: OpenDalStorageOptions::try_from(config)?,
+            operator_cache,
         })
     }
 }
 
 /// OpenDAL-based storage factory.
 ///
-/// Maps scheme to the corresponding OpenDalStorage storage variant.
-/// Use this factory with `FileIOBuilder::new(factory)` to create FileIO instances.
+/// Maps a backend to the corresponding [`OpenDalStorage`] variant. All
+/// [`FileIO`](iceberg::io::FileIO) instances built from this factory share its
+/// S3/GCS operator cache for the lifetime of the factory. Cloning a factory
+/// preserves that cache; calling a backend constructor creates an independent
+/// factory and cache.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum OpenDalStorageFactory {
+#[serde(transparent)]
+pub struct OpenDalStorageFactory {
+    backend: OpenDalStorageBackend,
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: SharedOperatorCache,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum OpenDalStorageBackend {
     /// Memory storage factory.
     #[cfg(feature = "opendal-memory")]
     Memory,
@@ -218,40 +360,104 @@ pub enum OpenDalStorageFactory {
     Hf,
 }
 
-#[typetag::serde(name = "OpenDalStorageFactory")]
-impl StorageFactory for OpenDalStorageFactory {
+impl OpenDalStorageFactory {
+    fn new(backend: OpenDalStorageBackend) -> Self {
+        Self {
+            backend,
+            operator_cache: default_operator_cache(),
+        }
+    }
+
+    /// Create a memory storage factory.
+    #[cfg(feature = "opendal-memory")]
+    pub fn memory() -> Self {
+        Self::new(OpenDalStorageBackend::Memory)
+    }
+
+    /// Create a local filesystem storage factory.
+    #[cfg(feature = "opendal-fs")]
+    pub fn fs() -> Self {
+        Self::new(OpenDalStorageBackend::Fs)
+    }
+
+    /// Create an S3 storage factory using the default credential chain.
+    #[cfg(feature = "opendal-s3")]
+    pub fn s3() -> Self {
+        Self::new(OpenDalStorageBackend::S3 {
+            customized_credential_load: None,
+        })
+    }
+
+    /// Create an S3 storage factory using a custom credential loader.
+    #[cfg(feature = "opendal-s3")]
+    pub fn s3_with_credential_loader(loader: CustomAwsCredentialLoader) -> Self {
+        Self::new(OpenDalStorageBackend::S3 {
+            customized_credential_load: Some(loader),
+        })
+    }
+
+    /// Create a GCS storage factory.
+    #[cfg(feature = "opendal-gcs")]
+    pub fn gcs() -> Self {
+        Self::new(OpenDalStorageBackend::Gcs)
+    }
+
+    /// Create an OSS storage factory.
+    #[cfg(feature = "opendal-oss")]
+    pub fn oss() -> Self {
+        Self::new(OpenDalStorageBackend::Oss)
+    }
+
+    /// Create an Azure Data Lake Storage factory.
+    #[cfg(feature = "opendal-azdls")]
+    pub fn azdls() -> Self {
+        Self::new(OpenDalStorageBackend::Azdls)
+    }
+
+    /// Create an Azure Blob Storage factory.
+    #[cfg(feature = "opendal-azblob")]
+    pub fn azblob() -> Self {
+        Self::new(OpenDalStorageBackend::Azblob)
+    }
+
+    /// Create a HuggingFace Hub storage factory.
+    #[cfg(feature = "opendal-hf")]
+    pub fn hf() -> Self {
+        Self::new(OpenDalStorageBackend::Hf)
+    }
+
     #[allow(unused_variables)]
-    fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        let storage = match self {
+    fn build_configured(&self, config: &StorageConfig) -> Result<ConfiguredOpenDalStorage> {
+        let storage = match &self.backend {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorageFactory::Memory => OpenDalStorage::Memory(memory_config_build()?),
+            OpenDalStorageBackend::Memory => OpenDalStorage::Memory(memory_config_build()?),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => OpenDalStorage::LocalFs,
+            OpenDalStorageBackend::Fs => OpenDalStorage::LocalFs,
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorageFactory::S3 {
+            OpenDalStorageBackend::S3 {
                 customized_credential_load,
             } => OpenDalStorage::S3 {
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
             },
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorageFactory::Gcs => OpenDalStorage::Gcs {
+            OpenDalStorageBackend::Gcs => OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorageFactory::Oss => OpenDalStorage::Oss {
+            OpenDalStorageBackend::Oss => OpenDalStorage::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageFactory::Azdls => OpenDalStorage::Azdls {
+            OpenDalStorageBackend::Azdls => OpenDalStorage::Azdls {
                 config: azdls_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-azblob")]
-            OpenDalStorageFactory::Azblob => OpenDalStorage::Azblob {
+            OpenDalStorageBackend::Azblob => OpenDalStorage::Azblob {
                 config: azblob_config_parse(config.props().clone()).into(),
             },
             #[cfg(feature = "opendal-hf")]
-            OpenDalStorageFactory::Hf => OpenDalStorage::Hf {
+            OpenDalStorageBackend::Hf => OpenDalStorage::Hf {
                 config: hf_config_parse(config.props().clone())?.into(),
             },
             #[cfg(all(
@@ -271,7 +477,14 @@ impl StorageFactory for OpenDalStorageFactory {
                 ));
             }
         };
-        Ok(Arc::new(ConfiguredOpenDalStorage::new(storage, config)?))
+        ConfiguredOpenDalStorage::new(storage, config, self.operator_cache.clone())
+    }
+}
+
+#[typetag::serde(name = "OpenDalStorageFactory")]
+impl StorageFactory for OpenDalStorageFactory {
+    fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(self.build_configured(config)?))
     }
 }
 
@@ -344,6 +557,34 @@ pub enum OpenDalStorage {
 }
 
 impl OpenDalStorage {
+    #[allow(unreachable_patterns)]
+    fn operator_cache_key(
+        &self,
+        path: &str,
+        options: &OpenDalStorageOptions,
+    ) -> Result<Option<OperatorCacheKey>> {
+        let backend_config = match self {
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorage::S3 { config, .. } => OperatorBackendConfig::S3(config.clone()),
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorage::Gcs { config } => OperatorBackendConfig::Gcs(config.clone()),
+            _ => return Ok(None),
+        };
+
+        let url = url::Url::parse(path)?;
+        let bucket = url.host_str().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid object storage url: {path}, missing bucket"),
+            )
+        })?;
+        Ok(Some(OperatorCacheKey {
+            backend_config,
+            bucket: bucket.to_string(),
+            layer_options: options.into(),
+        }))
+    }
+
     /// Creates operator from path.
     ///
     /// # Arguments
@@ -361,8 +602,31 @@ impl OpenDalStorage {
         &self,
         path: &'a impl AsRef<str>,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<(Operator, &'a str)> {
         let path = path.as_ref();
+        if let Some(operator_cache) = operator_cache
+            && let Some(cache_key) = self.operator_cache_key(path, options)?
+        {
+            // Validate and relativize before consulting the cache so a cached operator
+            // cannot make a malformed path appear valid.
+            let relative_path = self.relativize_path(path)?;
+            let operator = operator_cache.get_or_create(cache_key, || {
+                self.build_operator_with_options(path, options)
+                    .map(|(operator, _)| operator)
+            })?;
+            return Ok((operator, relative_path));
+        }
+
+        self.build_operator_with_options(path, options)
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn build_operator_with_options<'a>(
+        &self,
+        path: &'a str,
+        options: &OpenDalStorageOptions,
+    ) -> Result<(Operator, &'a str)> {
         let (operator, relative_path): (Operator, &str) = match self {
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(op) => {
@@ -649,8 +913,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<bool> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         operator
             .exists(relative_path)
             .await
@@ -661,8 +927,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<FileMetadata> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let metadata = operator
             .stat(relative_path)
             .await
@@ -676,8 +944,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<Bytes> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(operator
             .read(relative_path)
             .await
@@ -689,8 +959,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<Box<dyn FileRead>> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(Box::new(OpenDalReader(
             operator
                 .reader(relative_path)
@@ -704,8 +976,11 @@ impl OpenDalStorage {
         path: &str,
         bytes: Bytes,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
-        let mut writer = self.writer_with_options(path, options).await?;
+        let mut writer = self
+            .writer_with_options(path, options, operator_cache)
+            .await?;
         writer.write(bytes).await?;
         writer.close().await
     }
@@ -714,8 +989,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<Box<dyn FileWrite>> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let mut writer = operator.writer_with(relative_path);
         if self.uses_append_mode() {
             writer = writer.append(true);
@@ -728,8 +1005,14 @@ impl OpenDalStorage {
         )))
     }
 
-    async fn delete_with_options(&self, path: &str, options: &OpenDalStorageOptions) -> Result<()> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+    async fn delete_with_options(
+        &self,
+        path: &str,
+        options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
+    ) -> Result<()> {
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         operator
             .delete(relative_path)
             .await
@@ -740,8 +1023,10 @@ impl OpenDalStorage {
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let path = if relative_path.ends_with('/') {
             relative_path.to_string()
         } else {
@@ -758,6 +1043,7 @@ impl OpenDalStorage {
         &self,
         mut paths: BoxStream<'static, String>,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
@@ -769,7 +1055,7 @@ impl OpenDalStorage {
                 }
                 Entry::Vacant(entry) => {
                     let (operator, relative_path) =
-                        self.create_operator_with_options(&path, options)?;
+                        self.create_operator_with_options(&path, options, operator_cache)?;
                     let relative_path = relative_path.to_string();
                     let deleter = operator.deleter().await.map_err(from_opendal_error)?;
                     (relative_path, entry.insert(deleter))
@@ -792,9 +1078,11 @@ impl OpenDalStorage {
         path: &str,
         recursive: bool,
         options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
         let path: Arc<str> = Arc::from(path);
-        let (operator, relative_path) = self.create_operator_with_options(&path, options)?;
+        let (operator, relative_path) =
+            self.create_operator_with_options(&path, options, operator_cache)?;
         let absolute_prefix: Arc<str> =
             Arc::from(&path[..path.len().saturating_sub(relative_path.len())]);
         let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
@@ -835,47 +1123,47 @@ impl OpenDalStorage {
 #[async_trait]
 impl Storage for OpenDalStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        self.exists_with_options(path, &OpenDalStorageOptions::default())
+        self.exists_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.metadata_with_options(path, &OpenDalStorageOptions::default())
+        self.metadata_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        self.read_with_options(path, &OpenDalStorageOptions::default())
+        self.read_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.reader_with_options(path, &OpenDalStorageOptions::default())
+        self.reader_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.write_with_options(path, bs, &OpenDalStorageOptions::default())
+        self.write_with_options(path, bs, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.writer_with_options(path, &OpenDalStorageOptions::default())
+        self.writer_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        self.delete_with_options(path, &OpenDalStorageOptions::default())
+        self.delete_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
-        self.delete_prefix_with_options(path, &OpenDalStorageOptions::default())
+        self.delete_prefix_with_options(path, &OpenDalStorageOptions::default(), None)
             .await
     }
 
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
-        self.delete_stream_with_options(paths, &OpenDalStorageOptions::default())
+        self.delete_stream_with_options(paths, &OpenDalStorageOptions::default(), None)
             .await
     }
 
@@ -884,7 +1172,7 @@ impl Storage for OpenDalStorage {
         path: &str,
         recursive: bool,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
-        self.list_with_options(path, recursive, &OpenDalStorageOptions::default())
+        self.list_with_options(path, recursive, &OpenDalStorageOptions::default(), None)
             .await
     }
 
@@ -903,46 +1191,56 @@ impl Storage for OpenDalStorage {
 #[async_trait]
 impl Storage for ConfiguredOpenDalStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        self.storage.exists_with_options(path, &self.options).await
+        self.storage
+            .exists_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.storage
-            .metadata_with_options(path, &self.options)
+            .metadata_with_options(path, &self.options, Some(&self.operator_cache))
             .await
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        self.storage.read_with_options(path, &self.options).await
+        self.storage
+            .read_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.storage.reader_with_options(path, &self.options).await
+        self.storage
+            .reader_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn write(&self, path: &str, bytes: Bytes) -> Result<()> {
         self.storage
-            .write_with_options(path, bytes, &self.options)
+            .write_with_options(path, bytes, &self.options, Some(&self.operator_cache))
             .await
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.storage.writer_with_options(path, &self.options).await
+        self.storage
+            .writer_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        self.storage.delete_with_options(path, &self.options).await
+        self.storage
+            .delete_with_options(path, &self.options, Some(&self.operator_cache))
+            .await
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
         self.storage
-            .delete_prefix_with_options(path, &self.options)
+            .delete_prefix_with_options(path, &self.options, Some(&self.operator_cache))
             .await
     }
 
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
         self.storage
-            .delete_stream_with_options(paths, &self.options)
+            .delete_stream_with_options(paths, &self.options, Some(&self.operator_cache))
             .await
     }
 
@@ -952,7 +1250,7 @@ impl Storage for ConfiguredOpenDalStorage {
         recursive: bool,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
         self.storage
-            .list_with_options(path, recursive, &self.options)
+            .list_with_options(path, recursive, &self.options, Some(&self.operator_cache))
             .await
     }
 
@@ -1003,7 +1301,228 @@ impl FileWrite for OpenDalWriter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "opendal-s3")]
+    use std::sync::Barrier;
+    #[cfg(feature = "opendal-s3")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(feature = "opendal-s3")]
+    use iceberg::io::{
+        CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
+        S3_SECRET_ACCESS_KEY,
+    };
+
     use super::*;
+
+    #[cfg(feature = "opendal-s3")]
+    fn test_s3_cache_key(bucket: &str) -> OperatorCacheKey {
+        let mut config = S3Config::default();
+        config.region = Some("us-east-1".to_string());
+        OperatorCacheKey {
+            backend_config: OperatorBackendConfig::S3(Arc::new(config)),
+            bucket: bucket.to_string(),
+            layer_options: OperatorLayerOptions::from(&OpenDalStorageOptions::default()),
+        }
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    fn create_cached_operator(storage: &ConfiguredOpenDalStorage, path: &str) {
+        storage
+            .storage
+            .create_operator_with_options(&path, &storage.options, Some(&storage.operator_cache))
+            .unwrap();
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_coalesces_concurrent_builds() {
+        const CONCURRENCY: usize = 16;
+
+        let cache = default_operator_cache();
+        let barrier = Arc::new(Barrier::new(CONCURRENCY));
+        let build_count = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..CONCURRENCY {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let build_count = build_count.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_create(test_s3_cache_key("test-bucket"), || {
+                            build_count.fetch_add(1, Ordering::SeqCst);
+                            let mut config = S3Config::default();
+                            config.region = Some("us-east-1".to_string());
+                            s3_config_build(&config, &None, "s3://test-bucket/path/to/file")
+                        })
+                        .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_failed_operator_build_can_be_retried() {
+        let cache = default_operator_cache();
+        let build_count = AtomicUsize::new(0);
+        let key = test_s3_cache_key("test-bucket");
+
+        let error = cache.get_or_create(key.clone(), || {
+            build_count.fetch_add(1, Ordering::SeqCst);
+            Err(Error::new(ErrorKind::Unexpected, "injected build failure"))
+        });
+        assert!(error.is_err());
+
+        cache
+            .get_or_create(key, || {
+                build_count.fetch_add(1, Ordering::SeqCst);
+                let mut config = S3Config::default();
+                config.region = Some("us-east-1".to_string());
+                s3_config_build(&config, &None, "s3://test-bucket/path/to/file")
+            })
+            .unwrap();
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_factory_cache_is_shared_across_storages_and_bucket_scoped() {
+        let factory = OpenDalStorageFactory::s3();
+        let config = StorageConfig::new().with_prop(S3_REGION, "us-east-1");
+        let first_storage = factory.build_configured(&config).unwrap();
+        let second_storage = factory.build_configured(&config).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &first_storage.operator_cache,
+            &second_storage.operator_cache
+        ));
+
+        create_cached_operator(&first_storage, "s3://bucket-a/path/to/first-file");
+        create_cached_operator(&second_storage, "s3://bucket-a/path/to/second-file");
+        create_cached_operator(&second_storage, "s3://bucket-b/path/to/third-file");
+
+        assert_eq!(factory.operator_cache.len(), 2);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_factory_cache_is_scoped_by_effective_configuration() {
+        let factory = OpenDalStorageFactory::s3();
+        let s3_region = StorageConfig::new().with_prop(S3_REGION, "us-east-1");
+        let client_region = StorageConfig::new().with_prop(CLIENT_REGION, "us-east-1");
+        let different_chunk_size = s3_region.clone().with_prop(IO_CHUNK_SIZE, "1024");
+        let different_region = StorageConfig::new().with_prop(S3_REGION, "us-west-2");
+        let different_endpoint = s3_region
+            .clone()
+            .with_prop(S3_ENDPOINT, "http://localhost:9001");
+        let different_credentials = s3_region
+            .clone()
+            .with_prop(S3_ACCESS_KEY_ID, "test-access-key")
+            .with_prop(S3_SECRET_ACCESS_KEY, "test-secret-key");
+        let different_path_style = s3_region.clone().with_prop(S3_PATH_STYLE_ACCESS, "true");
+        let different_timeout = s3_region.clone().with_prop(IO_TIMEOUT_SECONDS, "10");
+        let different_retry = s3_region.clone().with_prop(IO_MAX_RETRIES, "10");
+
+        for config in [&s3_region, &client_region, &different_chunk_size] {
+            let storage = factory.build_configured(config).unwrap();
+            create_cached_operator(&storage, "s3://test-bucket/path/to/file");
+        }
+        // Region aliases normalize to the same S3 config, while write chunk size
+        // is applied per writer and does not change the operator.
+        assert_eq!(factory.operator_cache.len(), 1);
+
+        for config in [
+            &different_region,
+            &different_endpoint,
+            &different_credentials,
+            &different_path_style,
+            &different_timeout,
+            &different_retry,
+        ] {
+            let storage = factory.build_configured(config).unwrap();
+            create_cached_operator(&storage, "s3://test-bucket/path/to/file");
+        }
+        assert_eq!(factory.operator_cache.len(), 7);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_follows_factory_lifecycle() {
+        let first_factory = OpenDalStorageFactory::s3();
+        let cloned_factory = first_factory.clone();
+        let second_factory = OpenDalStorageFactory::s3();
+        let config = StorageConfig::new().with_prop(S3_REGION, "us-east-1");
+
+        let first_storage = first_factory.build_configured(&config).unwrap();
+        let cloned_storage = cloned_factory.build_configured(&config).unwrap();
+        let second_storage = second_factory.build_configured(&config).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &first_storage.operator_cache,
+            &cloned_storage.operator_cache
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_storage.operator_cache,
+            &second_storage.operator_cache
+        ));
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_factory_operator_cache_is_reset_after_deserialization() {
+        let factory = OpenDalStorageFactory::s3();
+        let config = StorageConfig::new().with_prop(S3_REGION, "us-east-1");
+        let storage = factory.build_configured(&config).unwrap();
+        create_cached_operator(&storage, "s3://test-bucket/path/to/file");
+
+        let serialized = serde_json::to_string(&factory).unwrap();
+        let deserialized: OpenDalStorageFactory = serde_json::from_str(&serialized).unwrap();
+
+        // Keep the serialized representation compatible with the former
+        // public enum even though the factory now owns runtime state.
+        assert_eq!(serialized, r#"{"S3":{}}"#);
+        assert_eq!(factory.operator_cache.len(), 1);
+        assert_eq!(deserialized.operator_cache.len(), 0);
+        assert!(!Arc::ptr_eq(
+            &factory.operator_cache,
+            &deserialized.operator_cache
+        ));
+    }
+
+    #[cfg(feature = "opendal-gcs")]
+    #[test]
+    fn test_cached_gcs_operator_does_not_bypass_path_validation() {
+        let factory = OpenDalStorageFactory::gcs();
+        let storage = factory.build_configured(&StorageConfig::new()).unwrap();
+
+        storage
+            .storage
+            .create_operator_with_options(
+                &"gs://test-bucket/path/to/file",
+                &storage.options,
+                Some(&storage.operator_cache),
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .storage
+                .create_operator_with_options(
+                    &"s3://test-bucket/path/to/file",
+                    &storage.options,
+                    Some(&storage.operator_cache),
+                )
+                .is_err()
+        );
+        assert_eq!(factory.operator_cache.len(), 1);
+    }
 
     #[cfg(feature = "opendal-memory")]
     #[test]
@@ -1207,6 +1726,7 @@ mod tests {
         let storage = ConfiguredOpenDalStorage::new(
             OpenDalStorage::Memory(default_memory_operator()),
             &config,
+            default_operator_cache(),
         )
         .unwrap();
 

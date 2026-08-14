@@ -232,11 +232,9 @@ async fn glue_catalog() -> GlueCatalog {
         (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
     ]);
 
-    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-        customized_credential_load: None,
-    }))
-    .with_props(props.clone())
-    .build();
+    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
+        .with_props(props.clone())
+        .build();
 
     let mut retries = 0;
     while retries < 30 {
@@ -283,11 +281,9 @@ async fn hms_catalog() -> HmsCatalog {
         (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
     ]);
 
-    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-        customized_credential_load: None,
-    }))
-    .with_props(props.clone())
-    .build();
+    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
+        .with_props(props.clone())
+        .build();
 
     let mut retries = 0;
     while retries < 30 {
@@ -299,9 +295,7 @@ async fn hms_catalog() -> HmsCatalog {
     }
 
     HmsCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
         .load("hms", props)
         .await
         .unwrap()

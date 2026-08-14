@@ -33,9 +33,7 @@ use ordered_float::OrderedFloat;
 async fn test_evolved_schema() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();

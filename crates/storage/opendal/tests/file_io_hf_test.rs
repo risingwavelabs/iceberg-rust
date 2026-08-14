@@ -56,7 +56,7 @@ mod tests {
 
     fn get_file_io(token: &str) -> FileIO {
         set_up();
-        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Hf))
+        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::hf()))
             .with_props(vec![(HF_TOKEN, token.to_string())])
             .build()
     }
@@ -291,7 +291,7 @@ mod tests {
         set_up();
 
         // Build FileIO with HF_REVISION set in config — paths without @revision use it.
-        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Hf))
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::hf()))
             .with_props(vec![
                 (HF_TOKEN, token.to_string()),
                 (HF_REVISION, "main".to_string()),

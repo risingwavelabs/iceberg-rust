@@ -29,9 +29,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 async fn test_read_table_with_positional_deletes() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
