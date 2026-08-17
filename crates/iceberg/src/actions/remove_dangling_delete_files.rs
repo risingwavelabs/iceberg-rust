@@ -25,11 +25,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::delete_file_index::try_infer_single_referenced_data_file_from_bounds;
 use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, Struct};
-use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::table::Table;
+use crate::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
 use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, delete_file_key, for_each_manifest};
-use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
+use crate::{Catalog, Error, ErrorKind, Result, TableIdent, TableRequirement};
 
 /// Action to remove dangling delete files from a table.
 ///
@@ -193,6 +196,23 @@ impl RemoveDanglingDeleteFilesAction {
         let dangling_count = dangling.len();
         let txn = Transaction::new(&table);
         let branch = self.to_branch.clone();
+
+        // Fail the whole commit if `branch` has moved since the snapshot we just
+        // scanned, instead of silently re-applying our dangling-file decision
+        // against a structurally different (refreshed) snapshot. See
+        // `RequireScannedSnapshotAction` for why this must be the first action applied.
+        let txn = RequireScannedSnapshotAction {
+            branch: branch.clone(),
+            snapshot_id: snapshot.snapshot_id(),
+        }
+        .apply(txn)
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to build snapshot-guard action: {e}"),
+            )
+        })?;
+
         let action = txn
             .rewrite_files()
             .delete_files(dangling)
@@ -211,12 +231,45 @@ impl RemoveDanglingDeleteFilesAction {
     }
 }
 
+/// A no-op [`TransactionAction`] that only carries a [`TableRequirement`]: `branch` must
+/// still point at `snapshot_id` at commit time.
+///
+/// [`Transaction::commit`] unconditionally refreshes to the table's latest state on
+/// every attempt (not just retries) before re-applying its actions. Without this guard,
+/// a dangling-file decision computed against the snapshot scanned by
+/// [`RemoveDanglingDeleteFilesAction::execute`] could silently be replayed against a
+/// newer, structurally different snapshot — e.g. one where a concurrent commit made a
+/// previously-dangling delete applicable again. Chaining this action turns that into a
+/// hard, retryable-but-never-silent commit failure instead: the caller must re-invoke
+/// `execute()` to rescan.
+///
+/// This must be applied to the transaction *before* the real rewrite action: requirement
+/// checks run against the table state accumulated from all earlier actions in the same
+/// commit, so if this ran after the rewrite, it would be checking against the branch
+/// pointer the rewrite itself just moved (which never equals the scanned snapshot id).
+struct RequireScannedSnapshotAction {
+    branch: String,
+    snapshot_id: i64,
+}
+
+#[async_trait]
+impl TransactionAction for RequireScannedSnapshotAction {
+    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
+        Ok(ActionCommit::new(vec![], vec![
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: self.branch.clone(),
+                snapshot_id: Some(self.snapshot_id),
+            },
+        ]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::RemoveDanglingDeleteFilesAction;
+    use super::{RemoveDanglingDeleteFilesAction, RequireScannedSnapshotAction};
     use crate::catalog::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::catalog::{Catalog, CatalogBuilder};
     use crate::spec::{
@@ -1042,6 +1095,58 @@ mod tests {
         assert!(
             !delete_file_is_live(&table, "memory://test/pos-bounds.parquet").await,
             "the bounds-scoped dangling position delete should be removed"
+        );
+    }
+
+    /// Regression test for review of #168 point 1: a stale scan must not be silently
+    /// replayed against a table that moved concurrently.
+    ///
+    /// `Transaction::commit` unconditionally refreshes to the table's latest state
+    /// before re-applying its actions -- on every attempt, not just retries. Without a
+    /// guard, a dangling-file decision computed against an older snapshot could be
+    /// committed against a newer one where that decision may no longer hold.
+    /// `RequireScannedSnapshotAction` turns this into a hard, immediate commit failure
+    /// instead of a silent misapplication.
+    #[tokio::test]
+    async fn test_stale_scan_fails_instead_of_reapplying() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_stale_scan").await;
+        let table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+
+        // Simulate what `execute()` does: load and scan the table at snapshot A.
+        let table_at_scan = catalog.load_table(&table_ident).await.unwrap();
+        let scanned_snapshot_id = table_at_scan
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .snapshot_id();
+
+        // A concurrent writer commits on top of the same snapshot A, advancing the
+        // branch to a new snapshot B before our (simulated) commit lands.
+        let _ = commit_data_file(&catalog, &table, "memory://test/data-2.parquet").await;
+
+        // Build a transaction from the now-stale `table_at_scan`, guarded to require
+        // the branch is still at the snapshot we scanned -- exactly what
+        // `RemoveDanglingDeleteFilesAction::execute` does before its rewrite action.
+        let txn = Transaction::new(&table_at_scan);
+        let txn = RequireScannedSnapshotAction {
+            branch: MAIN_BRANCH.to_string(),
+            snapshot_id: scanned_snapshot_id,
+        }
+        .apply(txn)
+        .unwrap();
+
+        let result = txn.commit(catalog.as_ref()).await;
+
+        assert!(
+            result.is_err(),
+            "commit must fail when the branch moved since the scan, not silently succeed \
+             against the newer snapshot"
+        );
+        assert!(
+            result.unwrap_err().retryable(),
+            "the failure should be flagged retryable so callers know a fresh execute() call \
+             (rescan) may succeed"
         );
     }
 }
