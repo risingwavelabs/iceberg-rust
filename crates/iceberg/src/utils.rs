@@ -250,10 +250,39 @@ use futures::stream::{self, StreamExt};
 
 use crate::error::Result;
 use crate::io::FileIO;
-use crate::spec::{Manifest, ManifestFile, ManifestList, ManifestStatus, Snapshot};
+use crate::spec::{DataFile, Manifest, ManifestFile, ManifestList, ManifestStatus, Snapshot};
 
 pub(crate) const DEFAULT_DELETE_CONCURRENCY_LIMIT: usize = 10;
 pub(crate) const DEFAULT_LOAD_CONCURRENCY_LIMIT: usize = 16;
+
+/// Identity of a delete file, matching Java's `DeleteFileSet`: deletion vectors
+/// are addressed by `(file_path, content_offset, content_size_in_bytes)` since
+/// multiple DVs may share one physical Puffin file, while other delete files
+/// (whose offset/size are always `None`) are identified by `file_path` alone.
+pub(crate) type DeleteFileKey = (String, Option<i64>, Option<i64>);
+
+/// Builds a [`DeleteFileKey`] for `df`. Safe to use for any [`DataFile`],
+/// including data files: their offset/size are always `None`, so the key
+/// degenerates to `file_path` alone.
+pub(crate) fn delete_file_key(df: &DataFile) -> DeleteFileKey {
+    (
+        df.file_path().to_string(),
+        df.content_offset(),
+        df.content_size_in_bytes(),
+    )
+}
+
+/// Extracts just the `file_path` component of each key in `keys`.
+///
+/// Intended as a cheap pre-filter before the full [`DeleteFileKey`] check: a
+/// manifest scan can test a candidate entry's path against this set with no
+/// allocation (`HashSet<String>::contains` accepts `&str` via `Borrow`),
+/// reserving the allocating [`delete_file_key`] call for entries whose path
+/// actually matches — which, in the common case of removing a handful of
+/// dangling deletes from a much larger manifest, is the rare case.
+pub(crate) fn delete_file_paths(keys: &HashSet<DeleteFileKey>) -> HashSet<String> {
+    keys.iter().map(|(path, _, _)| path.clone()).collect()
+}
 
 /// Streams the manifest lists for `snapshots`, invoking `f` on each loaded
 /// [`ManifestList`] and dropping it immediately afterwards.

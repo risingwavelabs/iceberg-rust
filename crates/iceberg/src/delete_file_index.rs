@@ -31,9 +31,11 @@ use crate::spec::{DataContentType, DataFile, Struct};
 //
 // See Iceberg spec (position deletes) and our `POSITION_DELETE_SCHEMA` in
 // `writer/base_writer/position_delete_file_writer.rs`.
-const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2147483546;
+pub(crate) const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2147483546;
 
-fn try_infer_single_referenced_data_file_from_bounds(delete_file: &DataFile) -> Option<String> {
+pub(crate) fn try_infer_single_referenced_data_file_from_bounds(
+    delete_file: &DataFile,
+) -> Option<String> {
     // Match Iceberg Java's `DeleteFileUtil.referencedDataFile(DeleteFile)` heuristic:
     // if lower and upper bounds for PATH_ID are present and equal, the delete file
     // targets a single data file.

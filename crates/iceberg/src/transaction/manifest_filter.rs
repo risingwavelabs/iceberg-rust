@@ -28,6 +28,7 @@ use crate::spec::{
     ManifestWriter, ManifestWriterBuilder, PartitionSpec, Schema,
 };
 use crate::transaction::snapshot::new_manifest_path;
+use crate::utils::{DeleteFileKey, delete_file_key};
 use crate::{Error, ErrorKind};
 
 /// Context for creating manifest writers during filtering operations
@@ -107,8 +108,10 @@ impl ManifestWriterContext {
 
 /// Manager for filtering manifest files and handling delete operations
 pub struct ManifestFilterManager {
-    /// Files to be deleted by path
-    files_to_delete: HashMap<String, DataFile>,
+    /// Files to be deleted, keyed by `(file_path, content_offset, content_size_in_bytes)`
+    /// rather than path alone: several deletion vectors may share one Puffin file, so a
+    /// path-only key would collapse them.
+    files_to_delete: HashMap<DeleteFileKey, DataFile>,
 
     /// Minimum sequence number for removing old delete files
     min_sequence_number: i64,
@@ -119,7 +122,7 @@ pub struct ManifestFilterManager {
     /// Cache of filtered manifests to avoid reprocessing
     filtered_manifests: HashMap<String, ManifestFile>, // manifest_path -> filtered_manifest
     /// Tracking where files were deleted to validate retries quickly
-    filtered_manifest_to_deleted_files: HashMap<String, Vec<String>>, // manifest_path -> deleted_files
+    filtered_manifest_to_deleted_files: HashMap<String, Vec<DeleteFileKey>>, // manifest_path -> deleted_file_keys
     ///    this is only being used for the DeleteManifestFilterManager to detect orphaned deletes for removed data file paths
     removed_data_file_path: HashSet<String>,
 
@@ -172,9 +175,9 @@ impl ManifestFilterManager {
     /// Mark a data file for deletion
     pub fn delete_file(&mut self, file: DataFile) -> Result<()> {
         // Todo: check all deletes references in manifests?
-        let file_path = file.file_path.clone();
+        let key = delete_file_key(&file);
 
-        self.files_to_delete.insert(file_path, file);
+        self.files_to_delete.insert(key, file);
 
         Ok(())
     }
@@ -286,12 +289,12 @@ impl ManifestFilterManager {
             // Why an entry is removed matters, so keep the reasons separate.
             //
             // An explicit delete, or the sequence-number rule, condemns the *whole file*
-            // and may therefore be promoted to the path-level `files_to_delete` set.
+            // and may therefore be promoted to the identity-keyed `files_to_delete` set.
             // Danglingness is different: it is a property of a single deletion-vector
             // *blob*. Several DVs can share one Puffin file, distinguished by
             // (`file_path`, `content_offset`, `content_size_in_bytes`), so a dangling blob
             // says nothing about its neighbours in the same file.
-            let explicitly_deleted = self.files_to_delete.contains_key(file.file_path());
+            let explicitly_deleted = self.files_to_delete.contains_key(&delete_file_key(file));
             // For delete manifests, check sequence number for old delete files
             let superseded_by_sequence_number = is_delete
                 && matches!(entry.sequence_number(), Some(seq_num) if seq_num != crate::spec::UNASSIGNED_SEQUENCE_NUMBER
@@ -324,30 +327,30 @@ impl ManifestFilterManager {
                     // Mark this entry as deleted
                     writer.add_delete_entry(entry.clone())?;
 
-                    // A blob-level decision must NOT be promoted to the path-level sets:
-                    // `files_to_delete` is keyed by path and is consulted for every entry
-                    // in this and every later manifest, so recording a shared Puffin here
-                    // would drop the *live* deletion vectors of data files that were never
-                    // rewritten -- silently resurrecting their deleted rows. Dropping this
-                    // one entry is the whole effect we want.
+                    // A blob-level decision must NOT be promoted to the identity-keyed
+                    // sets: `files_to_delete` is consulted for every entry in this and
+                    // every later manifest, so recording a shared Puffin blob's identity
+                    // here would still be harmless on its own, but recording it under a
+                    // path-only key would drop the *live* deletion vectors of data files
+                    // that were never rewritten -- silently resurrecting their deleted
+                    // rows. Dropping this one entry is the whole effect we want.
                     if explicitly_deleted || superseded_by_sequence_number {
                         // Create a copy of the file without stats
                         let file_copy = file.clone();
+                        let key = delete_file_key(&file_copy);
 
                         // For file that it was deleted using an expression
-                        self.files_to_delete
-                            .insert(file.file_path().to_string(), file_copy.clone());
+                        self.files_to_delete.insert(key.clone(), file_copy.clone());
 
                         // TODO: add file to removed_data_file_path once we implement drop_partition
 
-                        // Track deleted files for duplicate detection and validation
-                        if deleted_files.contains_key(file_copy.file_path()) {
-                            // TODO: Log warning about duplicate
-                        } else {
-                            // Only add the file to deletes if it is a new delete
-                            // This keeps the snapshot summary accurate for non-duplicate data
-                            deleted_files.insert(file_copy.file_path.to_owned(), file_copy.clone());
-                        }
+                        // Track deleted files for duplicate detection and validation.
+                        // Only add the file to deletes if it is a new delete -- this keeps
+                        // the snapshot summary accurate for non-duplicate data. A duplicate
+                        // is silently a no-op here (TODO: log a warning about it).
+                        deleted_files
+                            .entry(key)
+                            .or_insert_with(|| file_copy.clone());
                     }
                 } else {
                     // Keep the entry as existing
@@ -366,11 +369,11 @@ impl ManifestFilterManager {
         self.filtered_manifests
             .insert(manifest.manifest_path.clone(), filtered_manifest.clone());
 
-        // Track deleted files for validation - convert HashSet to Vec of file paths
-        let deleted_file_paths: Vec<String> = deleted_files.keys().cloned().collect();
+        // Track deleted files for validation - convert to a Vec of identity keys
+        let deleted_file_keys: Vec<DeleteFileKey> = deleted_files.into_keys().collect();
 
         self.filtered_manifest_to_deleted_files
-            .insert(filtered_manifest.manifest_path.clone(), deleted_file_paths);
+            .insert(filtered_manifest.manifest_path.clone(), deleted_file_keys);
 
         Ok(filtered_manifest)
     }
@@ -381,11 +384,15 @@ impl ManifestFilterManager {
             let deleted_files = self.deleted_files(manifests);
             // check deleted_files contains all files in self.delete_files
 
-            for file_path in self.files_to_delete.keys() {
-                if !deleted_files.contains(file_path) {
+            for key in self.files_to_delete.keys() {
+                if !deleted_files.contains(key) {
+                    let (path, content_offset, content_size_in_bytes) = key;
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Required delete path missing: {file_path}"),
+                        format!(
+                            "Required delete file missing: {path} \
+                             (content_offset={content_offset:?}, content_size_in_bytes={content_size_in_bytes:?})"
+                        ),
                     ));
                 }
             }
@@ -393,7 +400,7 @@ impl ManifestFilterManager {
         Ok(())
     }
 
-    fn deleted_files(&self, manifests: &[ManifestFile]) -> HashSet<String> {
+    fn deleted_files(&self, manifests: &[ManifestFile]) -> HashSet<DeleteFileKey> {
         let mut deleted_files = HashSet::new();
         for manifest in manifests {
             if let Some(deleted) = self
@@ -429,8 +436,8 @@ impl ManifestFilterManager {
             // Mirrors the decision in `filter_manifest_with_deleted_files`; see the comment
             // there for why the dangling-delete case is deliberately per-blob.
             let marked_for_delete =
-                // Check if file path is in files to delete
-                self.files_to_delete.contains_key(file.file_path()) ||
+                // Check if this exact delete-file identity is in files to delete
+                self.files_to_delete.contains_key(&delete_file_key(file)) ||
                 // For delete manifests, check sequence number for old delete files
                 (is_delete &&
                  entry.status() != ManifestStatus::Deleted &&
@@ -819,6 +826,7 @@ mod tests {
         // Test 1: Delete file by path
         let file_path = "/test/path/file.parquet";
         let test_file1 = create_test_data_file(file_path, 0);
+        let key1 = delete_file_key(&test_file1);
 
         // Initially no deletes
         assert!(!manager.contains_deletes());
@@ -828,17 +836,17 @@ mod tests {
 
         // Should now contain deletes
         assert!(manager.contains_deletes());
-        assert!(manager.files_to_delete.contains_key(file_path));
+        assert!(manager.files_to_delete.contains_key(&key1));
 
         // Test 2: Delete another file and verify tracking
         let test_file2 = create_test_data_file("/test/data/file2.parquet", 0);
-        let file_path2 = test_file2.file_path.clone();
+        let key2 = delete_file_key(&test_file2);
         manager.delete_file(test_file2).unwrap();
 
         // Should track both files for deletion
         let deleted_files = manager.files_to_be_deleted();
         assert_eq!(deleted_files.len(), 2);
-        assert!(manager.files_to_delete.contains_key(&file_path2));
+        assert!(manager.files_to_delete.contains_key(&key2));
     }
 
     #[test]
@@ -922,7 +930,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Required delete path missing")
+                .contains("Required delete file missing")
         );
     }
 
@@ -956,8 +964,16 @@ mod tests {
         // Verify manifest filtering capabilities
         assert!(manager.can_contain_deleted_files(&manifest));
         assert!(manager.manifest_has_deleted_files(&manifest).await.unwrap());
-        assert!(manager.files_to_delete.contains_key(&delete_file.file_path));
-        assert!(!manager.files_to_delete.contains_key(&keep_file.file_path));
+        assert!(
+            manager
+                .files_to_delete
+                .contains_key(&delete_file_key(&delete_file))
+        );
+        assert!(
+            !manager
+                .files_to_delete
+                .contains_key(&delete_file_key(&keep_file))
+        );
 
         // Verify manager state
         assert!(manager.contains_deletes());
@@ -1036,7 +1052,11 @@ mod tests {
 
         // Verify manifest can contain deleted files
         assert!(manager.can_contain_deleted_files(&manifest));
-        assert!(manager.files_to_delete.contains_key(&delete_file.file_path));
+        assert!(
+            manager
+                .files_to_delete
+                .contains_key(&delete_file_key(&delete_file))
+        );
 
         // Validation should pass when no required deletes are set
         assert!(manager.validate_required_deletes(&[manifest]).is_ok());
@@ -1541,6 +1561,87 @@ mod tests {
                 .iter()
                 .any(|f| f.file_path() == PUFFIN),
             "a partially-dangling Puffin must not be promoted to a path-level delete"
+        );
+    }
+
+    /// Regression test for the `explicitly_deleted` path raised in review of #168.
+    ///
+    /// `delete_file()` (used e.g. for expression-based overwrites) marks a specific
+    /// [`DataFile`] for removal via `files_to_delete`. When two deletion vectors share
+    /// one Puffin file, marking only one of them for deletion must not drop the other:
+    /// `files_to_delete` must be keyed by the full `(file_path, content_offset,
+    /// content_size_in_bytes)` identity, not by `file_path` alone.
+    #[tokio::test]
+    async fn test_shared_puffin_explicit_delete_keeps_live_deletion_vector() {
+        let (mut manager, temp_dir) = setup_test_manager();
+        let schema = create_test_schema();
+
+        const PUFFIN: &str = "/test/explicit-shared.puffin";
+        let deleted_blob = create_test_deletion_vector_at(PUFFIN, "/test/data-a.parquet", 4);
+        let live_blob = create_test_deletion_vector_at(PUFFIN, "/test/data-b.parquet", 128);
+
+        // Only the first blob is explicitly marked for deletion.
+        manager.delete_file(deleted_blob.clone()).unwrap();
+
+        let manifest_path = temp_dir
+            .path()
+            .join("explicit-delete-manifest.avro")
+            .to_string_lossy()
+            .to_string();
+
+        write_delete_manifest_with_entries(
+            &manager,
+            &manifest_path,
+            &schema,
+            create_entries_from_files(vec![deleted_blob, live_blob]),
+            12345,
+        )
+        .await
+        .unwrap();
+
+        let input_manifest = create_manifest_metadata(
+            &manifest_path,
+            ManifestContentType::Deletes,
+            10,
+            12345,
+            (2, 0, 0),
+        );
+
+        let filtered = manager
+            .filter_manifests(&schema, vec![input_manifest.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_ne!(
+            filtered[0].manifest_path, input_manifest.manifest_path,
+            "manifest must be rewritten when it contains an explicitly deleted blob"
+        );
+
+        let filtered_manifest = filtered[0].load_manifest(&manager.file_io).await.unwrap();
+        let statuses: HashMap<Option<i64>, ManifestStatus> = filtered_manifest
+            .entries()
+            .iter()
+            .map(|entry| (entry.data_file().content_offset(), entry.status()))
+            .collect();
+
+        assert_eq!(
+            statuses.get(&Some(4)),
+            Some(&ManifestStatus::Deleted),
+            "the explicitly-deleted blob must be dropped"
+        );
+        assert_eq!(
+            statuses.get(&Some(128)),
+            Some(&ManifestStatus::Existing),
+            "a live blob sharing the same Puffin path must survive an explicit delete of \
+             its neighbour"
+        );
+
+        // The Puffin path itself must not be promoted whole into `files_to_delete`.
+        assert_eq!(
+            manager.files_to_be_deleted().len(),
+            1,
+            "only the exact deleted blob identity should be tracked, not the shared path"
         );
     }
 }

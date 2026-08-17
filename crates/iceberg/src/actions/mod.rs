@@ -17,9 +17,11 @@
 
 //! Table maintenance actions.
 //!
-//! This module provides actions for table maintenance operations that do not
-//! modify table metadata, such as cleaning up orphan files.
+//! This module provides actions for table maintenance operations, such as
+//! cleaning up orphan files and removing dangling delete file references.
 
+mod remove_dangling_delete_files;
 mod remove_orphan_files;
 
+pub use remove_dangling_delete_files::*;
 pub use remove_orphan_files::*;
