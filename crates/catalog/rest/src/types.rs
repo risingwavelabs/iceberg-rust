@@ -251,6 +251,7 @@ pub struct CreateTableRequest {
     /// Name of the table to create
     pub name: String,
     /// Optional table location. If not provided, the server will choose a location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// Table schema
     pub schema: Schema,
@@ -353,6 +354,28 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&ns_response_no_props).expect("Serialization failed"),
             json_no_props
+        );
+    }
+
+    #[test]
+    fn test_create_table_request_omits_null_location() {
+        // Some REST-compatible catalogs (e.g. AWS Glue REST) reject `"location": null`
+        // even though the spec marks the field as optional, expecting the field to be
+        // omitted entirely so they can fall back to a server-side default (e.g. the
+        // database `LocationUri`). Verify that `None` is not serialized as `null`.
+        let req = CreateTableRequest {
+            name: "t1".to_string(),
+            location: None,
+            schema: Schema::builder().build().unwrap(),
+            partition_spec: None,
+            write_order: None,
+            stage_create: Some(false),
+            properties: HashMap::new(),
+        };
+        let value = serde_json::to_value(&req).expect("Serialization failed");
+        assert!(
+            value.get("location").is_none(),
+            "`location` should be omitted when None, got: {value}"
         );
     }
 }
