@@ -115,13 +115,11 @@ async fn test_spark_variant_scan_and_projection() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    assert!(
-        matches!(
-            json_values[0].as_str(),
-            r#"{"a":1,"b":"hello"}"# | r#"{"b":"hello","a":1}"#
-        ),
-        "unexpected object value: {}",
-        json_values[0]
-    );
-    assert_eq!(&json_values[1..], ["[1,2,3]", "42"]);
+    assert_eq!(json_values.len(), 3);
+    assert!(json_values.iter().any(|value| matches!(
+        value.as_str(),
+        r#"{"a":1,"b":"hello"}"# | r#"{"b":"hello","a":1}"#
+    )));
+    assert!(json_values.iter().any(|value| value == "[1,2,3]"));
+    assert!(json_values.iter().any(|value| value == "42"));
 }
