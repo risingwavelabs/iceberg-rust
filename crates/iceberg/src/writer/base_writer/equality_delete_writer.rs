@@ -447,6 +447,26 @@ mod test {
         assert_eq!(res.len(), 1);
         let data_file = res.into_iter().next().unwrap();
 
+        assert_eq!(data_file.equality_ids(), Some(vec![0, 8]));
+        assert_eq!(
+            *data_file.null_value_counts(),
+            HashMap::from([(0, 0), (8, 0)])
+        );
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([
+                (0, crate::spec::Datum::int(1)),
+                (8, crate::spec::Datum::int(1))
+            ])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([
+                (0, crate::spec::Datum::int(1)),
+                (8, crate::spec::Datum::int(1))
+            ])
+        );
+
         // check
         let to_write_projected = projector.project_batch(to_write)?;
         check_parquet_data_file_with_equality_delete_write(
