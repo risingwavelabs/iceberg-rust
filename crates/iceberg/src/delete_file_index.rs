@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
@@ -44,6 +45,50 @@ fn inferred_referenced_data_file(delete_file: &DataFile) -> Option<String> {
 
     let bytes = lower.to_bytes().ok()?;
     std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned)
+}
+
+fn may_contain_null(file: &DataFile, field_id: i32) -> bool {
+    file.null_value_counts()
+        .get(&field_id)
+        .is_none_or(|count| *count > 0)
+}
+
+/// Returns whether an equality delete file may contain a row that matches the data file.
+///
+/// File metrics are used only to prove that a match is impossible. Missing or incompatible
+/// metrics fail open so that scan planning never drops a delete that may apply.
+fn can_contain_eq_deletes_for_file(data_file: &DataFile, delete_file: &DataFile) -> bool {
+    let Some(equality_ids) = delete_file.equality_ids.as_deref() else {
+        return true;
+    };
+
+    for &field_id in equality_ids {
+        if may_contain_null(data_file, field_id) && may_contain_null(delete_file, field_id) {
+            // Null equals null for equality deletes, so this field may match.
+            continue;
+        }
+
+        let (Some(data_lower), Some(data_upper), Some(delete_lower), Some(delete_upper)) = (
+            data_file.lower_bounds().get(&field_id),
+            data_file.upper_bounds().get(&field_id),
+            delete_file.lower_bounds().get(&field_id),
+            delete_file.upper_bounds().get(&field_id),
+        ) else {
+            continue;
+        };
+
+        if matches!(
+            data_lower.partial_cmp(delete_upper),
+            Some(Ordering::Greater)
+        ) || matches!(
+            delete_lower.partial_cmp(data_upper),
+            Some(Ordering::Greater)
+        ) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Index of delete files
@@ -198,6 +243,7 @@ impl PopulatedDeleteFileIndex {
                 seq_num
                     .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
                     .unwrap_or_else(|| true)
+                    && can_contain_eq_deletes_for_file(data_file, delete.manifest_entry.data_file())
             })
             .for_each(|delete| results.push(delete.as_ref().into()));
 
@@ -210,6 +256,10 @@ impl PopulatedDeleteFileIndex {
                         .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                        && can_contain_eq_deletes_for_file(
+                            data_file,
+                            delete.manifest_entry.data_file(),
+                        )
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -438,6 +488,53 @@ mod tests {
         assert!(actual_paths_to_apply_for_different_spec.is_empty());
     }
 
+    #[test]
+    fn test_equality_delete_metrics_pruning() {
+        let data_file =
+            with_int_metrics(build_unpartitioned_data_file(), 1, Some(100), Some(200), 0);
+
+        let disjoint_delete =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(1), Some(10), 0);
+        assert!(!can_contain_eq_deletes_for_file(
+            &data_file,
+            &disjoint_delete
+        ));
+
+        for (lower, upper) in [(150, 250), (200, 250)] {
+            let delete_file = with_int_metrics(
+                build_unpartitioned_eq_delete(),
+                1,
+                Some(lower),
+                Some(upper),
+                0,
+            );
+            assert!(can_contain_eq_deletes_for_file(&data_file, &delete_file));
+        }
+
+        let missing_bound_delete =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(1), None, 0);
+        assert!(can_contain_eq_deletes_for_file(
+            &data_file,
+            &missing_bound_delete
+        ));
+
+        let data_with_null =
+            with_int_metrics(build_unpartitioned_data_file(), 1, Some(100), Some(200), 1);
+        let delete_with_null =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(1), Some(10), 1);
+        assert!(can_contain_eq_deletes_for_file(
+            &data_with_null,
+            &delete_with_null
+        ));
+
+        let data_file = with_int_metrics(data_file, 2, Some(10), Some(20), 0);
+        let mut delete_file =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(150), Some(250), 0);
+        delete_file.equality_ids = Some(vec![1, 2]);
+        let delete_file = with_int_metrics(delete_file, 2, Some(30), Some(40), 0);
+        assert!(!can_contain_eq_deletes_for_file(&data_file, &delete_file));
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
@@ -497,6 +594,23 @@ mod tests {
             .file_size_in_bytes(100)
             .build()
             .unwrap()
+    }
+
+    fn with_int_metrics(
+        mut file: DataFile,
+        field_id: i32,
+        lower: Option<i32>,
+        upper: Option<i32>,
+        null_count: u64,
+    ) -> DataFile {
+        file.null_value_counts.insert(field_id, null_count);
+        if let Some(lower) = lower {
+            file.lower_bounds.insert(field_id, Datum::int(lower));
+        }
+        if let Some(upper) = upper {
+            file.upper_bounds.insert(field_id, Datum::int(upper));
+        }
+        file
     }
 
     fn build_added_manifest_entry(data_seq_number: i64, file: &DataFile) -> ManifestEntry {
