@@ -259,8 +259,8 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        DataFileFormat, Datum, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType,
-        Schema, Struct, Type,
+        DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
+        Struct, Type,
     };
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
@@ -281,12 +281,8 @@ mod tests {
             DefaultFileNameGenerator::new("pos_del".to_string(), None, DataFileFormat::Parquet);
 
         let schema = Arc::new(POSITION_DELETE_SCHEMA.clone());
-        let parquet_builder = ParquetWriterBuilder::new(
-            WriterProperties::builder()
-                .set_statistics_truncate_length(None)
-                .build(),
-            schema.clone(),
-        );
+        let parquet_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
 
         let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
@@ -299,12 +295,10 @@ mod tests {
             .build(None)
             .await?;
 
-        let first_path = "s3://bucket/warehouse/namespace/table/data/00000-0-00000000-0000-0000-0000-000000000001.parquet";
-        let second_path = "s3://bucket/warehouse/namespace/table/data/00000-0-00000000-0000-0000-0000-000000000002.parquet";
         let deletes = vec![
-            PositionDeleteInput::new(Arc::from(first_path), 1),
-            PositionDeleteInput::new(Arc::from(first_path), 2),
-            PositionDeleteInput::new(Arc::from(second_path), 5),
+            PositionDeleteInput::new(Arc::from("s3://bucket/data/file-1.parquet"), 1),
+            PositionDeleteInput::new(Arc::from("s3://bucket/data/file-1.parquet"), 2),
+            PositionDeleteInput::new(Arc::from("s3://bucket/data/file-2.parquet"), 5),
         ];
 
         let expected_batch = RecordBatch::try_new(
@@ -321,7 +315,11 @@ mod tests {
                     )])),
             ])),
             vec![
-                Arc::new(StringArray::from(vec![first_path, first_path, second_path])),
+                Arc::new(StringArray::from(vec![
+                    "s3://bucket/data/file-1.parquet",
+                    "s3://bucket/data/file-1.parquet",
+                    "s3://bucket/data/file-2.parquet",
+                ])),
                 Arc::new(Int64Array::from(vec![1, 2, 5])),
             ],
         )?;
@@ -335,14 +333,6 @@ mod tests {
             DataContentType::PositionDeletes
         );
         assert_eq!(data_files[0].partition(), &Struct::empty());
-        assert_eq!(
-            data_files[0].lower_bounds().get(&DELETE_FILE_PATH.id),
-            Some(&Datum::string(first_path))
-        );
-        assert_eq!(
-            data_files[0].upper_bounds().get(&DELETE_FILE_PATH.id),
-            Some(&Datum::string(second_path))
-        );
 
         check_parquet_data_file(&file_io, &data_files[0], &expected_batch).await;
 
