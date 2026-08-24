@@ -21,7 +21,7 @@
 //! as required by the Iceberg specification. Ordering and deduplication must be handled by the
 //! caller (e.g. by using a sorting writer) before passing records to this writer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -32,8 +32,8 @@ use once_cell::sync::Lazy;
 
 use crate::arrow::schema_to_arrow_schema;
 use crate::spec::{
-    DataContentType, DataFile, Datum, NestedField, NestedFieldRef, PartitionKey, PrimitiveType,
-    Schema, Struct, Type,
+    DataContentType, DataFile, NestedField, NestedFieldRef, PartitionKey, PrimitiveType, Schema,
+    Struct, Type,
 };
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
@@ -121,7 +121,6 @@ where
             inner: Some(self.inner.build()),
             partition_key,
             distinct_paths: HashSet::new(),
-            path_bounds_by_delete_file: HashMap::new(),
         })
     }
 }
@@ -135,7 +134,6 @@ pub struct PositionDeleteFileWriter<
     inner: Option<RollingFileWriter<B, L, F>>,
     partition_key: Option<PartitionKey>,
     distinct_paths: HashSet<Arc<str>>,
-    path_bounds_by_delete_file: HashMap<String, (Arc<str>, Arc<str>)>,
 }
 
 #[async_trait::async_trait]
@@ -153,25 +151,11 @@ where
         for pd in &input {
             self.distinct_paths.insert(Arc::clone(&pd.path));
         }
-        let lower_path = Arc::clone(&input.first().unwrap().path);
-        let upper_path = Arc::clone(&input.last().unwrap().path);
 
         let batch = build_position_delete_batch(input)?;
 
         if let Some(writer) = self.inner.as_mut() {
-            writer.write(&self.partition_key, &batch).await?;
-            self.path_bounds_by_delete_file
-                .entry(writer.current_file_path())
-                .and_modify(|(lower, upper)| {
-                    if lower_path < *lower {
-                        *lower = lower_path.clone();
-                    }
-                    if upper_path > *upper {
-                        *upper = upper_path.clone();
-                    }
-                })
-                .or_insert((lower_path, upper_path));
-            Ok(())
+            writer.write(&self.partition_key, &batch).await
         } else {
             Err(Error::new(
                 ErrorKind::Unexpected,
@@ -206,23 +190,12 @@ where
                     if let Some(ref_path) = single_ref.as_ref() {
                         builder.referenced_data_file(Some(ref_path.clone()));
                     }
-                    let mut data_file = builder.build().map_err(|e| {
+                    builder.build().map_err(|e| {
                         Error::new(
                             ErrorKind::DataInvalid,
                             format!("Failed to build position delete file: {e}"),
                         )
-                    })?;
-                    if let Some((lower, upper)) =
-                        self.path_bounds_by_delete_file.get(data_file.file_path())
-                    {
-                        data_file
-                            .lower_bounds_mut()
-                            .insert(DELETE_FILE_PATH.id, Datum::string(lower.as_ref()));
-                        data_file
-                            .upper_bounds_mut()
-                            .insert(DELETE_FILE_PATH.id, Datum::string(upper.as_ref()));
-                    }
-                    Ok(data_file)
+                    })
                 })
                 .collect()
         } else {
@@ -308,8 +281,12 @@ mod tests {
             DefaultFileNameGenerator::new("pos_del".to_string(), None, DataFileFormat::Parquet);
 
         let schema = Arc::new(POSITION_DELETE_SCHEMA.clone());
-        let parquet_builder =
-            ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
+        let parquet_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder()
+                .set_statistics_truncate_length(None)
+                .build(),
+            schema.clone(),
+        );
 
         let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,

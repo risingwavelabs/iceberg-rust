@@ -1066,6 +1066,11 @@ mod tests {
         let after_range =
             build_unpartitioned_data_file_with_path("s3://bucket/data/file-00005.parquet");
 
+        assert!(can_contain_pos_deletes_for_file(
+            &before_range,
+            &build_unpartitioned_pos_delete()
+        ));
+
         assert_eq!(
             index
                 .get_deletes_for_data_file(&matching_file, Some(0))
