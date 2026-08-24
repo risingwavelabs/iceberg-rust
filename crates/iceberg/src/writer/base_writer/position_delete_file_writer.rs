@@ -21,7 +21,7 @@
 //! as required by the Iceberg specification. Ordering and deduplication must be handled by the
 //! caller (e.g. by using a sorting writer) before passing records to this writer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -32,8 +32,8 @@ use once_cell::sync::Lazy;
 
 use crate::arrow::schema_to_arrow_schema;
 use crate::spec::{
-    DataContentType, DataFile, NestedField, NestedFieldRef, PartitionKey, PrimitiveType, Schema,
-    Struct, Type,
+    DataContentType, DataFile, Datum, NestedField, NestedFieldRef, PartitionKey, PrimitiveType,
+    Schema, Struct, Type,
 };
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
@@ -121,6 +121,7 @@ where
             inner: Some(self.inner.build()),
             partition_key,
             distinct_paths: HashSet::new(),
+            path_bounds_by_delete_file: HashMap::new(),
         })
     }
 }
@@ -134,6 +135,7 @@ pub struct PositionDeleteFileWriter<
     inner: Option<RollingFileWriter<B, L, F>>,
     partition_key: Option<PartitionKey>,
     distinct_paths: HashSet<Arc<str>>,
+    path_bounds_by_delete_file: HashMap<String, (Arc<str>, Arc<str>)>,
 }
 
 #[async_trait::async_trait]
@@ -151,11 +153,25 @@ where
         for pd in &input {
             self.distinct_paths.insert(Arc::clone(&pd.path));
         }
+        let lower_path = Arc::clone(&input.first().unwrap().path);
+        let upper_path = Arc::clone(&input.last().unwrap().path);
 
         let batch = build_position_delete_batch(input)?;
 
         if let Some(writer) = self.inner.as_mut() {
-            writer.write(&self.partition_key, &batch).await
+            writer.write(&self.partition_key, &batch).await?;
+            self.path_bounds_by_delete_file
+                .entry(writer.current_file_path())
+                .and_modify(|(lower, upper)| {
+                    if lower_path < *lower {
+                        *lower = lower_path.clone();
+                    }
+                    if upper_path > *upper {
+                        *upper = upper_path.clone();
+                    }
+                })
+                .or_insert((lower_path, upper_path));
+            Ok(())
         } else {
             Err(Error::new(
                 ErrorKind::Unexpected,
@@ -190,12 +206,23 @@ where
                     if let Some(ref_path) = single_ref.as_ref() {
                         builder.referenced_data_file(Some(ref_path.clone()));
                     }
-                    builder.build().map_err(|e| {
+                    let mut data_file = builder.build().map_err(|e| {
                         Error::new(
                             ErrorKind::DataInvalid,
                             format!("Failed to build position delete file: {e}"),
                         )
-                    })
+                    })?;
+                    if let Some((lower, upper)) =
+                        self.path_bounds_by_delete_file.get(data_file.file_path())
+                    {
+                        data_file
+                            .lower_bounds_mut()
+                            .insert(DELETE_FILE_PATH.id, Datum::string(lower.as_ref()));
+                        data_file
+                            .upper_bounds_mut()
+                            .insert(DELETE_FILE_PATH.id, Datum::string(upper.as_ref()));
+                    }
+                    Ok(data_file)
                 })
                 .collect()
         } else {
@@ -259,8 +286,8 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
-        Struct, Type,
+        DataFileFormat, Datum, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType,
+        Schema, Struct, Type,
     };
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
@@ -295,10 +322,12 @@ mod tests {
             .build(None)
             .await?;
 
+        let first_path = "s3://bucket/warehouse/namespace/table/data/00000-0-00000000-0000-0000-0000-000000000001.parquet";
+        let second_path = "s3://bucket/warehouse/namespace/table/data/00000-0-00000000-0000-0000-0000-000000000002.parquet";
         let deletes = vec![
-            PositionDeleteInput::new(Arc::from("s3://bucket/data/file-1.parquet"), 1),
-            PositionDeleteInput::new(Arc::from("s3://bucket/data/file-1.parquet"), 2),
-            PositionDeleteInput::new(Arc::from("s3://bucket/data/file-2.parquet"), 5),
+            PositionDeleteInput::new(Arc::from(first_path), 1),
+            PositionDeleteInput::new(Arc::from(first_path), 2),
+            PositionDeleteInput::new(Arc::from(second_path), 5),
         ];
 
         let expected_batch = RecordBatch::try_new(
@@ -315,11 +344,7 @@ mod tests {
                     )])),
             ])),
             vec![
-                Arc::new(StringArray::from(vec![
-                    "s3://bucket/data/file-1.parquet",
-                    "s3://bucket/data/file-1.parquet",
-                    "s3://bucket/data/file-2.parquet",
-                ])),
+                Arc::new(StringArray::from(vec![first_path, first_path, second_path])),
                 Arc::new(Int64Array::from(vec![1, 2, 5])),
             ],
         )?;
@@ -333,6 +358,14 @@ mod tests {
             DataContentType::PositionDeletes
         );
         assert_eq!(data_files[0].partition(), &Struct::empty());
+        assert_eq!(
+            data_files[0].lower_bounds().get(&DELETE_FILE_PATH.id),
+            Some(&Datum::string(first_path))
+        );
+        assert_eq!(
+            data_files[0].upper_bounds().get(&DELETE_FILE_PATH.id),
+            Some(&Datum::string(second_path))
+        );
 
         check_parquet_data_file(&file_io, &data_files[0], &expected_batch).await;
 

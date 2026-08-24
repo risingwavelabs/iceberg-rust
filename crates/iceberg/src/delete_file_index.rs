@@ -34,24 +34,41 @@ use crate::spec::{DataContentType, DataFile, Struct};
 // `writer/base_writer/position_delete_file_writer.rs`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2147483546;
 
-fn try_infer_single_referenced_data_file_from_bounds(delete_file: &DataFile) -> Option<String> {
-    // Match Iceberg Java's `DeleteFileUtil.referencedDataFile(DeleteFile)` heuristic:
-    // if lower and upper bounds for PATH_ID are present and equal, the delete file
-    // targets a single data file.
-    let lower = delete_file
-        .lower_bounds
-        .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH)?;
-    let upper = delete_file
-        .upper_bounds
-        .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH)?;
-
-    if lower != upper {
-        return None;
+/// Returns whether a position delete file may contain deletes for the data file.
+///
+/// An explicit referenced data file is exact and takes precedence over metrics. Otherwise, file
+/// path bounds are used only to prove that the data file is outside the delete file's path range.
+/// Missing or incompatible metrics fail open so that scan planning never drops an applicable
+/// delete.
+fn can_contain_pos_deletes_for_file(data_file: &DataFile, delete_file: &DataFile) -> bool {
+    if let Some(referenced_data_file) = delete_file.referenced_data_file() {
+        return referenced_data_file == data_file.file_path();
     }
 
-    let bytes = lower.to_bytes().ok()?;
-    let path = std::str::from_utf8(bytes.as_ref()).ok()?;
-    Some(path.to_string())
+    let (Some(lower), Some(upper)) = (
+        delete_file
+            .lower_bounds()
+            .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH),
+        delete_file
+            .upper_bounds()
+            .get(&FIELD_ID_POSITIONAL_DELETE_FILE_PATH),
+    ) else {
+        return true;
+    };
+    let data_file_path = crate::spec::Datum::string(data_file.file_path());
+
+    let (Some(lower_to_upper), Some(path_to_lower), Some(path_to_upper)) = (
+        lower.partial_cmp(upper),
+        data_file_path.partial_cmp(lower),
+        data_file_path.partial_cmp(upper),
+    ) else {
+        return true;
+    };
+    if lower_to_upper == Ordering::Greater {
+        return true;
+    }
+
+    path_to_lower != Ordering::Less && path_to_upper != Ordering::Greater
 }
 
 fn may_contain_null(file: &DataFile, field_id: i32) -> bool {
@@ -283,28 +300,13 @@ impl PopulatedDeleteFileIndex {
                 .iter()
                 // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
                 .filter(|&(delete, _)| {
-                    let delete_data_file = delete.manifest_entry.data_file();
-
-                    let referenced_data_file_matches = match delete_data_file
-                        .referenced_data_file
-                        .as_deref()
-                    {
-                        Some(referenced_data_file) => referenced_data_file == data_file.file_path(),
-                        None => match try_infer_single_referenced_data_file_from_bounds(
-                            delete_data_file,
-                        ) {
-                            Some(referenced_data_file) => {
-                                referenced_data_file == data_file.file_path()
-                            }
-                            None => true,
-                        },
-                    };
+                    let delete_file = delete.manifest_entry.data_file();
 
                     seq_num
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or(true)
                         && data_file.partition_spec_id == delete.partition_spec_id
-                        && referenced_data_file_matches
+                        && can_contain_pos_deletes_for_file(data_file, delete_file)
                 })
                 .for_each(|(_, task)| results.push(task.clone()));
         }
@@ -988,8 +990,12 @@ mod tests {
     }
 
     fn build_unpartitioned_data_file() -> DataFile {
+        build_unpartitioned_data_file_with_path(format!("{}-data.parquet", Uuid::new_v4()))
+    }
+
+    fn build_unpartitioned_data_file_with_path(file_path: impl Into<String>) -> DataFile {
         DataFileBuilder::default()
-            .file_path(format!("{}-data.parquet", Uuid::new_v4()))
+            .file_path(file_path.into())
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::Data)
             .record_count(100)
@@ -1036,5 +1042,45 @@ mod tests {
             .sequence_number(data_seq_number)
             .data_file(file.clone())
             .build()
+    }
+    #[test]
+    fn test_position_delete_path_bounds_pruning() {
+        let mut bounded_delete = build_unpartitioned_pos_delete();
+        bounded_delete.lower_bounds.insert(
+            FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+            Datum::string("s3://bucket/data/file-00002.parquet"),
+        );
+        bounded_delete.upper_bounds.insert(
+            FIELD_ID_POSITIONAL_DELETE_FILE_PATH,
+            Datum::string("s3://bucket/data/file-00004.parquet"),
+        );
+        let index = PopulatedDeleteFileIndex::new(vec![build_delete_context(
+            build_added_manifest_entry(1, &bounded_delete),
+            0,
+        )]);
+
+        let matching_file =
+            build_unpartitioned_data_file_with_path("s3://bucket/data/file-00003.parquet");
+        let before_range =
+            build_unpartitioned_data_file_with_path("s3://bucket/data/file-00001.parquet");
+        let after_range =
+            build_unpartitioned_data_file_with_path("s3://bucket/data/file-00005.parquet");
+
+        assert_eq!(
+            index
+                .get_deletes_for_data_file(&matching_file, Some(0))
+                .len(),
+            1
+        );
+        assert!(
+            index
+                .get_deletes_for_data_file(&before_range, Some(0))
+                .is_empty()
+        );
+        assert!(
+            index
+                .get_deletes_for_data_file(&after_range, Some(0))
+                .is_empty()
+        );
     }
 }
