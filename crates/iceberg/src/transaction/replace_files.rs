@@ -388,6 +388,22 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                     ),
                 ));
             }
+
+            if !self.added_data_files.is_empty() {
+                let added_data_sequence_number = self
+                    .new_data_file_sequence_number
+                    .unwrap_or(last_sequence_number);
+                if sequence_number > added_data_sequence_number {
+                    return Err(crate::Error::new(
+                        crate::ErrorKind::DataInvalid,
+                        format!(
+                            "Delete file cleanup minimum data sequence number {sequence_number} \
+                             must not exceed the added data file sequence number \
+                             {added_data_sequence_number}"
+                        ),
+                    ));
+                }
+            }
         }
 
         let mut snapshot_producer = SnapshotProducer::new(
@@ -797,6 +813,18 @@ mod tests {
                 .all(|status| *status != ManifestStatus::Deleted),
             "delete files newer than the explicitly retained data sequence must stay live"
         );
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .set_delete_file_cleanup_min_data_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
+            .add_data_files([added_file.clone()]);
+        let err = match Arc::new(action).commit(&table).await {
+            Ok(_) => panic!("cleanup sequence newer than added data should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("must not exceed"));
 
         let action = Transaction::new(&table)
             .rewrite_files()

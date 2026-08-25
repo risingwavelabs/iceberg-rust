@@ -533,21 +533,21 @@ impl<'a> SnapshotProducer<'a> {
                 self.new_data_file_sequence_number
                     .unwrap_or(last_sequence_number),
             );
-            let min_data_sequence_number =
-                if let Some(sequence_number) = self.delete_file_cleanup_min_data_sequence_number {
-                    added_data_sequence_number
-                        .map(|added_sequence| sequence_number.min(added_sequence))
-                        .unwrap_or(sequence_number)
-                } else {
-                    data_manifests
-                        .iter()
-                        .map(|manifest| manifest.min_sequence_number)
-                        .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
-                        .chain(added_data_sequence_number)
-                        .min()
-                        .map(|sequence| sequence.min(last_sequence_number))
-                        .unwrap_or(last_sequence_number)
-                };
+            let live_data_min_sequence_number = data_manifests
+                .iter()
+                .map(|manifest| manifest.min_sequence_number)
+                .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
+                .chain(added_data_sequence_number)
+                .min()
+                .map(|sequence| sequence.min(last_sequence_number))
+                .unwrap_or(last_sequence_number);
+            // The live-data minimum reflects files that survive this commit. The optional
+            // planning-derived bound is validated against added data before snapshot production,
+            // so either bound can independently advance delete cleanup.
+            let min_data_sequence_number = self
+                .delete_file_cleanup_min_data_sequence_number
+                .unwrap_or(live_data_min_sequence_number)
+                .max(live_data_min_sequence_number);
 
             filter.drop_delete_files_older_than(min_data_sequence_number);
             filter.remove_dangling_deletes_for(&self.removed_data_file_paths);
