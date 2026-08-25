@@ -231,6 +231,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     removed_delete_files: Vec<DataFile>,
     snapshot_id: Option<i64>,
     new_data_file_sequence_number: Option<i64>,
+    delete_file_cleanup_min_data_sequence_number: Option<i64>,
     target_branch: Option<String>,
     enable_delete_filter_manager: bool,
     check_file_existence: bool,
@@ -260,6 +261,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             removed_delete_files: Vec::new(),
             snapshot_id: None,
             new_data_file_sequence_number: None,
+            delete_file_cleanup_min_data_sequence_number: None,
             target_branch: None,
             enable_delete_filter_manager: false,
             check_file_existence: false,
@@ -355,6 +357,16 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         self
     }
 
+    /// Set the minimum data sequence used to retire older delete files.
+    ///
+    /// If omitted, the minimum sequence from all data manifests is used. An
+    /// override must not exceed the data sequence of any live data file to which
+    /// an existing delete may apply.
+    pub fn set_delete_file_cleanup_min_data_sequence_number(mut self, seq: i64) -> Self {
+        self.delete_file_cleanup_min_data_sequence_number = Some(seq);
+        self
+    }
+
     pub fn set_check_file_existence(mut self, check: bool) -> Self {
         self.check_file_existence = check;
         self
@@ -364,6 +376,19 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
 #[async_trait::async_trait]
 impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        if let Some(sequence_number) = self.delete_file_cleanup_min_data_sequence_number {
+            let last_sequence_number = table.metadata().last_sequence_number();
+            if sequence_number < 0 || sequence_number > last_sequence_number {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::DataInvalid,
+                    format!(
+                        "Delete file cleanup minimum data sequence number {sequence_number} must \
+                         be between 0 and the table's last sequence number {last_sequence_number}"
+                    ),
+                ));
+            }
+        }
+
         let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -378,6 +403,10 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
 
         if let Some(seq) = self.new_data_file_sequence_number {
             snapshot_producer.set_new_data_file_sequence_number(seq);
+        }
+
+        if let Some(seq) = self.delete_file_cleanup_min_data_sequence_number {
+            snapshot_producer.set_delete_file_cleanup_min_data_sequence_number(seq);
         }
 
         if let Some(branch) = &self.target_branch {
