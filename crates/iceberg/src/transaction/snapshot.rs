@@ -537,9 +537,8 @@ partition_struct: {:?}, partition_type: {:?}",
         // to ensure correct first_row_id assignment by ManifestListWriter.
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
-        let mut manifest_files = if let Some(delete_filter_manager) =
-            self.delete_filter_manager.as_mut()
-        {
+        let delete_filter_manager = self.delete_filter_manager.as_mut();
+        let mut manifest_files = if let Some(delete_filter_manager) = delete_filter_manager {
             // When delete filter manager is enabled, filter existing manifests
             let metadata_ref = self.table.metadata_ref();
             let branch_snapshot_ref = metadata_ref.snapshot_for_ref(&self.target_branch);
@@ -574,21 +573,26 @@ partition_struct: {:?}, partition_type: {:?}",
 
             let added_data_sequence_number = (!self.added_data_files.is_empty())
                 .then_some(self.new_data_file_sequence_number.unwrap_or(last_seq));
-            let min_data_seq =
-                if let Some(sequence_number) = self.delete_file_cleanup_min_data_sequence_number {
-                    added_data_sequence_number
+            let live_data_min_sequence_number = existing_data_manifests
+                .iter()
+                .map(|manifest| manifest.min_sequence_number)
+                .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
+                .chain(added_data_sequence_number)
+                .min()
+                .map(|sequence| sequence.min(last_seq))
+                .unwrap_or(last_seq);
+            // The live-data minimum reflects files that survive this commit, while the
+            // optional override is a planning-derived safe bound. Keep the override below
+            // newly added data, then use whichever cleanup bound has advanced further.
+            let min_data_seq = self
+                .delete_file_cleanup_min_data_sequence_number
+                .map(|sequence_number| {
+                    let sequence_number = added_data_sequence_number
                         .map(|added_sequence| sequence_number.min(added_sequence))
-                        .unwrap_or(sequence_number)
-                } else {
-                    existing_data_manifests
-                        .iter()
-                        .map(|manifest| manifest.min_sequence_number)
-                        .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
-                        .chain(added_data_sequence_number)
-                        .min()
-                        .map(|sequence| sequence.min(last_seq))
-                        .unwrap_or(last_seq)
-                };
+                        .unwrap_or(sequence_number);
+                    sequence_number.max(live_data_min_sequence_number)
+                })
+                .unwrap_or(live_data_min_sequence_number);
 
             let mut filtered_manifests = existing_data_manifests;
 
