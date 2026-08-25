@@ -541,18 +541,13 @@ impl<'a> SnapshotProducer<'a> {
                 .min()
                 .map(|sequence| sequence.min(last_sequence_number))
                 .unwrap_or(last_sequence_number);
-            // The live-data minimum reflects files that survive this commit, while the
-            // optional override is a planning-derived safe bound. Keep the override below
-            // newly added data, then use whichever cleanup bound has advanced further.
+            // The live-data minimum reflects files that survive this commit. The optional
+            // planning-derived bound is validated against added data before snapshot production,
+            // so either bound can independently advance delete cleanup.
             let min_data_sequence_number = self
                 .delete_file_cleanup_min_data_sequence_number
-                .map(|sequence_number| {
-                    let sequence_number = added_data_sequence_number
-                        .map(|added_sequence| sequence_number.min(added_sequence))
-                        .unwrap_or(sequence_number);
-                    sequence_number.max(live_data_min_sequence_number)
-                })
-                .unwrap_or(live_data_min_sequence_number);
+                .unwrap_or(live_data_min_sequence_number)
+                .max(live_data_min_sequence_number);
 
             filter.drop_delete_files_older_than(min_data_sequence_number);
             filter.remove_dangling_deletes_for(&self.removed_data_file_paths);
