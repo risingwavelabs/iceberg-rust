@@ -387,6 +387,22 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                     ),
                 ));
             }
+
+            if !self.added_data_files.is_empty() {
+                let added_data_sequence_number = self
+                    .new_data_file_sequence_number
+                    .unwrap_or(last_sequence_number);
+                if sequence_number > added_data_sequence_number {
+                    return Err(crate::Error::new(
+                        crate::ErrorKind::DataInvalid,
+                        format!(
+                            "Delete file cleanup minimum data sequence number {sequence_number} \
+                             must not exceed the added data file sequence number \
+                             {added_data_sequence_number}"
+                        ),
+                    ));
+                }
+            }
         }
 
         let mut snapshot_producer = SnapshotProducer::new(
@@ -444,16 +460,22 @@ impl<M: ReplaceFilesMode> Default for ReplaceFilesAction<M> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use uuid::Uuid;
 
     use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
-    use crate::spec::{ManifestContentType, ManifestStatus, Operation};
+    use crate::ErrorKind;
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestContentType,
+        ManifestStatus, Operation, Struct,
+    };
     use crate::transaction::snapshot::{SnapshotProduceOperation, SnapshotProducer};
     use crate::transaction::tests::{
         PARENT_SEQUENCE_NUMBER, PARENT_SNAPSHOT_ID, REMOVED_DELETE_FILE, RETAINED_DELETE_FILE,
         make_v2_table_with_delete_manifest, position_delete_file,
     };
+    use crate::transaction::{Transaction, TransactionAction};
 
     #[test]
     fn test_modes_map_to_their_operations() {
@@ -576,5 +598,33 @@ mod tests {
     #[tokio::test]
     async fn test_rewrite_preserves_delete_manifest_content_type() {
         assert_delete_manifest_carried_forward_intact::<Rewrite>().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_cleanup_sequence_cannot_exceed_added_data_sequence() {
+        let table = make_v2_table_with_delete_manifest().await;
+        let added_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/compacted.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER - 1)
+            .set_delete_file_cleanup_min_data_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .add_data_files([added_file]);
+        let err = match Arc::new(action).commit(&table).await {
+            Ok(_) => panic!("cleanup sequence newer than added data should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("must not exceed"));
     }
 }
