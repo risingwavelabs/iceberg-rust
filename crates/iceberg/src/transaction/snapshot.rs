@@ -142,6 +142,7 @@ pub(crate) struct SnapshotProducer<'a> {
     // It is shared with ManifestWriterContext to avoid naming conflicts.
     manifest_counter: Arc<AtomicU64>,
     new_data_file_sequence_number: Option<i64>,
+    delete_file_cleanup_min_data_sequence_number: Option<i64>,
     target_branch: String,
     delete_filter_manager: Option<ManifestFilterManager>,
 }
@@ -183,6 +184,7 @@ impl<'a> SnapshotProducer<'a> {
             removed_delete_files,
             manifest_counter: Arc::new(AtomicU64::new(0)),
             new_data_file_sequence_number: None,
+            delete_file_cleanup_min_data_sequence_number: None,
             target_branch: MAIN_BRANCH.to_string(),
             delete_filter_manager: None,
         }
@@ -531,14 +533,21 @@ impl<'a> SnapshotProducer<'a> {
                 self.new_data_file_sequence_number
                     .unwrap_or(last_sequence_number),
             );
-            let min_data_sequence_number = data_manifests
-                .iter()
-                .map(|manifest| manifest.min_sequence_number)
-                .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
-                .chain(added_data_sequence_number)
-                .min()
-                .map(|sequence| sequence.min(last_sequence_number))
-                .unwrap_or(last_sequence_number);
+            let min_data_sequence_number =
+                if let Some(sequence_number) = self.delete_file_cleanup_min_data_sequence_number {
+                    added_data_sequence_number
+                        .map(|added_sequence| sequence_number.min(added_sequence))
+                        .unwrap_or(sequence_number)
+                } else {
+                    data_manifests
+                        .iter()
+                        .map(|manifest| manifest.min_sequence_number)
+                        .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
+                        .chain(added_data_sequence_number)
+                        .min()
+                        .map(|sequence| sequence.min(last_sequence_number))
+                        .unwrap_or(last_sequence_number)
+                };
 
             filter.drop_delete_files_older_than(min_data_sequence_number);
             filter.remove_dangling_deletes_for(&self.removed_data_file_paths);
@@ -801,6 +810,13 @@ impl<'a> SnapshotProducer<'a> {
 
     pub(crate) fn set_new_data_file_sequence_number(&mut self, sequence_number: i64) {
         self.new_data_file_sequence_number = Some(sequence_number);
+    }
+
+    pub(crate) fn set_delete_file_cleanup_min_data_sequence_number(
+        &mut self,
+        sequence_number: i64,
+    ) {
+        self.delete_file_cleanup_min_data_sequence_number = Some(sequence_number);
     }
 
     pub(crate) fn snapshot_id(&self) -> i64 {
