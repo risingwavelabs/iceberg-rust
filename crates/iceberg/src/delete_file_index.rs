@@ -847,7 +847,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_infer_referenced_data_file_missing_bounds_returns_none() {
+    fn test_position_delete_missing_bounds_fails_open() {
+        let data_file = build_test_data_file("s3://bucket/data.parquet", &Struct::empty(), 0);
         let pos_delete = build_test_pos_delete_file(
             "s3://bucket/pos-delete-missing-bounds.parquet",
             None,
@@ -856,7 +857,7 @@ mod tests {
             0,
         );
 
-        assert!(try_infer_single_referenced_data_file_from_bounds(&pos_delete).is_none());
+        assert!(can_contain_pos_deletes_for_file(&data_file, &pos_delete));
     }
 
     #[test]
