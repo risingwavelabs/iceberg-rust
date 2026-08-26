@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
 use arrow_buffer::NullBuffer;
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::schema::schema_to_arrow_schema;
+use crate::arrow::schema::{VariantExtensionType, schema_to_arrow_schema};
 use crate::error::Result;
 use crate::spec::Schema as IcebergSchema;
 use crate::{Error, ErrorKind};
@@ -139,7 +140,9 @@ impl RecordBatchProjector {
                 index_vec.push(pos);
                 return Ok(Some(field.clone()));
             }
+            // A variant field is a logical leaf: its children carry no field ids.
             if let DataType::Struct(inner) = field.data_type()
+                && field.extension_type_name() != Some(VariantExtensionType::NAME)
                 && searchable_field_func(field)
                 && let Some(res) = Self::fetch_field_index(
                     inner,
