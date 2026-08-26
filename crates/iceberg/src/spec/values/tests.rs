@@ -236,6 +236,76 @@ fn json_timestamptz_ns() {
 }
 
 #[test]
+fn json_timestamps_before_the_unix_epoch_round_trip() {
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999+00:00""#,
+        Literal::Primitive(PrimitiveLiteral::Long(-1)),
+        &Primitive(PrimitiveType::Timestamptz),
+    );
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999999+00:00""#,
+        Literal::Primitive(PrimitiveLiteral::Long(-1)),
+        &Primitive(PrimitiveType::TimestamptzNs),
+    );
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999999""#,
+        Literal::Primitive(PrimitiveLiteral::Long(-1)),
+        &Primitive(PrimitiveType::TimestampNs),
+    );
+}
+
+#[test]
+fn json_timestamp_ns_out_of_range_errors() {
+    for (json, ty) in [
+        (
+            r#""2263-01-01T00:00:00""#,
+            Primitive(PrimitiveType::TimestampNs),
+        ),
+        (
+            r#""1600-01-01T00:00:00""#,
+            Primitive(PrimitiveType::TimestampNs),
+        ),
+        (
+            r#""2263-01-01T00:00:00+00:00""#,
+            Primitive(PrimitiveType::TimestamptzNs),
+        ),
+        (
+            r#""1600-01-01T00:00:00+00:00""#,
+            Primitive(PrimitiveType::TimestamptzNs),
+        ),
+    ] {
+        let raw = serde_json::from_str::<JsonValue>(json).unwrap();
+        let result = Literal::try_from_json(raw, &ty);
+        assert!(
+            result.is_err(),
+            "expected {json} to be rejected for {ty}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn nanosecond_initial_default_survives_schema_deserialization() {
+    let field: NestedField = serde_json::from_str(
+        r#"{
+            "id": 1,
+            "name": "created_at",
+            "required": false,
+            "type": "timestamp_ns",
+            "initial-default": "2017-11-16T22:31:08.123456789"
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        field.initial_default,
+        Some(Literal::Primitive(PrimitiveLiteral::Long(
+            1510871468123456789
+        ))),
+        "the `initial-default` must not be silently discarded"
+    );
+}
+
+#[test]
 fn json_timestamptz_ns_rejects_non_utc_offset() {
     // Per the spec, timestamptz_ns single-value serialization must use offset "+00:00"; Java's
     // SingleValueParser enforces the same (DateTimeUtil.isUTCTimestamptz). A non-UTC offset is not a
