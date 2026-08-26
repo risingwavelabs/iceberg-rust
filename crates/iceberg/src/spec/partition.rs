@@ -641,31 +641,31 @@ impl PartitionSpecBuilder {
             )
         })?;
 
-        if field.transform != Transform::Void {
-            if !schema_field.field_type.is_primitive() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot partition by non-primitive source field: '{}'.",
-                        schema_field.field_type
-                    ),
-                ));
-            }
+        // The spec requires partition source columns to be primitive for every
+        // transform, `void` included.
+        if !schema_field.field_type.is_primitive() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot partition by non-primitive source field: '{}'.",
+                    schema_field.field_type
+                ),
+            ));
+        }
 
-            if field
-                .transform
-                .result_type(&schema_field.field_type)
-                .is_err()
-            {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid source type: '{}' for transform: '{}'.",
-                        schema_field.field_type,
-                        field.transform.dedup_name()
-                    ),
-                ));
-            }
+        if field
+            .transform
+            .result_type(&schema_field.field_type)
+            .is_err()
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid source type: '{}' for transform: '{}'.",
+                    schema_field.field_type,
+                    field.transform.dedup_name()
+                ),
+            ));
         }
 
         Ok(())
@@ -1343,6 +1343,32 @@ mod tests {
                 transform: Transform::Identity,
             }])
             .expect_err("variant must not be allowed as a partition source");
+
+        assert_eq!(
+            err.message(),
+            "Cannot partition by non-primitive source field: 'variant'."
+        );
+    }
+
+    #[test]
+    fn test_builder_disallows_void_on_non_primitive_source() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Variant(crate::spec::VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let err = PartitionSpec::builder(schema)
+            .with_spec_id(1)
+            .add_unbound_fields(vec![UnboundPartitionField {
+                source_id: 2,
+                field_id: None,
+                name: "v_part".to_string(),
+                transform: Transform::Void,
+            }])
+            .expect_err("void on a non-primitive source must not be allowed");
 
         assert_eq!(
             err.message(),

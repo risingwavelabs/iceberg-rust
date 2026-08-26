@@ -389,15 +389,18 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         for (value, field) in partition_value.fields().iter().zip(partition_type.fields()) {
+            // Nothing to validate for null; in particular a `void` field may legally
+            // have a non-primitive type on tables written by other implementations.
+            let Some(value) = value else {
+                continue;
+            };
             let field = field.field_type.as_primitive_type().ok_or_else(|| {
                 Error::new(
                     ErrorKind::Unexpected,
                     "Partition field should only be primitive type.",
                 )
             })?;
-            if let Some(value) = value
-                && !field.compatible(&value.as_primitive_literal().unwrap())
-            {
+            if !field.compatible(&value.as_primitive_literal().unwrap()) {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Partition value is not compatible partition type",
@@ -860,5 +863,27 @@ impl<'a> SnapshotProducer<'a> {
 
         self.delete_filter_manager = Some(manager);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Literal, NestedField, PrimitiveType, Type, VariantType};
+
+    #[test]
+    fn test_validate_partition_value_skips_null_non_primitive_fields() {
+        // e.g. a `void` field on a non-primitive source: type non-primitive, value null.
+        let partition_type = StructType::new(vec![
+            NestedField::optional(1000, "v_part", Type::Variant(VariantType)).into(),
+            NestedField::optional(1001, "id_part", Type::Primitive(PrimitiveType::Int)).into(),
+        ]);
+
+        let ok = Struct::from_iter([None, Some(Literal::int(42))]);
+        SnapshotProducer::validate_partition_value(&ok, &partition_type).unwrap();
+
+        // A non-null value on a non-primitive partition field is still rejected.
+        let bad = Struct::from_iter([Some(Literal::int(1)), None]);
+        SnapshotProducer::validate_partition_value(&bad, &partition_type).unwrap_err();
     }
 }
