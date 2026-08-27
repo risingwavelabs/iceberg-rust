@@ -87,6 +87,25 @@ async fn test_variant_schema_is_parsed() {
 }
 
 #[tokio::test]
+async fn test_variant_arrow_schema() {
+    // Full scan without projection: exercises the non-projected read path.
+    let table = load_variant_table().await;
+    let batches: Vec<_> = table
+        .scan()
+        .build()
+        .unwrap()
+        .to_arrow()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert!(!batches.is_empty());
+    assert_variant_column(&batches[0]);
+}
+
+#[tokio::test]
 async fn test_spark_variant_scan_and_projection() {
     let table = load_variant_table().await;
     let batches: Vec<_> = table
