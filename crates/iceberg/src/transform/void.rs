@@ -87,7 +87,9 @@ mod test {
                     Struct(StructType::new(vec![
                         NestedField::optional(1, "a", Primitive(Timestamp)).into(),
                     ])),
-                    Some(Primitive(Int)),
+                    Some(Struct(StructType::new(vec![
+                        NestedField::optional(1, "a", Primitive(Timestamp)).into(),
+                    ]))),
                 ),
             ],
         };

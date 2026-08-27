@@ -279,18 +279,6 @@ impl UnboundPartitionSpec {
         PartitionSpecBuilder::new_from_unbound(self, schema)?.build()
     }
 
-    /// Bind a partition spec that was already present in table metadata.
-    ///
-    /// Some implementations historically allowed `void` fields sourced from
-    /// non-primitive columns. New specs must reject those fields, but existing
-    /// metadata still needs to remain readable and committable.
-    pub(crate) fn bind_for_existing_metadata(
-        self,
-        schema: impl Into<SchemaRef>,
-    ) -> Result<PartitionSpec> {
-        PartitionSpecBuilder::new_from_existing(self, schema)?.build()
-    }
-
     /// Spec id of the partition spec
     pub fn spec_id(&self) -> Option<i32> {
         self.spec_id
@@ -439,27 +427,11 @@ impl PartitionSpecBuilder {
         unbound: UnboundPartitionSpec,
         schema: impl Into<SchemaRef>,
     ) -> Result<Self> {
-        Self::new_from_unbound_with_compatibility(unbound, schema, false)
-    }
-
-    fn new_from_existing(
-        unbound: UnboundPartitionSpec,
-        schema: impl Into<SchemaRef>,
-    ) -> Result<Self> {
-        Self::new_from_unbound_with_compatibility(unbound, schema, true)
-    }
-
-    fn new_from_unbound_with_compatibility(
-        unbound: UnboundPartitionSpec,
-        schema: impl Into<SchemaRef>,
-        allow_non_primitive_void_source: bool,
-    ) -> Result<Self> {
         let mut builder =
             Self::new(schema).with_spec_id(unbound.spec_id.unwrap_or(DEFAULT_PARTITION_SPEC_ID));
 
         for field in unbound.fields {
-            builder = builder
-                .add_unbound_field_with_compatibility(field, allow_non_primitive_void_source)?;
+            builder = builder.add_unbound_field(field)?;
         }
         Ok(builder)
     }
@@ -514,19 +486,11 @@ impl PartitionSpecBuilder {
     ///
     /// If partition field id is set, it is used as the field id.
     /// Otherwise, a new `field_id` is assigned.
-    pub fn add_unbound_field(self, field: UnboundPartitionField) -> Result<Self> {
-        self.add_unbound_field_with_compatibility(field, false)
-    }
-
-    fn add_unbound_field_with_compatibility(
-        mut self,
-        field: UnboundPartitionField,
-        allow_non_primitive_void_source: bool,
-    ) -> Result<Self> {
+    pub fn add_unbound_field(mut self, field: UnboundPartitionField) -> Result<Self> {
         self.check_name_set_and_unique(&field.name)?;
         self.check_for_redundant_partitions(field.source_id, &field.transform)?;
         Self::check_name_does_not_collide_with_schema(&field, &self.schema)?;
-        Self::check_transform_compatibility(&field, &self.schema, allow_non_primitive_void_source)?;
+        Self::check_transform_compatibility(&field, &self.schema)?;
         if let Some(partition_field_id) = field.field_id {
             self.check_partition_id_unique(partition_field_id)?;
         }
@@ -666,11 +630,7 @@ impl PartitionSpecBuilder {
 
     /// Ensure that the transformation of the field is compatible with type of the field
     /// in the schema. Implicitly also checks if the source field exists in the schema.
-    fn check_transform_compatibility(
-        field: &UnboundPartitionField,
-        schema: &Schema,
-        allow_non_primitive_void_source: bool,
-    ) -> Result<()> {
+    fn check_transform_compatibility(field: &UnboundPartitionField, schema: &Schema) -> Result<()> {
         let schema_field = schema.field_by_id(field.source_id).ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -683,9 +643,7 @@ impl PartitionSpecBuilder {
 
         // The spec requires partition source columns to be primitive for every
         // transform, `void` included.
-        let is_compatible_legacy_void =
-            allow_non_primitive_void_source && field.transform == Transform::Void;
-        if !(schema_field.field_type.is_primitive() || is_compatible_legacy_void) {
+        if !schema_field.field_type.is_primitive() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -1415,31 +1373,6 @@ mod tests {
         assert_eq!(
             err.message(),
             "Cannot partition by non-primitive source field: 'variant'."
-        );
-    }
-
-    #[test]
-    fn test_existing_void_on_non_primitive_source_binds_as_int() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "v", Type::Variant(crate::spec::VariantType)).into(),
-            ])
-            .build()
-            .unwrap();
-        let unbound = UnboundPartitionSpec::builder()
-            .with_spec_id(1)
-            .add_partition_field(2, "v_part", Transform::Void)
-            .unwrap()
-            .build();
-
-        assert!(unbound.clone().bind(schema.clone()).is_err());
-
-        let spec = unbound.bind_for_existing_metadata(schema.clone()).unwrap();
-        let partition_type = spec.partition_type(&schema).unwrap();
-        assert_eq!(
-            partition_type.fields()[0].field_type.as_ref(),
-            &Type::Primitive(PrimitiveType::Int)
         );
     }
 
