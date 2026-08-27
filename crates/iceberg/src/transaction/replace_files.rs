@@ -460,6 +460,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
@@ -472,9 +473,9 @@ mod tests {
     use crate::transaction::tests::{
         PARENT_SEQUENCE_NUMBER, PARENT_SNAPSHOT_ID, REMOVED_DELETE_FILE, RETAINED_DELETE_FILE,
         make_v2_minimal_table, make_v2_table_with_delete_manifest, make_v3_minimal_table,
-        position_delete_file,
+        make_v3_minimal_table_in_catalog, position_delete_file,
     };
-    use crate::transaction::{Transaction, TransactionAction};
+    use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{ErrorKind, TableRequirement, TableUpdate};
 
     async fn delete_file_statuses(table: &Table, snapshot: &Snapshot) -> Vec<ManifestStatus> {
@@ -513,6 +514,83 @@ mod tests {
         assert_eq!(
             ReplaceFilesOperation::<Overwrite>::new().operation(),
             Operation::Overwrite
+        );
+    }
+
+    /// A logical overwrite may replace only part of a table. Its summary must account for the
+    /// files actually removed instead of treating every overwrite as a full-table truncate.
+    #[tokio::test]
+    async fn test_partial_overwrite_summary_rolls_totals_forward() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let make_file = |path: String, record_count: u64, file_size_in_bytes: u64| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path)
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(file_size_in_bytes)
+                .record_count(record_count)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap()
+        };
+
+        let parent_files = (0..5)
+            .map(|index| make_file(format!("test/old-{index}.parquet"), 20, 200))
+            .collect::<Vec<_>>();
+        let removed_file = parent_files[0].clone();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(parent_files)
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let replacement = make_file("test/replacement.parquet".to_string(), 10, 100);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .overwrite_files()
+            .add_data_files([replacement])
+            .delete_files([removed_file])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let summary = table.metadata().current_snapshot().unwrap().summary();
+        assert_eq!(summary.operation, Operation::Overwrite);
+        let properties = &summary.additional_properties;
+
+        assert_eq!(
+            properties.get("added-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            properties.get("deleted-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            properties.get("deleted-records").map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            properties.get("removed-files-size").map(String::as_str),
+            Some("200")
+        );
+        assert_eq!(
+            properties.get("total-data-files").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            properties.get("total-records").map(String::as_str),
+            Some("90")
+        );
+        assert_eq!(
+            properties.get("total-files-size").map(String::as_str),
+            Some("900")
         );
     }
 

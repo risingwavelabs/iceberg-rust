@@ -671,6 +671,10 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
+        // `Overwrite` is also used for partial replace-files commits. Treating it as a table
+        // truncate would report every parent file as deleted and reset totals to only the files
+        // added by this commit. The producer already collected the exact removed files above, so
+        // all replace-files operations must roll summaries forward incrementally.
         update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
