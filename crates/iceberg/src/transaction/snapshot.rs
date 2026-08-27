@@ -27,8 +27,9 @@ use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
-    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
-    StructType, Summary, TableProperties, UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
+    Operation, PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention,
+    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties, Transform,
+    UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
@@ -202,6 +203,7 @@ impl<'a> SnapshotProducer<'a> {
             Self::validate_partition_value(
                 data_file.partition(),
                 self.table.metadata().default_partition_type(),
+                self.table.metadata().default_partition_spec(),
             )?;
         }
 
@@ -380,15 +382,33 @@ impl<'a> SnapshotProducer<'a> {
     fn validate_partition_value(
         partition_value: &Struct,
         partition_type: &StructType,
+        partition_spec: &PartitionSpec,
     ) -> Result<()> {
-        if partition_value.fields().len() != partition_type.fields().len() {
+        if partition_value.fields().len() != partition_type.fields().len()
+            || partition_value.fields().len() != partition_spec.fields().len()
+        {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Partition value is not compatible with partition type",
             ));
         }
 
-        for (value, field) in partition_value.fields().iter().zip(partition_type.fields()) {
+        for (idx, (value, field)) in partition_value
+            .fields()
+            .iter()
+            .zip(partition_type.fields())
+            .enumerate()
+        {
+            if partition_spec.fields()[idx].transform == Transform::Void {
+                if value.is_some() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Void partition field must be null",
+                    ));
+                }
+                continue;
+            }
+
             let field = field.field_type.as_primitive_type().ok_or_else(|| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -864,5 +884,49 @@ impl<'a> SnapshotProducer<'a> {
 
         self.delete_filter_manager = Some(manager);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Type, VariantType};
+
+    #[test]
+    fn test_validate_partition_value_for_legacy_void_non_primitive_source() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        let partition_spec: PartitionSpec = serde_json::from_value(serde_json::json!({
+            "spec-id": 0,
+            "fields": [
+                {
+                    "source-id": 2,
+                    "field-id": 1000,
+                    "name": "v_part",
+                    "transform": "void"
+                },
+                {
+                    "source-id": 1,
+                    "field-id": 1001,
+                    "name": "id_part",
+                    "transform": "identity"
+                }
+            ]
+        }))
+        .unwrap();
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let ok = Struct::from_iter([None, Some(Literal::int(42))]);
+        SnapshotProducer::validate_partition_value(&ok, &partition_type, &partition_spec).unwrap();
+
+        // `void` must remain null even though its compatibility result type is `int`.
+        let bad = Struct::from_iter([Some(Literal::int(1)), None]);
+        SnapshotProducer::validate_partition_value(&bad, &partition_type, &partition_spec)
+            .unwrap_err();
     }
 }
