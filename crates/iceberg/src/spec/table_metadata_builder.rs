@@ -1144,7 +1144,7 @@ impl TableMetadataBuilder {
         self.metadata.default_spec = Arc::new(
             Arc::unwrap_or_clone(self.metadata.default_spec)
                 .into_unbound()
-                .bind(schema.clone())?,
+                .bind_for_existing_metadata(schema.clone())?,
         );
         self.metadata.default_partition_type =
             self.metadata.default_spec.partition_type(&schema)?;

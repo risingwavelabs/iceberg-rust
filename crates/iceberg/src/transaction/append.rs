@@ -236,7 +236,8 @@ mod tests {
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
-        ManifestWriterBuilder, SnapshotRef, Struct, TableMetadata,
+        ManifestWriterBuilder, NestedField, PartitionSpec, SnapshotRef, Struct, TableMetadata,
+        Type, VariantType,
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
@@ -855,6 +856,79 @@ mod tests {
         let action = action.add_data_files(vec![data_file.clone()]);
 
         assert!(Arc::new(action).commit(&table).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_to_existing_void_non_primitive_partition() {
+        let table = make_v3_minimal_table();
+        let mut metadata = table.metadata().clone();
+        let mut fields = metadata.current_schema().as_struct().fields().to_vec();
+        fields.push(NestedField::optional(4, "v", Type::Variant(VariantType)).into());
+        let schema = crate::spec::Schema::builder()
+            .with_schema_id(metadata.current_schema_id())
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let legacy_spec: PartitionSpec = serde_json::from_value(serde_json::json!({
+            "spec-id": 0,
+            "fields": [{
+                "source-id": 4,
+                "field-id": 1000,
+                "name": "v_part",
+                "transform": "void"
+            }]
+        }))
+        .unwrap();
+
+        metadata.last_column_id = 4;
+        metadata
+            .schemas
+            .insert(schema.schema_id(), Arc::new(schema.clone()));
+        metadata.partition_specs.clear();
+        metadata
+            .partition_specs
+            .insert(legacy_spec.spec_id(), Arc::new(legacy_spec.clone()));
+        metadata.default_partition_type = legacy_spec.partition_type(&schema).unwrap();
+        metadata.default_spec = Arc::new(legacy_spec);
+        metadata.last_partition_id = 1000;
+
+        // Exercise the real compatibility boundary: metadata produced elsewhere is loaded
+        // from JSON before the append starts.
+        let json = serde_json::to_vec(&metadata).unwrap();
+        let metadata: TableMetadata = serde_json::from_slice(&json).unwrap();
+        let table = table.with_metadata(Arc::new(metadata));
+        assert_eq!(
+            table.metadata().default_partition_type().fields()[0]
+                .field_type
+                .as_ref(),
+            &Type::Primitive(crate::spec::PrimitiveType::Int)
+        );
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/legacy-void.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([None]))
+            .build()
+            .unwrap();
+        let action = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![data_file]);
+        let action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut updates = Vec::new();
+        let mut requirements = Vec::new();
+        let updated =
+            Transaction::apply(table, action_commit, &mut updates, &mut requirements).unwrap();
+
+        let snapshot = updated.metadata().current_snapshot().unwrap();
+        let manifest_list = updated.manifest_list_reader(snapshot).load().await.unwrap();
+        let summary = manifest_list.entries()[0].partitions.as_ref().unwrap();
+        assert!(summary[0].contains_null);
+        assert!(summary[0].lower_bound.is_none());
+        assert!(summary[0].upper_bound.is_none());
     }
 
     #[tokio::test]
