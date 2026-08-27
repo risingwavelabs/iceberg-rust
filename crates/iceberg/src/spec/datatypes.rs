@@ -19,7 +19,6 @@
  * Data Types
  */
 use std::collections::HashMap;
-use std::convert::identity;
 use std::fmt;
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
@@ -554,7 +553,7 @@ impl fmt::Display for StructType {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Eq, Clone)]
-#[serde(from = "SerdeNestedField", into = "SerdeNestedField")]
+#[serde(try_from = "SerdeNestedField", into = "SerdeNestedField")]
 /// A struct is a tuple of typed values. Each field in the tuple is named and has an integer id that is unique in the table schema.
 /// Each field can be either optional or required, meaning that values can (or cannot) be null. Fields may be any type.
 /// Fields may have an optional comment or doc string. Fields can have default values.
@@ -591,25 +590,66 @@ struct SerdeNestedField {
     pub write_default: Option<JsonValue>,
 }
 
-impl From<SerdeNestedField> for NestedField {
-    fn from(value: SerdeNestedField) -> Self {
-        NestedField {
+/// Parses a field default, failing when it cannot be represented as the field's type.
+///
+/// This is deliberately fallible. Discarding an unrepresentable default would make invalid metadata
+/// indistinguishable from a field that simply has no default, and the consequence is silent: a
+/// reader falls back to `null` for a field absent from a data file, so a *required* field can end up
+/// materializing `NULL`, and a writer that rewrites the file makes that permanent. Rejecting the
+/// metadata keeps the failure loud and recoverable, and matches the reference implementation, which
+/// also refuses invalid single values.
+fn parse_field_default(
+    value: serde_json::Value,
+    field_type: &Type,
+    default_kind: &str,
+    field_id: i32,
+    field_name: &str,
+) -> Result<Option<Literal>> {
+    Literal::try_from_json(value, field_type).map_err(|error| {
+        crate::Error::new(
+            crate::ErrorKind::DataInvalid,
+            format!(
+                "Invalid `{default_kind}` for field {field_id} ({field_name:?}) of type {field_type}."
+            ),
+        )
+        .with_source(error)
+    })
+}
+
+impl TryFrom<SerdeNestedField> for NestedField {
+    type Error = crate::Error;
+
+    fn try_from(value: SerdeNestedField) -> Result<Self> {
+        let initial_default = value
+            .initial_default
+            .map(|x| {
+                parse_field_default(
+                    x,
+                    &value.field_type,
+                    "initial-default",
+                    value.id,
+                    &value.name,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let write_default = value
+            .write_default
+            .map(|x| {
+                parse_field_default(x, &value.field_type, "write-default", value.id, &value.name)
+            })
+            .transpose()?
+            .flatten();
+
+        Ok(NestedField {
             id: value.id,
             name: value.name,
             required: value.required,
-            initial_default: value.initial_default.and_then(|x| {
-                Literal::try_from_json(x, &value.field_type)
-                    .ok()
-                    .and_then(identity)
-            }),
-            write_default: value.write_default.and_then(|x| {
-                Literal::try_from_json(x, &value.field_type)
-                    .ok()
-                    .and_then(identity)
-            }),
+            initial_default,
+            write_default,
             field_type: value.field_type,
             doc: value.doc,
-        }
+        })
     }
 }
 

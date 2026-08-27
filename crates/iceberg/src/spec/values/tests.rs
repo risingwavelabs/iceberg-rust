@@ -236,6 +236,76 @@ fn json_timestamptz_ns() {
 }
 
 #[test]
+fn json_timestamps_before_the_unix_epoch_round_trip() {
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999+00:00""#,
+        Literal::Primitive(PrimitiveLiteral::Long(-1)),
+        &Primitive(PrimitiveType::Timestamptz),
+    );
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999999+00:00""#,
+        Literal::Primitive(PrimitiveLiteral::Long(-1)),
+        &Primitive(PrimitiveType::TimestamptzNs),
+    );
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999999""#,
+        Literal::Primitive(PrimitiveLiteral::Long(-1)),
+        &Primitive(PrimitiveType::TimestampNs),
+    );
+}
+
+#[test]
+fn json_timestamp_ns_out_of_range_errors() {
+    for (json, ty) in [
+        (
+            r#""2263-01-01T00:00:00""#,
+            Primitive(PrimitiveType::TimestampNs),
+        ),
+        (
+            r#""1600-01-01T00:00:00""#,
+            Primitive(PrimitiveType::TimestampNs),
+        ),
+        (
+            r#""2263-01-01T00:00:00+00:00""#,
+            Primitive(PrimitiveType::TimestamptzNs),
+        ),
+        (
+            r#""1600-01-01T00:00:00+00:00""#,
+            Primitive(PrimitiveType::TimestamptzNs),
+        ),
+    ] {
+        let raw = serde_json::from_str::<JsonValue>(json).unwrap();
+        let result = Literal::try_from_json(raw, &ty);
+        assert!(
+            result.is_err(),
+            "expected {json} to be rejected for {ty}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn nanosecond_initial_default_survives_schema_deserialization() {
+    let field: NestedField = serde_json::from_str(
+        r#"{
+            "id": 1,
+            "name": "created_at",
+            "required": false,
+            "type": "timestamp_ns",
+            "initial-default": "2017-11-16T22:31:08.123456789"
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        field.initial_default,
+        Some(Literal::Primitive(PrimitiveLiteral::Long(
+            1510871468123456789
+        ))),
+        "the `initial-default` must not be silently discarded"
+    );
+}
+
+#[test]
 fn json_timestamptz_ns_rejects_non_utc_offset() {
     // Per the spec, timestamptz_ns single-value serialization must use offset "+00:00"; Java's
     // SingleValueParser enforces the same (DateTimeUtil.isUTCTimestamptz). A non-UTC offset is not a
@@ -283,6 +353,52 @@ fn json_uuid() {
                 .as_u128(),
         )),
         &Primitive(PrimitiveType::Uuid),
+    );
+}
+
+/// A default that cannot be represented must be **rejected**, not quietly turned into "no default".
+///
+/// The two are very different: a discarded default means a reader falls back to `null` for a field
+/// that is absent from a data file, so a *required* field can end up materializing `NULL`, and a
+/// writer that rewrites the file makes that permanent. `2263-01-01` is past the last instant an
+/// `i64` nanosecond timestamp can express, so it is invalid metadata and must say so.
+#[test]
+fn out_of_range_nanosecond_default_is_rejected_not_dropped() {
+    for default_kind in ["initial-default", "write-default"] {
+        let json = format!(
+            r#"{{
+                "id": 1,
+                "name": "created_at",
+                "required": true,
+                "type": "timestamp_ns",
+                "{default_kind}": "2263-01-01T00:00:00"
+            }}"#
+        );
+
+        let error = serde_json::from_str::<NestedField>(&json)
+            .expect_err("an unrepresentable default must fail deserialization");
+        let message = error.to_string();
+        assert!(
+            message.contains(default_kind) && message.contains("created_at"),
+            "the error should name the offending default and field, got: {message}"
+        );
+    }
+}
+
+/// Same requirement for a default whose JSON shape does not match the field type at all.
+#[test]
+fn mistyped_default_is_rejected_not_dropped() {
+    let json = r#"{
+        "id": 1,
+        "name": "label",
+        "required": false,
+        "type": "string",
+        "initial-default": 5
+    }"#;
+
+    assert!(
+        serde_json::from_str::<NestedField>(json).is_err(),
+        "a default whose type does not match the field must be rejected"
     );
 }
 
