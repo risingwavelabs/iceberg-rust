@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
@@ -30,20 +31,85 @@ use crate::spec::{DataContentType, DataFile, Struct};
 // Iceberg field ID for the `file_path` column in position delete files.
 const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2147483546;
 
-fn inferred_referenced_data_file(delete_file: &DataFile) -> Option<String> {
-    let lower = delete_file
-        .lower_bounds
-        .get(&POSITION_DELETE_FILE_PATH_FIELD_ID)?;
-    let upper = delete_file
-        .upper_bounds
-        .get(&POSITION_DELETE_FILE_PATH_FIELD_ID)?;
-
-    if lower != upper {
-        return None;
+/// Returns whether a position delete file may contain deletes for the data file.
+///
+/// An explicit referenced data file is exact and takes precedence over metrics. Otherwise, file
+/// path bounds are used only to prove that the data file is outside the delete file's path range.
+/// Missing or incompatible metrics fail open so that scan planning never drops an applicable
+/// delete.
+fn can_contain_pos_deletes_for_file(data_file: &DataFile, delete_file: &DataFile) -> bool {
+    if let Some(referenced_data_file) = delete_file.referenced_data_file() {
+        return referenced_data_file == data_file.file_path();
     }
 
-    let bytes = lower.to_bytes().ok()?;
-    std::str::from_utf8(bytes.as_ref()).ok().map(str::to_owned)
+    let (Some(lower), Some(upper)) = (
+        delete_file
+            .lower_bounds()
+            .get(&POSITION_DELETE_FILE_PATH_FIELD_ID),
+        delete_file
+            .upper_bounds()
+            .get(&POSITION_DELETE_FILE_PATH_FIELD_ID),
+    ) else {
+        return true;
+    };
+    let data_file_path = crate::spec::Datum::string(data_file.file_path());
+
+    let (Some(lower_to_upper), Some(path_to_lower), Some(path_to_upper)) = (
+        lower.partial_cmp(upper),
+        data_file_path.partial_cmp(lower),
+        data_file_path.partial_cmp(upper),
+    ) else {
+        return true;
+    };
+    if lower_to_upper == Ordering::Greater {
+        return true;
+    }
+
+    path_to_lower != Ordering::Less && path_to_upper != Ordering::Greater
+}
+
+fn may_contain_null(file: &DataFile, field_id: i32) -> bool {
+    file.null_value_counts()
+        .get(&field_id)
+        .is_none_or(|count| *count > 0)
+}
+
+/// Returns whether an equality delete file may contain a row that matches the data file.
+///
+/// File metrics are used only to prove that a match is impossible. Missing or incompatible
+/// metrics fail open so that scan planning never drops a delete that may apply.
+fn can_contain_eq_deletes_for_file(data_file: &DataFile, delete_file: &DataFile) -> bool {
+    let Some(equality_ids) = delete_file.equality_ids.as_deref() else {
+        return true;
+    };
+
+    for &field_id in equality_ids {
+        if may_contain_null(data_file, field_id) && may_contain_null(delete_file, field_id) {
+            // Null equals null for equality deletes, so this field may match.
+            continue;
+        }
+
+        let (Some(data_lower), Some(data_upper), Some(delete_lower), Some(delete_upper)) = (
+            data_file.lower_bounds().get(&field_id),
+            data_file.upper_bounds().get(&field_id),
+            delete_file.lower_bounds().get(&field_id),
+            delete_file.upper_bounds().get(&field_id),
+        ) else {
+            continue;
+        };
+
+        if matches!(
+            data_lower.partial_cmp(delete_upper),
+            Some(Ordering::Greater)
+        ) || matches!(
+            delete_lower.partial_cmp(data_upper),
+            Some(Ordering::Greater)
+        ) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Index of delete files
@@ -198,6 +264,7 @@ impl PopulatedDeleteFileIndex {
                 seq_num
                     .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
                     .unwrap_or_else(|| true)
+                    && can_contain_eq_deletes_for_file(data_file, delete.manifest_entry.data_file())
             })
             .for_each(|delete| results.push(delete.as_ref().into()));
 
@@ -210,6 +277,10 @@ impl PopulatedDeleteFileIndex {
                         .map(|seq_num| delete.manifest_entry.sequence_number() > Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
+                        && can_contain_eq_deletes_for_file(
+                            data_file,
+                            delete.manifest_entry.data_file(),
+                        )
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -220,16 +291,12 @@ impl PopulatedDeleteFileIndex {
                 // filter that returns true if the provided delete file's sequence number is **greater than or equal to** `seq_num`
                 .filter(|&delete| {
                     let delete_file = delete.manifest_entry.data_file();
-                    let referenced_data_file_matches = delete_file
-                        .referenced_data_file()
-                        .or_else(|| inferred_referenced_data_file(delete_file))
-                        .is_none_or(|path| path == data_file.file_path());
 
                     seq_num
                         .map(|seq_num| delete.manifest_entry.sequence_number() >= Some(seq_num))
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
-                        && referenced_data_file_matches
+                        && can_contain_pos_deletes_for_file(data_file, delete_file)
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
         }
@@ -438,6 +505,53 @@ mod tests {
         assert!(actual_paths_to_apply_for_different_spec.is_empty());
     }
 
+    #[test]
+    fn test_equality_delete_metrics_pruning() {
+        let data_file =
+            with_int_metrics(build_unpartitioned_data_file(), 1, Some(100), Some(200), 0);
+
+        let disjoint_delete =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(1), Some(10), 0);
+        assert!(!can_contain_eq_deletes_for_file(
+            &data_file,
+            &disjoint_delete
+        ));
+
+        for (lower, upper) in [(150, 250), (200, 250)] {
+            let delete_file = with_int_metrics(
+                build_unpartitioned_eq_delete(),
+                1,
+                Some(lower),
+                Some(upper),
+                0,
+            );
+            assert!(can_contain_eq_deletes_for_file(&data_file, &delete_file));
+        }
+
+        let missing_bound_delete =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(1), None, 0);
+        assert!(can_contain_eq_deletes_for_file(
+            &data_file,
+            &missing_bound_delete
+        ));
+
+        let data_with_null =
+            with_int_metrics(build_unpartitioned_data_file(), 1, Some(100), Some(200), 1);
+        let delete_with_null =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(1), Some(10), 1);
+        assert!(can_contain_eq_deletes_for_file(
+            &data_with_null,
+            &delete_with_null
+        ));
+
+        let data_file = with_int_metrics(data_file, 2, Some(10), Some(20), 0);
+        let mut delete_file =
+            with_int_metrics(build_unpartitioned_eq_delete(), 1, Some(150), Some(250), 0);
+        delete_file.equality_ids = Some(vec![1, 2]);
+        let delete_file = with_int_metrics(delete_file, 2, Some(30), Some(40), 0);
+        assert!(!can_contain_eq_deletes_for_file(&data_file, &delete_file));
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
@@ -474,8 +588,12 @@ mod tests {
     }
 
     fn build_unpartitioned_data_file() -> DataFile {
+        build_unpartitioned_data_file_with_path(format!("{}-data.parquet", Uuid::new_v4()))
+    }
+
+    fn build_unpartitioned_data_file_with_path(file_path: impl Into<String>) -> DataFile {
         DataFileBuilder::default()
-            .file_path(format!("{}-data.parquet", Uuid::new_v4()))
+            .file_path(file_path.into())
             .file_format(DataFileFormat::Parquet)
             .content(DataContentType::Data)
             .record_count(100)
@@ -497,6 +615,23 @@ mod tests {
             .file_size_in_bytes(100)
             .build()
             .unwrap()
+    }
+
+    fn with_int_metrics(
+        mut file: DataFile,
+        field_id: i32,
+        lower: Option<i32>,
+        upper: Option<i32>,
+        null_count: u64,
+    ) -> DataFile {
+        file.null_value_counts.insert(field_id, null_count);
+        if let Some(lower) = lower {
+            file.lower_bounds.insert(field_id, Datum::int(lower));
+        }
+        if let Some(upper) = upper {
+            file.upper_bounds.insert(field_id, Datum::int(upper));
+        }
+        file
     }
 
     fn build_added_manifest_entry(data_seq_number: i64, file: &DataFile) -> ManifestEntry {
@@ -546,37 +681,47 @@ mod tests {
     }
 
     #[test]
-    fn test_position_delete_single_path_bounds_pruning() {
-        let data_file = build_unpartitioned_data_file();
-        let other_data_file = build_unpartitioned_data_file();
-        let path = Datum::string(data_file.file_path());
-        let bounded_delete = DataFileBuilder::default()
-            .file_path("bounded-delete.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .content(DataContentType::PositionDeletes)
-            .record_count(1)
-            .lower_bounds(HashMap::from([(
-                POSITION_DELETE_FILE_PATH_FIELD_ID,
-                path.clone(),
-            )]))
-            .upper_bounds(HashMap::from([(POSITION_DELETE_FILE_PATH_FIELD_ID, path)]))
-            .partition(Struct::empty())
-            .partition_spec_id(0)
-            .file_size_in_bytes(100)
-            .build()
-            .unwrap();
+    fn test_position_delete_path_bounds_pruning() {
+        let mut bounded_delete = build_unpartitioned_pos_delete();
+        bounded_delete.lower_bounds.insert(
+            POSITION_DELETE_FILE_PATH_FIELD_ID,
+            Datum::string("s3://bucket/data/file-00002.parquet"),
+        );
+        bounded_delete.upper_bounds.insert(
+            POSITION_DELETE_FILE_PATH_FIELD_ID,
+            Datum::string("s3://bucket/data/file-00004.parquet"),
+        );
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(1, &bounded_delete).into(),
             partition_spec_id: 0,
         }]);
 
+        let matching_file =
+            build_unpartitioned_data_file_with_path("s3://bucket/data/file-00003.parquet");
+        let before_range =
+            build_unpartitioned_data_file_with_path("s3://bucket/data/file-00001.parquet");
+        let after_range =
+            build_unpartitioned_data_file_with_path("s3://bucket/data/file-00005.parquet");
+
+        assert!(can_contain_pos_deletes_for_file(
+            &before_range,
+            &build_unpartitioned_pos_delete()
+        ));
+
         assert_eq!(
-            index.get_deletes_for_data_file(&data_file, Some(0)).len(),
+            index
+                .get_deletes_for_data_file(&matching_file, Some(0))
+                .len(),
             1
         );
         assert!(
             index
-                .get_deletes_for_data_file(&other_data_file, Some(0))
+                .get_deletes_for_data_file(&before_range, Some(0))
+                .is_empty()
+        );
+        assert!(
+            index
+                .get_deletes_for_data_file(&after_range, Some(0))
                 .is_empty()
         );
     }

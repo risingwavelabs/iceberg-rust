@@ -27,8 +27,9 @@ use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
-    Operation, Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
-    StructType, Summary, TableProperties, UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
+    Operation, PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention,
+    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties, Transform,
+    UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
@@ -142,6 +143,7 @@ pub(crate) struct SnapshotProducer<'a> {
     // It is shared with ManifestWriterContext to avoid naming conflicts.
     manifest_counter: Arc<AtomicU64>,
     new_data_file_sequence_number: Option<i64>,
+    delete_file_cleanup_min_data_sequence_number: Option<i64>,
     target_branch: String,
     delete_filter_manager: Option<ManifestFilterManager>,
 }
@@ -183,6 +185,7 @@ impl<'a> SnapshotProducer<'a> {
             removed_delete_files,
             manifest_counter: Arc::new(AtomicU64::new(0)),
             new_data_file_sequence_number: None,
+            delete_file_cleanup_min_data_sequence_number: None,
             target_branch: MAIN_BRANCH.to_string(),
             delete_filter_manager: None,
         }
@@ -200,6 +203,7 @@ impl<'a> SnapshotProducer<'a> {
             Self::validate_partition_value(
                 data_file.partition(),
                 self.table.metadata().default_partition_type(),
+                self.table.metadata().default_partition_spec(),
             )?;
         }
 
@@ -378,15 +382,33 @@ impl<'a> SnapshotProducer<'a> {
     fn validate_partition_value(
         partition_value: &Struct,
         partition_type: &StructType,
+        partition_spec: &PartitionSpec,
     ) -> Result<()> {
-        if partition_value.fields().len() != partition_type.fields().len() {
+        if partition_value.fields().len() != partition_type.fields().len()
+            || partition_value.fields().len() != partition_spec.fields().len()
+        {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Partition value is not compatible with partition type",
             ));
         }
 
-        for (value, field) in partition_value.fields().iter().zip(partition_type.fields()) {
+        for (idx, (value, field)) in partition_value
+            .fields()
+            .iter()
+            .zip(partition_type.fields())
+            .enumerate()
+        {
+            if partition_spec.fields()[idx].transform == Transform::Void {
+                if value.is_some() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Void partition field must be null",
+                    ));
+                }
+                continue;
+            }
+
             let field = field.field_type.as_primitive_type().ok_or_else(|| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -531,7 +553,7 @@ impl<'a> SnapshotProducer<'a> {
                 self.new_data_file_sequence_number
                     .unwrap_or(last_sequence_number),
             );
-            let min_data_sequence_number = data_manifests
+            let live_data_min_sequence_number = data_manifests
                 .iter()
                 .map(|manifest| manifest.min_sequence_number)
                 .filter(|sequence| *sequence != UNASSIGNED_SEQUENCE_NUMBER)
@@ -539,6 +561,13 @@ impl<'a> SnapshotProducer<'a> {
                 .min()
                 .map(|sequence| sequence.min(last_sequence_number))
                 .unwrap_or(last_sequence_number);
+            // The live-data minimum reflects files that survive this commit. The optional
+            // planning-derived bound is validated against added data before snapshot production,
+            // so either bound can independently advance delete cleanup.
+            let min_data_sequence_number = self
+                .delete_file_cleanup_min_data_sequence_number
+                .unwrap_or(live_data_min_sequence_number)
+                .max(live_data_min_sequence_number);
 
             filter.drop_delete_files_older_than(min_data_sequence_number);
             filter.remove_dangling_deletes_for(&self.removed_data_file_paths);
@@ -662,6 +691,10 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
+        // `Overwrite` is also used for partial replace-files commits. Treating it as a table
+        // truncate would report every parent file as deleted and reset totals to only the files
+        // added by this commit. The producer already collected the exact removed files above, so
+        // all replace-files operations must roll summaries forward incrementally.
         update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
@@ -803,6 +836,13 @@ impl<'a> SnapshotProducer<'a> {
         self.new_data_file_sequence_number = Some(sequence_number);
     }
 
+    pub(crate) fn set_delete_file_cleanup_min_data_sequence_number(
+        &mut self,
+        sequence_number: i64,
+    ) {
+        self.delete_file_cleanup_min_data_sequence_number = Some(sequence_number);
+    }
+
     pub(crate) fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
@@ -844,5 +884,49 @@ impl<'a> SnapshotProducer<'a> {
 
         self.delete_filter_manager = Some(manager);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Type, VariantType};
+
+    #[test]
+    fn test_validate_partition_value_for_legacy_void_non_primitive_source() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        let partition_spec: PartitionSpec = serde_json::from_value(serde_json::json!({
+            "spec-id": 0,
+            "fields": [
+                {
+                    "source-id": 2,
+                    "field-id": 1000,
+                    "name": "v_part",
+                    "transform": "void"
+                },
+                {
+                    "source-id": 1,
+                    "field-id": 1001,
+                    "name": "id_part",
+                    "transform": "identity"
+                }
+            ]
+        }))
+        .unwrap();
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+
+        let ok = Struct::from_iter([None, Some(Literal::int(42))]);
+        SnapshotProducer::validate_partition_value(&ok, &partition_type, &partition_spec).unwrap();
+
+        // `void` must remain null even though its compatibility result type is `int`.
+        let bad = Struct::from_iter([Some(Literal::int(1)), None]);
+        SnapshotProducer::validate_partition_value(&bad, &partition_type, &partition_spec)
+            .unwrap_err();
     }
 }

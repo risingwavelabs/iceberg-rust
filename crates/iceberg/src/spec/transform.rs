@@ -128,8 +128,8 @@ pub enum Transform {
     /// existing partition field so that the field is effectively dropped in
     /// v1 tables.
     ///
-    /// - Source type could be any type..
-    /// - Return type is Source type.
+    /// - Source type could be any type.
+    /// - Return type is the source type for primitive sources, otherwise `int`.
     Void,
     /// Used to represent some customized transform that can't be recognized or supported now.
     Unknown,
@@ -169,7 +169,16 @@ impl Transform {
                     ))
                 }
             }
-            Transform::Void => Ok(input_type.clone()),
+            Transform::Void => {
+                if input_type.is_primitive() {
+                    Ok(input_type.clone())
+                } else {
+                    // The spec permits `int` as the result type of `void`. Use it for
+                    // legacy specs whose source is non-primitive so manifests can still
+                    // represent the always-null partition value.
+                    Ok(Type::Primitive(PrimitiveType::Int))
+                }
+            }
             Transform::Unknown => Ok(Type::Primitive(PrimitiveType::String)),
             Transform::Bucket(_) => {
                 if let Type::Primitive(p) = input_type {

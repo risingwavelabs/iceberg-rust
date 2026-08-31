@@ -233,6 +233,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     removed_delete_files: Vec<DataFile>,
     snapshot_id: Option<i64>,
     new_data_file_sequence_number: Option<i64>,
+    delete_file_cleanup_min_data_sequence_number: Option<i64>,
     target_branch: Option<String>,
     enable_delete_filter_manager: bool,
     check_file_existence: bool,
@@ -258,6 +259,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             removed_delete_files: Vec::new(),
             snapshot_id: None,
             new_data_file_sequence_number: None,
+            delete_file_cleanup_min_data_sequence_number: None,
             target_branch: None,
             enable_delete_filter_manager: true,
             check_file_existence: false,
@@ -334,6 +336,16 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         self
     }
 
+    /// Set the minimum data sequence used to retire older delete files.
+    ///
+    /// If omitted, the minimum sequence from all data manifests is used. An
+    /// override must not exceed the data sequence of any live data file to which
+    /// an existing delete may apply.
+    pub fn set_delete_file_cleanup_min_data_sequence_number(mut self, seq: i64) -> Self {
+        self.delete_file_cleanup_min_data_sequence_number = Some(seq);
+        self
+    }
+
     pub fn set_check_file_existence(mut self, check: bool) -> Self {
         self.check_file_existence = check;
         self
@@ -365,6 +377,35 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             }
         }
 
+        if let Some(sequence_number) = self.delete_file_cleanup_min_data_sequence_number {
+            let last_sequence_number = table.metadata().last_sequence_number();
+            if sequence_number < 0 || sequence_number > last_sequence_number {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::DataInvalid,
+                    format!(
+                        "Delete file cleanup minimum data sequence number {sequence_number} must \
+                         be between 0 and the table's last sequence number {last_sequence_number}"
+                    ),
+                ));
+            }
+
+            if !self.added_data_files.is_empty() {
+                let added_data_sequence_number = self
+                    .new_data_file_sequence_number
+                    .unwrap_or(last_sequence_number);
+                if sequence_number > added_data_sequence_number {
+                    return Err(crate::Error::new(
+                        crate::ErrorKind::DataInvalid,
+                        format!(
+                            "Delete file cleanup minimum data sequence number {sequence_number} \
+                             must not exceed the added data file sequence number \
+                             {added_data_sequence_number}"
+                        ),
+                    ));
+                }
+            }
+        }
+
         let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -378,6 +419,10 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
 
         if let Some(seq) = self.new_data_file_sequence_number {
             snapshot_producer.set_new_data_file_sequence_number(seq);
+        }
+
+        if let Some(seq) = self.delete_file_cleanup_min_data_sequence_number {
+            snapshot_producer.set_delete_file_cleanup_min_data_sequence_number(seq);
         }
 
         if let Some(branch) = &self.target_branch {
@@ -415,21 +460,48 @@ mod tests {
     use uuid::Uuid;
 
     use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
         ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
     };
+    use crate::table::Table;
     use crate::test_utils::make_encrypted_table;
     use crate::transaction::snapshot::{SnapshotProduceOperation, SnapshotProducer};
     use crate::transaction::tests::{
         PARENT_SEQUENCE_NUMBER, PARENT_SNAPSHOT_ID, REMOVED_DELETE_FILE, RETAINED_DELETE_FILE,
         make_v2_minimal_table, make_v2_table_with_delete_manifest, make_v3_minimal_table,
-        position_delete_file,
+        make_v3_minimal_table_in_catalog, position_delete_file,
     };
-    use crate::transaction::{Transaction, TransactionAction};
+    use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{ErrorKind, TableRequirement, TableUpdate};
+
+    async fn delete_file_statuses(table: &Table, snapshot: &Snapshot) -> Vec<ManifestStatus> {
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        let mut statuses = Vec::new();
+        for manifest_file in manifest_list
+            .entries()
+            .iter()
+            .filter(|manifest| manifest.content == ManifestContentType::Deletes)
+        {
+            statuses.extend(
+                manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .unwrap()
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.status()),
+            );
+        }
+        statuses
+    }
 
     #[test]
     fn test_modes_map_to_their_operations() {
@@ -442,6 +514,83 @@ mod tests {
         assert_eq!(
             ReplaceFilesOperation::<Overwrite>::new().operation(),
             Operation::Overwrite
+        );
+    }
+
+    /// A logical overwrite may replace only part of a table. Its summary must account for the
+    /// files actually removed instead of treating every overwrite as a full-table truncate.
+    #[tokio::test]
+    async fn test_partial_overwrite_summary_rolls_totals_forward() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let make_file = |path: String, record_count: u64, file_size_in_bytes: u64| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path)
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(file_size_in_bytes)
+                .record_count(record_count)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap()
+        };
+
+        let parent_files = (0..5)
+            .map(|index| make_file(format!("test/old-{index}.parquet"), 20, 200))
+            .collect::<Vec<_>>();
+        let removed_file = parent_files[0].clone();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(parent_files)
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let replacement = make_file("test/replacement.parquet".to_string(), 10, 100);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .overwrite_files()
+            .add_data_files([replacement])
+            .delete_files([removed_file])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let summary = table.metadata().current_snapshot().unwrap().summary();
+        assert_eq!(summary.operation, Operation::Overwrite);
+        let properties = &summary.additional_properties;
+
+        assert_eq!(
+            properties.get("added-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            properties.get("deleted-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            properties.get("deleted-records").map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            properties.get("removed-files-size").map(String::as_str),
+            Some("200")
+        );
+        assert_eq!(
+            properties.get("total-data-files").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            properties.get("total-records").map(String::as_str),
+            Some("90")
+        );
+        assert_eq!(
+            properties.get("total-files-size").map(String::as_str),
+            Some("900")
         );
     }
 
@@ -682,7 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_requested_data_sequence_keeps_newer_delete_files() {
+    async fn test_delete_cleanup_sequence_override() {
         let table = make_v2_table_with_delete_manifest().await;
         let parent = table.metadata().current_snapshot().unwrap();
         let later_snapshot_id = PARENT_SNAPSHOT_ID + 1;
@@ -727,34 +876,13 @@ mod tests {
         let action = Transaction::new(&table)
             .rewrite_files()
             .set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER)
-            .add_data_files([added_file]);
+            .add_data_files([added_file.clone()]);
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();
         let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
             unreachable!()
         };
-        let manifest_list = table
-            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
-            .load()
-            .await
-            .unwrap();
-
-        let mut delete_statuses = Vec::new();
-        for manifest_file in manifest_list
-            .entries()
-            .iter()
-            .filter(|manifest| manifest.content == ManifestContentType::Deletes)
-        {
-            delete_statuses.extend(
-                manifest_file
-                    .load_manifest(table.file_io())
-                    .await
-                    .unwrap()
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.status()),
-            );
-        }
+        let delete_statuses = delete_file_statuses(&table, snapshot).await;
 
         assert_eq!(delete_statuses.len(), 2);
         assert!(
@@ -762,6 +890,35 @@ mod tests {
                 .iter()
                 .all(|status| *status != ManifestStatus::Deleted),
             "delete files newer than the explicitly retained data sequence must stay live"
+        );
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .set_delete_file_cleanup_min_data_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
+            .add_data_files([added_file.clone()]);
+        let err = match Arc::new(action).commit(&table).await {
+            Ok(_) => panic!("cleanup sequence newer than added data should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("must not exceed"));
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .set_new_data_file_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
+            .set_delete_file_cleanup_min_data_sequence_number(PARENT_SEQUENCE_NUMBER + 1)
+            .add_data_files([added_file]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        let delete_statuses = delete_file_statuses(&table, snapshot).await;
+        assert!(
+            delete_statuses
+                .iter()
+                .all(|status| *status == ManifestStatus::Deleted)
         );
     }
 

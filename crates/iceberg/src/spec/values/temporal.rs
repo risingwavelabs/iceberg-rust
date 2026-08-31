@@ -98,15 +98,16 @@ pub(crate) mod timestamptz {
     }
 
     pub(crate) fn microseconds_to_datetimetz(micros: i64) -> DateTime<Utc> {
-        let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
-
-        DateTime::from_timestamp(secs, rem as u32 * 1_000).unwrap()
+        // Splitting into (secs, subsec) by hand is wrong for values before the Unix epoch:
+        // truncating division leaves a *negative* remainder, and casting that to `u32` yields a
+        // nonsensical subsecond count, so this used to panic for any timestamp before 1970.
+        // This shouldn't fail until the year 262000.
+        DateTime::from_timestamp_micros(micros).unwrap()
     }
 
     pub(crate) fn nanoseconds_to_datetimetz(nanos: i64) -> DateTime<Utc> {
-        let (secs, rem) = (nanos / 1_000_000_000, nanos % 1_000_000_000);
-
-        DateTime::from_timestamp(secs, rem as u32).unwrap()
+        // Infallible for every `i64`, and correct before the Unix epoch. See the note above.
+        DateTime::from_timestamp_nanos(nanos)
     }
 
     /// Nanoseconds since the Unix epoch, or `None` if outside the representable `i64` range

@@ -257,7 +257,7 @@ mod test {
     use crate::io::FileIO;
     use crate::spec::{
         DataFile, DataFileFormat, ListType, MapType, NestedField, PrimitiveType, Schema,
-        StructType, Type,
+        StructType, Type, VariantType,
     };
     use crate::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -487,6 +487,26 @@ mod test {
         let res = equality_delete_writer.close().await?;
         assert_eq!(res.len(), 1);
         let data_file = res.into_iter().next().unwrap();
+
+        assert_eq!(data_file.equality_ids(), Some(vec![0, 8]));
+        assert_eq!(
+            *data_file.null_value_counts(),
+            HashMap::from([(0, 0), (8, 0)])
+        );
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([
+                (0, crate::spec::Datum::int(1)),
+                (8, crate::spec::Datum::int(1))
+            ])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([
+                (0, crate::spec::Datum::int(1)),
+                (8, crate::spec::Datum::int(1))
+            ])
+        );
 
         // check
         let to_write_projected = projector.project_batch(to_write)?;
@@ -898,5 +918,23 @@ mod test {
             .unwrap();
         assert_eq!(to_write_projected, expect_batch);
         Ok(())
+    }
+
+    #[test]
+    fn test_equality_ids_resolve_behind_variant_column() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+                    NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let config = EqualityDeleteWriterConfig::new(vec![2], schema).unwrap();
+        let projected = config.projected_arrow_schema_ref();
+        assert_eq!(projected.fields().len(), 1);
+        assert_eq!(projected.field(0).name(), "id");
     }
 }
