@@ -1441,6 +1441,71 @@ fn test_datum_decimal_convert_to_long_below_min() {
     assert_eq!(result, expected);
 }
 
+// `AboveMax`/`BelowMin` are real, persisted partition values -- produced by exactly the
+// narrowing conversions exercised above -- not a validation failure, so `Display` must
+// render them instead of panicking. This regressed a production incident: `Transform::Day`
+// on an extreme `Timestamp` value produces a `(PrimitiveType::Date, PrimitiveLiteral::
+// AboveMax)` datum, and formatting it (e.g. via `to_human_string()` while building a
+// partition path for a commit summary) hit `unreachable!()` and crashed the whole process.
+#[test]
+fn test_datum_display_above_max_does_not_panic() {
+    let datum = Datum::new(PrimitiveType::Int, PrimitiveLiteral::AboveMax);
+    assert_eq!(datum.to_string(), "above_max");
+}
+
+#[test]
+fn test_datum_display_below_min_does_not_panic() {
+    let datum = Datum::new(PrimitiveType::Int, PrimitiveLiteral::BelowMin);
+    assert_eq!(datum.to_string(), "below_min");
+}
+
+#[test]
+fn test_datum_display_above_max_below_min_any_paired_type() {
+    // The `Display` arms for these two variants are wildcarded on `PrimitiveType`
+    // (mirroring `Boolean`/`Float`/`Double`/`String`/`Binary` above them), because the
+    // narrowing conversions that produce them are not specific to one target type --
+    // `Long`, `Int` and `Date` (the exact shape from the production incident, via
+    // `Transform::Day`) all reach this path.
+    for r#type in [PrimitiveType::Int, PrimitiveType::Long, PrimitiveType::Date] {
+        assert_eq!(
+            Datum::new(r#type.clone(), PrimitiveLiteral::AboveMax).to_string(),
+            "above_max",
+            "type={type:?}"
+        );
+        assert_eq!(
+            Datum::new(r#type.clone(), PrimitiveLiteral::BelowMin).to_string(),
+            "below_min",
+            "type={type:?}"
+        );
+    }
+}
+
+#[test]
+fn test_datum_to_human_string_above_max_below_min_does_not_panic() {
+    // `to_human_string()` falls back to `to_string()` for every literal except
+    // `String` -- confirm that fallback actually covers these two variants, since
+    // that is the exact call site (`Transform::to_human_string` building a partition
+    // path) that panicked in production.
+    assert_eq!(
+        Datum::new(PrimitiveType::Date, PrimitiveLiteral::AboveMax).to_human_string(),
+        "above_max"
+    );
+    assert_eq!(
+        Datum::new(PrimitiveType::Date, PrimitiveLiteral::BelowMin).to_human_string(),
+        "below_min"
+    );
+}
+
+#[test]
+fn test_datum_long_convert_to_int_above_max_then_display_does_not_panic() {
+    // End-to-end with the exact conversion path exercised above, rather than a
+    // hand-built Datum: overflow via `.to()`, then format the result.
+    let datum = Datum::long(INT_MAX as i64 + 1)
+        .to(&Primitive(PrimitiveType::Int))
+        .unwrap();
+    assert_eq!(datum.to_string(), "above_max");
+}
+
 #[test]
 fn test_datum_string_convert_to_boolean() {
     let datum = Datum::string("true");

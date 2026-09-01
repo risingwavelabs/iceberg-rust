@@ -330,6 +330,15 @@ impl Display for Datum {
             ) => {
                 write!(f, "{}", decimal_from_i128_with_scale(*val, *scale))
             }
+            // A value that didn't fit the target type during a narrowing conversion
+            // (e.g. `Transform::Day` producing a day-since-epoch outside `i32`'s range
+            // for an extreme source timestamp). These are real, persisted partition
+            // values -- not a validation failure -- so `Display` must render them
+            // rather than treat them as unreachable. Same wording as the other place
+            // in this crate that already names them (`literal_type_name` in
+            // `transaction/snapshot.rs`).
+            (_, PrimitiveLiteral::AboveMax) => write!(f, "above_max"),
+            (_, PrimitiveLiteral::BelowMin) => write!(f, "below_min"),
             (_, _) => {
                 unreachable!()
             }
