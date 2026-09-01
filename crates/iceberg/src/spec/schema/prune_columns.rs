@@ -179,7 +179,10 @@ impl SchemaVisitor for PruneColumn {
                     list,
                     Type::Struct(projected_struct),
                 )?)))
-            } else if list.element_field.field_type.is_primitive() {
+            } else if list.element_field.field_type.is_primitive()
+                || matches!(*list.element_field.field_type, Type::Variant(_))
+            {
+                // A variant element is a leaf, selectable like a primitive.
                 Ok(Some(Type::List(list.clone())))
             } else {
                 Err(Error::new(
@@ -213,7 +216,9 @@ impl SchemaVisitor for PruneColumn {
                     map,
                     Type::Struct(projected_struct),
                 )?)))
-            } else if map.value_field.field_type.is_primitive() {
+            } else if map.value_field.field_type.is_primitive()
+                || matches!(*map.value_field.field_type, Type::Variant(_))
+            {
                 Ok(Some(Type::Map(map.clone())))
             } else {
                 Err(Error::new(
@@ -779,5 +784,64 @@ mod tests {
         ]));
         let result = prune_columns(&schema, HashSet::from([1]), false).unwrap();
         assert_eq!(result, only_foo);
+    }
+
+    #[test]
+    fn test_prune_columns_variant_in_list_and_map() {
+        // vs: list<variant> (element id=3), vm: map<string, variant> (key id=5, value id=6).
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "vs",
+                    Type::List(ListType {
+                        element_field: NestedField::list_element(
+                            3,
+                            Type::Variant(VariantType),
+                            false,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "vm",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(
+                            5,
+                            Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        value_field: NestedField::map_value_element(
+                            6,
+                            Type::Variant(VariantType),
+                            false,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        // Selecting a variant element/value keeps the whole collection, like a
+        // primitive leaf would.
+        let result = prune_columns(&schema, HashSet::from([3]), false).unwrap();
+        assert_eq!(
+            result,
+            Type::Struct(StructType::new(vec![
+                schema.field_by_id(1).unwrap().clone().into()
+            ]))
+        );
+
+        let result = prune_columns(&schema, HashSet::from([6]), false).unwrap();
+        assert_eq!(
+            result,
+            Type::Struct(StructType::new(vec![
+                schema.field_by_id(4).unwrap().clone().into()
+            ]))
+        );
     }
 }
