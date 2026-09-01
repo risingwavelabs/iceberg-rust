@@ -207,11 +207,22 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
         Ok(lhs || rhs)
     }
 
-    fn not(&mut self, inner: bool) -> Result<bool> {
-        Ok(!inner)
+    fn not(&mut self, _inner: bool) -> Result<bool> {
+        // Like java's ParquetMetricsRowGroupFilter, which rewrites NOT before
+        // evaluating: inverting a conservative might-match answer would wrongly
+        // prune row groups.
+        Err(Error::new(
+            ErrorKind::Unexpected,
+            "NOT unsupported at this point. NOT-rewrite should be performed first",
+        ))
     }
 
     fn is_null(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
+        // A variant's stats cannot resolve (no id-carrying leaf); leave it to the row filter.
+        if reference.is_variant() {
+            return ROW_GROUP_MIGHT_MATCH;
+        }
+
         let field_id = reference.field().id;
 
         match self.null_count(field_id) {
@@ -226,6 +237,10 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<bool> {
+        if reference.is_variant() {
+            return ROW_GROUP_MIGHT_MATCH;
+        }
+
         let field_id = reference.field().id;
 
         if self.contains_nulls_only(field_id) {
@@ -534,6 +549,25 @@ mod tests {
     use crate::Result;
     use crate::expr::{Bind, Reference};
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
+
+    #[test]
+    fn eval_rejects_not_predicate() -> Result<()> {
+        let row_group_metadata = create_row_group_metadata(1, 1, None, 1, None)?;
+        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
+
+        let filter =
+            (!Reference::new("col_float").is_nan()).bind(iceberg_schema_ref.clone(), false)?;
+        let err = RowGroupMetricsEvaluator::eval(
+            &filter,
+            &row_group_metadata,
+            &field_id_map,
+            iceberg_schema_ref.as_ref(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("NOT-rewrite"), "{err}");
+
+        Ok(())
+    }
 
     #[test]
     fn eval_matches_no_rows_for_empty_row_group() -> Result<()> {
