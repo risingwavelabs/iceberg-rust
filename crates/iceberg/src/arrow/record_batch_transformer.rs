@@ -221,6 +221,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, ColumnConstant>,
     virtual_fields: HashSet<i32>,
+    require_source_fields: HashSet<i32>,
 }
 
 /// A per-file constant value for a column.
@@ -283,6 +284,7 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
             virtual_fields: HashSet::new(),
+            require_source_fields: HashSet::new(),
         }
     }
 
@@ -331,12 +333,23 @@ impl RecordBatchTransformerBuilder {
         self
     }
 
+    /// Require these projected fields to be present in the source file instead of
+    /// falling back to initial-default/null materialization (equality delete columns).
+    pub(crate) fn with_required_source_fields(
+        mut self,
+        field_ids: impl IntoIterator<Item = i32>,
+    ) -> Self {
+        self.require_source_fields.extend(field_ids);
+        self
+    }
+
     pub(crate) fn build(self) -> RecordBatchTransformer {
         RecordBatchTransformer {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
             virtual_fields: self.virtual_fields,
+            require_source_fields: self.require_source_fields,
             batch_transform: None,
         }
     }
@@ -384,6 +397,9 @@ pub(crate) struct RecordBatchTransformer {
     // Iceberg projection rules (name mapping / initial-default / null)
     virtual_fields: HashSet<i32>,
 
+    // Field IDs that must resolve from the source file; see `with_required_source_fields`.
+    require_source_fields: HashSet<i32>,
+
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
@@ -426,6 +442,7 @@ impl RecordBatchTransformer {
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
                     &self.virtual_fields,
+                    &self.require_source_fields,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -446,6 +463,7 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
+        require_source_fields: &HashSet<i32>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
@@ -532,6 +550,7 @@ impl RecordBatchTransformer {
                     field_id_to_mapped_schema_map,
                     constant_fields,
                     virtual_fields,
+                    require_source_fields,
                 )?,
                 target_schema,
             }),
@@ -601,6 +620,7 @@ impl RecordBatchTransformer {
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
+        require_source_fields: &HashSet<i32>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -731,6 +751,18 @@ impl RecordBatchTransformer {
                 let column_source = if let Some(source) = field_by_id {
                     source
                 } else {
+                    // A default/null column here would silently change what the file
+                    // means (e.g. an equality delete key).
+                    if require_source_fields.contains(field_id) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Missing required source column for field {} (id {field_id})",
+                                iceberg_field.name
+                            ),
+                        ));
+                    }
+
                     // Rules #2, #3 and #4:
                     // Rule #2 (name mapping) was already applied in reader.rs if needed.
                     // If field_id is still not found, the column doesn't exist in the Parquet file.

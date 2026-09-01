@@ -312,6 +312,7 @@ impl CachingDeleteFileLoader {
                             .await?,
                         schema,
                         &equality_ids_vec,
+                        true,
                     )
                     .await?;
 
@@ -603,6 +604,18 @@ impl CachingDeleteFileLoader {
             let mut processor = EqDelColumnProcessor::new(&equality_ids);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
 
+            // A missing or non-primitive equality column would silently widen the
+            // delete key (or drop the batch entirely); refuse instead, like iceberg-java.
+            let missing_ids = processor.missing_ids();
+            if !missing_ids.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Equality delete file does not contain primitive columns for equality field ids {missing_ids:?}"
+                    ),
+                ));
+            }
+
             let mut datum_columns_with_names = processor.finish()?;
             if datum_columns_with_names.is_empty() {
                 continue;
@@ -657,7 +670,7 @@ impl CachingDeleteFileLoader {
 
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
-    collected_columns: Vec<(ArrayRef, String, Type)>,
+    collected_columns: Vec<(i32, ArrayRef, String, Type)>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
@@ -666,6 +679,15 @@ impl<'a> EqDelColumnProcessor<'a> {
             equality_ids,
             collected_columns: Vec::with_capacity(equality_ids.len()),
         }
+    }
+
+    /// Equality ids declared by the delete file that did not resolve to a primitive
+    /// column of the file's schema.
+    fn missing_ids(&self) -> Vec<i32> {
+        let collected: HashSet<i32> = self.collected_columns.iter().map(|(id, ..)| *id).collect();
+        let mut missing: Vec<i32> = self.equality_ids.difference(&collected).copied().collect();
+        missing.sort_unstable();
+        missing
     }
 
     #[allow(clippy::type_complexity)]
@@ -679,7 +701,7 @@ impl<'a> EqDelColumnProcessor<'a> {
     > {
         self.collected_columns
             .into_iter()
-            .map(|(array, field_name, field_type)| {
+            .map(|(_, array, field_name, field_type)| {
                 let primitive_type = field_type
                     .as_primitive_type()
                     .ok_or_else(|| {
@@ -720,6 +742,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
     fn field(&mut self, field: &NestedFieldRef, partner: &ArrayRef, _value: ()) -> Result<()> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
             self.collected_columns.push((
+                field.id,
                 partner.clone(),
                 field.name.clone(),
                 field.field_type.as_ref().clone(),
@@ -1360,7 +1383,7 @@ mod tests {
         // Only evolve the equality_ids columns (field 2), not all table columns
         let equality_ids = vec![2];
         let evolved_stream =
-            BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &equality_ids)
+            BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &equality_ids, true)
                 .await
                 .unwrap();
 
@@ -1384,6 +1407,72 @@ mod tests {
         assert_eq!(data_col.value(0), "a");
         assert_eq!(data_col.value(1), "d");
         assert_eq!(data_col.value(2), "g");
+    }
+
+    // A null-filled key column would turn the file into "delete rows where the
+    // column is null"; evolution must fail instead.
+    #[tokio::test]
+    async fn test_equality_deletes_missing_declared_column_fails_evolve() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "category", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // The delete file declares equality ids [2, 3] but only contains column 2.
+        let delete_file_path = {
+            let data_col = Arc::new(StringArray::from(vec!["a"])) as ArrayRef;
+            let delete_schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+                "data",
+                DataType::Utf8,
+                false,
+                "2",
+            )]));
+            let delete_batch = RecordBatch::try_new(delete_schema, vec![data_col]).unwrap();
+
+            let path = format!("{}/missing-col-eq-deletes.parquet", &table_location);
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, delete_batch.schema(), None).unwrap();
+            writer.write(&delete_batch).expect("Writing batch");
+            writer.close().unwrap();
+            path
+        };
+
+        let file_io = FileIO::new_with_fs();
+        let basic_delete_file_loader =
+            BasicDeleteFileLoader::new(file_io.clone(), ScanMetrics::new());
+
+        let batch_stream = basic_delete_file_loader
+            .parquet_to_batch_stream(
+                &delete_file_path,
+                std::fs::metadata(&delete_file_path).unwrap().len(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let evolved_stream =
+            BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &[2, 3], true)
+                .await
+                .unwrap();
+        let err = evolved_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("expected evolve to reject the missing equality column");
+        assert!(
+            err.to_string().contains("Missing required source column"),
+            "{err}"
+        );
     }
 
     /// Test loading a FileScanTask with BOTH positional and equality deletes.
