@@ -1359,14 +1359,13 @@ mod tests {
             other => panic!("variant must lower to a struct, got {other:?}"),
         };
 
-        // All three rows are logically non-null: the struct itself is valid on every row and
-        // the required `metadata` leaf is present on every row. The nullable `value` leaf is
-        // absent on the last row — the shredded shape. A reader must therefore see zero nulls
-        // for this column.
-        let metadata_arr = Arc::new(arrow_array::BinaryArray::from_vec(vec![
-            &[0x01, 0x00, 0x00][..],
-            &[0x01, 0x00, 0x00][..],
-            &[0x01, 0x00, 0x00][..],
+        // Two present variants and one NULL variant. In the unshredded layout both
+        // leaves are required, so a leaf is null exactly where the variant is null
+        // (masked by the struct validity); the stats are read off the `metadata` leaf.
+        let metadata_arr = Arc::new(arrow_array::BinaryArray::from_opt_vec(vec![
+            Some(&[0x01, 0x00, 0x00][..]),
+            Some(&[0x01, 0x00, 0x00][..]),
+            None,
         ])) as ArrayRef;
         let value_arr = Arc::new(arrow_array::BinaryArray::from_opt_vec(vec![
             Some(&[0x0c, 0x01][..]),
@@ -1376,7 +1375,7 @@ mod tests {
         let variant_arr = Arc::new(StructArray::new(
             variant_fields,
             vec![metadata_arr, value_arr],
-            None, // struct valid on every row: all three variants are logically non-null
+            Some(arrow_buffer::NullBuffer::from(vec![true, true, false])),
         )) as ArrayRef;
 
         let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![variant_arr])?;
@@ -1403,17 +1402,14 @@ mod tests {
         assert_eq!(
             data_file.value_counts().get(&2),
             Some(&3),
-            "value_counts must be the row count regardless of the null `value` child; got {:?}",
+            "value_counts must be the row count; got {:?}",
             data_file.value_counts()
         );
-        // The load-bearing assertion: null count is taken from the required `metadata` leaf,
-        // which has no nulls, so the shredded (value-null) row is NOT counted as a logical null.
-        // Sourcing from the nullable `value` leaf — the pre-fix behaviour — would report 1 here.
         assert_eq!(
             data_file.null_value_counts().get(&2),
-            Some(&0),
-            "a logically non-null variant with an absent (shredded) `value` must report zero \
-             nulls; null counts must come from the required `metadata` leaf, not `value`; got {:?}",
+            Some(&1),
+            "the NULL variant row must be the only logical null, counted from the \
+             `metadata` leaf; got {:?}",
             data_file.null_value_counts()
         );
 
