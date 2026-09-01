@@ -770,11 +770,11 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     fn variant(&mut self, _v: &VariantType) -> Result<ArrowSchemaOrFieldOrType> {
         // Variant is stored as a struct of two binary sub-fields (no field IDs on sub-fields).
         // Uses Binary (not LargeBinary) matching the Parquet BINARY primitive directly.
-        // `metadata` is always present; `value` is nullable, since in a shredded variant the
-        // value may be absent. The enclosing field carries the `arrow.parquet.variant` extension type
-        // (attached in `field`).
+        // Both sub-fields are required: the spec makes `value` optional only for shredded
+        // variants, which this converter never emits (mirrors java's TypeToMessageType#variant).
+        // The enclosing field carries the `arrow.parquet.variant` extension type (attached in `field`).
         let metadata_field = Field::new("metadata", DataType::Binary, false);
-        let value_field = Field::new("value", DataType::Binary, true);
+        let value_field = Field::new("value", DataType::Binary, false);
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::Struct(
             vec![metadata_field, value_field].into(),
         )))
@@ -1796,7 +1796,7 @@ mod tests {
                 "v",
                 DataType::Struct(Fields::from(vec![
                     Field::new("metadata", DataType::Binary, false),
-                    Field::new("value", DataType::Binary, true),
+                    Field::new("value", DataType::Binary, false),
                 ])),
                 true,
             )
@@ -2015,14 +2015,15 @@ mod tests {
 
     #[test]
     fn test_variant_type_to_arrow_type() {
-        // Variant maps to a struct with a required `metadata` and a nullable `value` binary
-        // field, with no field ids on the sub-fields, matching the Parquet BINARY layout.
+        // Variant maps to a struct with required `metadata` and `value` binary fields
+        // (unshredded layout), with no field ids on the sub-fields, matching the Parquet
+        // BINARY layout.
         let arrow_type = type_to_arrow_type(&Type::Variant(VariantType)).unwrap();
         assert_eq!(
             arrow_type,
             DataType::Struct(Fields::from(vec![
                 Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("value", DataType::Binary, false),
             ]))
         );
     }
@@ -2051,7 +2052,7 @@ mod tests {
             field.data_type(),
             &DataType::Struct(Fields::from(vec![
                 Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("value", DataType::Binary, false),
             ]))
         );
     }
@@ -2103,12 +2104,12 @@ mod tests {
         assert_eq!(value.extension_type_name(), Some("arrow.parquet.variant"));
     }
 
-    /// The unshredded Arrow storage of a variant: `metadata` (required) + `value`
-    /// (nullable) binary, with no field ids on the sub-fields.
+    /// The unshredded Arrow storage of a variant: required `metadata` + `value`
+    /// binary, with no field ids on the sub-fields.
     fn variant_storage() -> DataType {
         DataType::Struct(Fields::from(vec![
             Field::new("metadata", DataType::Binary, false),
-            Field::new("value", DataType::Binary, true),
+            Field::new("value", DataType::Binary, false),
         ]))
     }
 
