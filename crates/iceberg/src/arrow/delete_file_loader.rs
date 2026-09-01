@@ -101,9 +101,13 @@ impl BasicDeleteFileLoader {
         record_batch_stream: ArrowRecordBatchStream,
         target_schema: Arc<Schema>,
         equality_ids: &[i32],
+        require_source_columns: bool,
     ) -> Result<ArrowRecordBatchStream> {
-        let mut record_batch_transformer =
-            RecordBatchTransformerBuilder::new(target_schema.clone(), equality_ids).build();
+        let mut builder = RecordBatchTransformerBuilder::new(target_schema.clone(), equality_ids);
+        if require_source_columns {
+            builder = builder.with_required_source_fields(equality_ids.iter().copied());
+        }
+        let mut record_batch_transformer = builder.build();
 
         let record_batch_stream = record_batch_stream.map(move |record_batch| {
             record_batch.and_then(|record_batch| {
@@ -137,7 +141,13 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
             None => schema.field_id_to_name_map().keys().cloned().collect(),
         };
 
-        Self::evolve_schema(raw_batch_stream, schema, &field_ids).await
+        Self::evolve_schema(
+            raw_batch_stream,
+            schema,
+            &field_ids,
+            task.equality_ids.is_some(),
+        )
+        .await
     }
 }
 
