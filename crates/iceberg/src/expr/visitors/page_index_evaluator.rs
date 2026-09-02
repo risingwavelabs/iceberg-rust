@@ -136,22 +136,26 @@ impl<'a> PageIndexEvaluator<'a> {
     where
         F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
     {
-        let Some(&parquet_column_index) =
-            self.iceberg_field_id_to_parquet_column_index.get(&field_id)
-        else {
-            // if the snapshot's column is not present in the row group,
-            // exit early
-            return match missing_col_behavior {
-                MissingColBehavior::CantMatch => self.skip_all_rows(),
-                MissingColBehavior::MightMatch => self.select_all_rows(),
-            };
-        };
-
         let Some(field) = self.snapshot_schema.field_by_id(field_id) else {
             return Err(Error::new(
                 ErrorKind::Unexpected,
                 format!("Field with id {field_id} missing from snapshot schema"),
             ));
+        };
+
+        let Some(&parquet_column_index) =
+            self.iceberg_field_id_to_parquet_column_index.get(&field_id)
+        else {
+            // A column the file does not carry reads as its initial default, else
+            // null; only the null case can be decided here.
+            return if field.initial_default.is_some() {
+                self.select_all_rows()
+            } else {
+                match missing_col_behavior {
+                    MissingColBehavior::CantMatch => self.skip_all_rows(),
+                    MissingColBehavior::MightMatch => self.select_all_rows(),
+                }
+            };
         };
 
         let Some(field_type) = field.field_type.as_primitive_type() else {

@@ -216,8 +216,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
-        ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        ArrayRef, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -235,7 +236,8 @@ mod tests {
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
-        DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
+        DataContentType, DataFileFormat, Datum, Literal, NestedField, PrimitiveType, Schema,
+        SchemaRef, Type,
     };
 
     async fn test_perform_read(
@@ -609,9 +611,7 @@ mod tests {
         // Verify the actual data values are correct (not just the row count)
         if total_rows_task1 > 0 {
             let first_batch = &result1[0];
-            let id_col = first_batch
-                .column(0)
-                .as_primitive::<arrow_array::types::Int32Type>();
+            let id_col = first_batch.column(0).as_primitive::<Int32Type>();
             let first_val = id_col.value(0);
             let last_val = id_col.value(id_col.len() - 1);
             println!("Task 1 data range: {first_val} to {last_val}");
@@ -622,9 +622,7 @@ mod tests {
 
         if total_rows_task2 > 0 {
             let first_batch = &result2[0];
-            let id_col = first_batch
-                .column(0)
-                .as_primitive::<arrow_array::types::Int32Type>();
+            let id_col = first_batch.column(0).as_primitive::<Int32Type>();
             let first_val = id_col.value(0);
             println!("Task 2 first value: {first_val}");
 
@@ -712,9 +710,7 @@ mod tests {
                 .unwrap();
 
             for batch in &batches {
-                let col = batch
-                    .column(0)
-                    .as_primitive::<arrow_array::types::Int32Type>();
+                let col = batch.column(0).as_primitive::<Int32Type>();
                 ids.extend(col.values().iter().copied());
             }
 
@@ -820,9 +816,7 @@ mod tests {
 
             let mut ids = Vec::new();
             for batch in &batches {
-                let col = batch
-                    .column(0)
-                    .as_primitive::<arrow_array::types::Int32Type>();
+                let col = batch.column(0).as_primitive::<Int32Type>();
                 ids.extend(col.values().iter().copied());
             }
             per_split.push(ids);
@@ -1291,6 +1285,252 @@ mod tests {
             ids_sub2,
             vec![2, 4, 5],
             "positional deletes must be applied correctly even when page indexes are absent"
+        );
+    }
+
+    fn id_field(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    fn write_batch(dir: &TempDir, name: &str, batch: RecordBatch) -> String {
+        let path = format!("{}/{name}.parquet", dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    /// Scans `path` projecting field 1 (`id`) under `predicate`.
+    async fn try_scan_ids(
+        reader: &ArrowReader,
+        schema: &SchemaRef,
+        path: &str,
+        predicate: &Predicate,
+    ) -> crate::Result<Vec<i32>> {
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate.bind(schema.clone(), true)?))
+            .with_case_sensitive(true)
+            .build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .clone()
+            .read(tasks)?
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+        Ok(batches
+            .iter()
+            .flat_map(|batch| batch.column(0).as_primitive::<Int32Type>().values().iter())
+            .copied()
+            .collect())
+    }
+
+    fn evolved_schema(d: NestedField, s: NestedField) -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    d.into(),
+                    s.into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Writes `present.parquet` carrying `d`/`s` with the given rows and
+    /// `missing.parquet` carrying only `id`.
+    fn write_evolved_files(dir: &TempDir, d: ArrayRef, s: ArrayRef) -> (String, String) {
+        let ids = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let present = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                id_field("id", DataType::Int32, false, 1),
+                id_field("d", DataType::Float64, true, 2),
+                id_field("s", DataType::Utf8, true, 3),
+            ])),
+            vec![ids.clone(), d, s],
+        )
+        .unwrap();
+        let missing = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![id_field(
+                "id",
+                DataType::Int32,
+                false,
+                1,
+            )])),
+            vec![ids],
+        )
+        .unwrap();
+        (
+            write_batch(dir, "present", present),
+            write_batch(dir, "missing", missing),
+        )
+    }
+
+    async fn assert_missing_matches_present(
+        cases: Vec<(Predicate, Vec<i32>)>,
+        schema: &SchemaRef,
+        present: &str,
+        missing: &str,
+    ) {
+        for row_selection in [false, true] {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_row_selection_enabled(row_selection)
+                .build();
+            for (predicate, expected) in &cases {
+                let on_present = try_scan_ids(&reader, schema, present, predicate)
+                    .await
+                    .unwrap();
+                let on_missing = try_scan_ids(&reader, schema, missing, predicate)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    &on_present, expected,
+                    "present column, row_selection={row_selection}, predicate={predicate}"
+                );
+                assert_eq!(
+                    &on_missing, expected,
+                    "missing column, row_selection={row_selection}, predicate={predicate}"
+                );
+            }
+        }
+    }
+
+    /// A column the file does not carry filters exactly like a present all-null column.
+    #[tokio::test]
+    async fn test_missing_column_predicates_evaluate_as_null_column() {
+        let schema = evolved_schema(
+            NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)),
+            NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)),
+        );
+        let dir = TempDir::new().unwrap();
+        let (present, missing) = write_evolved_files(
+            &dir,
+            Arc::new(Float64Array::from(vec![None::<f64>; 3])),
+            Arc::new(StringArray::from(vec![None::<&str>; 3])),
+        );
+        let all = vec![1, 2, 3];
+        let d = || Reference::new("d");
+        let s = || Reference::new("s");
+        let cases = vec![
+            (d().is_null(), all.clone()),
+            (d().is_not_null(), vec![]),
+            (d().is_nan(), vec![]),
+            (d().is_not_nan(), all.clone()),
+            (d().less_than(Datum::double(1.0)), vec![]),
+            (d().less_than_or_equal_to(Datum::double(1.0)), vec![]),
+            (d().greater_than(Datum::double(1.0)), vec![]),
+            (d().greater_than_or_equal_to(Datum::double(1.0)), vec![]),
+            (d().equal_to(Datum::double(1.0)), vec![]),
+            (d().not_equal_to(Datum::double(1.0)), vec![]),
+            (d().is_in([Datum::double(1.0), Datum::double(2.0)]), vec![]),
+            (d().is_not_in([Datum::double(1.0)]), vec![]),
+            (s().starts_with(Datum::string("f")), vec![]),
+            (s().not_starts_with(Datum::string("f")), vec![]),
+        ];
+        assert_missing_matches_present(cases, &schema, &present, &missing).await;
+    }
+
+    /// With an initial default, a missing column filters like a present column
+    /// holding that default in every row.
+    #[tokio::test]
+    async fn test_missing_column_predicates_use_initial_default() {
+        let schema = evolved_schema(
+            NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double))
+                .with_initial_default(Literal::double(7.0)),
+            NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String))
+                .with_initial_default(Literal::string("foo")),
+        );
+        let dir = TempDir::new().unwrap();
+        let (present, missing) = write_evolved_files(
+            &dir,
+            Arc::new(Float64Array::from(vec![7.0; 3])),
+            Arc::new(StringArray::from(vec!["foo"; 3])),
+        );
+        let all = vec![1, 2, 3];
+        let d = || Reference::new("d");
+        let s = || Reference::new("s");
+        let cases = vec![
+            (d().is_null(), vec![]),
+            (d().is_not_null(), all.clone()),
+            (d().is_nan(), vec![]),
+            (d().is_not_nan(), all.clone()),
+            (d().less_than(Datum::double(10.0)), all.clone()),
+            (d().less_than(Datum::double(5.0)), vec![]),
+            (d().less_than_or_equal_to(Datum::double(7.0)), all.clone()),
+            (d().greater_than(Datum::double(7.0)), vec![]),
+            (
+                d().greater_than_or_equal_to(Datum::double(7.0)),
+                all.clone(),
+            ),
+            (d().equal_to(Datum::double(7.0)), all.clone()),
+            (d().not_equal_to(Datum::double(7.0)), vec![]),
+            (
+                d().is_in([Datum::double(7.0), Datum::double(8.0)]),
+                all.clone(),
+            ),
+            (d().is_not_in([Datum::double(7.0)]), vec![]),
+            (s().starts_with(Datum::string("f")), all.clone()),
+            (s().not_starts_with(Datum::string("f")), vec![]),
+            (s().starts_with(Datum::string("x")), vec![]),
+            (s().not_starts_with(Datum::string("x")), all.clone()),
+        ];
+        assert_missing_matches_present(cases, &schema, &present, &missing).await;
+    }
+
+    /// A required column missing without an initial default has no value; the
+    /// filter fails loudly like the projection does.
+    #[tokio::test]
+    async fn test_predicate_on_missing_required_column_errors() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "r", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let dir = TempDir::new().unwrap();
+        let missing = write_batch(
+            &dir,
+            "missing",
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![id_field(
+                    "id",
+                    DataType::Int32,
+                    false,
+                    1,
+                )])),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+        );
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let err = try_scan_ids(
+            &reader,
+            &schema,
+            &missing,
+            &Reference::new("r").equal_to(Datum::int(1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Missing required field: r"),
+            "{err}"
         );
     }
 }
