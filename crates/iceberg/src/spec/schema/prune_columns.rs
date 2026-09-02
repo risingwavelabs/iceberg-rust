@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(
             result,
             Type::Struct(StructType::new(vec![
-                schema.field_by_id(1).unwrap().clone().into()
+                schema.field_by_id(1).unwrap().clone()
             ]))
         );
 
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(
             result,
             Type::Struct(StructType::new(vec![
-                schema.field_by_id(4).unwrap().clone().into()
+                schema.field_by_id(4).unwrap().clone()
             ]))
         );
     }
