@@ -113,6 +113,14 @@ pub struct FileScanTask {
     #[builder(default)]
     pub sequence_number: i64,
 
+    /// File sequence number indicating when the file was added.
+    ///
+    /// This is distinct from [`Self::sequence_number`], which is the data
+    /// sequence number used for delete applicability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub file_sequence_number: Option<i64>,
+
     /// Partition data from the manifest entry, used to identify which columns can use
     /// constant values from partition metadata vs. reading from the data file.
     /// Per the Iceberg spec, only identity-transformed partition fields should use constants.

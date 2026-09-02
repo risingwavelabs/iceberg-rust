@@ -2206,6 +2206,17 @@ pub mod tests {
                 .unwrap()
                 .sequence_number()
         );
+        assert_eq!(
+            tasks[0].file_sequence_number,
+            Some(
+                fixture
+                    .table
+                    .metadata()
+                    .current_snapshot()
+                    .unwrap()
+                    .sequence_number()
+            )
+        );
 
         // Check second task is existing data file
         assert_eq!(
@@ -2222,6 +2233,19 @@ pub mod tests {
                 .parent_snapshot(fixture.table.metadata())
                 .unwrap()
                 .sequence_number()
+        );
+        assert_eq!(
+            tasks[1].file_sequence_number,
+            Some(
+                fixture
+                    .table
+                    .metadata()
+                    .current_snapshot()
+                    .unwrap()
+                    .parent_snapshot(fixture.table.metadata())
+                    .unwrap()
+                    .sequence_number()
+            )
         );
     }
 
@@ -2870,6 +2894,7 @@ pub mod tests {
             assert_eq!(task.schema, deserialized.schema);
             assert_eq!(task.first_row_id, deserialized.first_row_id);
             assert_eq!(task.data_sequence_number, deserialized.data_sequence_number);
+            assert_eq!(task.file_sequence_number, deserialized.file_sequence_number);
         };
 
         // without predicate
@@ -2893,6 +2918,7 @@ pub mod tests {
             .with_record_count(Some(100))
             .with_first_row_id(Some(1000))
             .with_data_sequence_number(Some(5))
+            .with_file_sequence_number(Some(7))
             .with_data_file_format(DataFileFormat::Parquet)
             .with_case_sensitive(false)
             .build();
