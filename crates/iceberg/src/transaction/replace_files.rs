@@ -362,8 +362,29 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
     /// dangling — resurrecting the rows it deleted. Setting this makes the commit fail instead, so
     /// the operation can be retried against the current snapshot.
     ///
-    /// Only delete files that record `referenced_data_file` are covered; see
-    /// [`SnapshotProducer::validate_no_new_deletes_for_data_files`].
+    /// See [`SnapshotProducer::validate_no_new_deletes_for_data_files`] for exactly what is (and is
+    /// not) checked, and the requirements this places on `snapshot_id` and the replacement files.
+    ///
+    /// # Scope — a same-branch rewrite guard, not a general write-coordination mechanism
+    ///
+    /// This is a conflict check for one commit against the branch it is committing to. It requires
+    /// `snapshot_id` to be an ancestor of that branch's current snapshot, so it is only meaningful
+    /// for operations that read and write the *same* branch — ordinary compaction, and a
+    /// copy-on-write rewrite performed on its own branch (e.g. an `ingestion` branch), are both
+    /// in scope.
+    ///
+    /// It is **not** a guard for publishing one branch's result into another. A copy-on-write
+    /// *publish* step (e.g. fast-forwarding or merging `ingestion` into `main`) is an authoritative
+    /// overwrite of the target branch, not a rewrite that read it — the source branch's snapshot is
+    /// not an ancestor of the target, so passing it here would either fail the ancestry check for
+    /// the wrong reason or, if the check were loosened to allow it, reject valid publishes by
+    /// comparing sequence numbers with no relationship to each other. Publish ordering belongs to
+    /// the caller (e.g. lease fencing in the orchestrating scheduler), not to this check.
+    ///
+    /// It is also not a substitute for out-of-band write coordination between multiple writers that
+    /// must agree on a commit before either applies it (for example, a combined-commit protocol
+    /// between a compactor and an external index maintainer). This only detects a conflict after
+    /// the fact, at commit time, for a single actor's own rewrite.
     pub fn validate_from_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.validate_from_snapshot_id = Some(snapshot_id);
         self

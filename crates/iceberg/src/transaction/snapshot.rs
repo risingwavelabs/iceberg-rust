@@ -917,6 +917,16 @@ impl<'a> SnapshotProducer<'a> {
     ///   relationship to the branch being committed to.
     /// * The new data file sequence number must be set to the starting snapshot's sequence number,
     ///   which is what keeps pre-existing equality deletes applicable to the replacement files.
+    ///
+    /// # Scope
+    ///
+    /// The ancestry requirement above makes this a same-branch rewrite guard: it covers ordinary
+    /// compaction and a copy-on-write rewrite performed on its own branch, but not a copy-on-write
+    /// *publish* of one branch into another (that is an authoritative overwrite, not a rewrite of
+    /// the target branch, so the source branch's snapshot is never an ancestor of it) and not a
+    /// substitute for out-of-band coordination between independent writers that must agree on a
+    /// commit before either applies it. See `ReplaceFilesAction::validate_from_snapshot_id` (the
+    /// public entry point that calls this) for the full rationale.
     pub(crate) async fn validate_no_new_deletes_for_data_files(
         &self,
         starting_snapshot_id: i64,
