@@ -23,8 +23,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
+use parquet::basic::{ConvertedType, LogicalType, Repetition};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use super::{ArrowReader, CollectFieldIdVisitor};
@@ -36,12 +37,11 @@ use crate::spec::{NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::{Error, ErrorKind};
 
 impl ArrowReader {
-    pub(super) fn build_field_id_set_and_map(
+    pub(super) fn build_field_id_set_and_resolution(
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
-        use_position_fallback: bool,
-    ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
+    ) -> Result<(HashSet<i32>, FileFieldResolution)> {
         // Collects all Iceberg field IDs referenced in the filter predicate
         let mut collector = CollectFieldIdVisitor {
             field_ids: HashSet::default(),
@@ -49,17 +49,9 @@ impl ArrowReader {
         visit(&mut collector, predicate)?;
 
         let iceberg_field_ids = collector.field_ids();
+        let resolution = resolve_file_field_ids(parquet_schema, arrow_schema, &iceberg_field_ids)?;
 
-        let field_id_map = match build_field_id_map(parquet_schema)? {
-            Some(map) => map,
-            // No embedded field IDs and no name mapping: position-based fallback
-            None if use_position_fallback => build_fallback_field_id_map(parquet_schema),
-            // No embedded field IDs, but a name mapping assigned them to the Arrow
-            // schema: resolve columns through the mapped Arrow field-id metadata
-            None => build_field_id_map_from_arrow_schema(arrow_schema),
-        };
-
-        Ok((iceberg_field_ids, field_id_map))
+        Ok((iceberg_field_ids, resolution))
     }
 
     /// Recursively extract leaf field IDs because Parquet projection works at the leaf column level.
@@ -81,8 +73,7 @@ impl ArrowReader {
                 Self::include_leaf_field_id(&map_type.key_field, field_ids);
                 Self::include_leaf_field_id(&map_type.value_field, field_ids);
             }
-            // Variant is a leaf type for Iceberg projection even though its Parquet
-            // storage is a group whose metadata/value leaves carry no field IDs.
+            // A variant projects as a leaf even though its storage is a group.
             Type::Variant(_) => {
                 field_ids.push(field.id);
             }
@@ -112,7 +103,7 @@ impl ArrowReader {
     }
 
     fn collect_variant_leaf_indices_for_field(
-        field: &arrow_schema::FieldRef,
+        field: &FieldRef,
         iceberg_schema_of_task: &Schema,
         selected_leaf_field_ids: &HashSet<i32>,
         current_variant_field_id: Option<i32>,
@@ -420,98 +411,218 @@ impl ArrowReader {
     }
 }
 
-/// Build the map of parquet field id to Parquet column index in the schema.
-/// Returns None if the Parquet file doesn't have field IDs embedded (e.g., migrated tables).
-pub(super) fn build_field_id_map(
-    parquet_schema: &SchemaDescriptor,
-) -> Result<Option<HashMap<i32, usize>>> {
-    let mut column_map = HashMap::new();
+/// Where a Parquet file's field ids resolve to, built once per file and shared
+/// by every predicate consumer.
+#[derive(Debug, Default)]
+pub(super) struct FileFieldResolution {
+    /// Leaf field id → Parquet leaf column index.
+    pub(super) leaf_map: HashMap<i32, usize>,
+    /// Group-level field id → group location. A variant's field id sits on its
+    /// storage group (its leaves are id-less), so it only resolves here.
+    pub(super) group_map: HashMap<i32, GroupFieldLocation>,
+    /// Ids were assigned to the Arrow schema by name mapping or position
+    /// fallback, which cover top-level fields only.
+    pub(super) ids_from_arrow: bool,
+}
 
-    for (idx, field) in parquet_schema.columns().iter().enumerate() {
-        let field_type = field.self_type();
-        match field_type {
-            ParquetType::PrimitiveType { basic_info, .. } => {
-                if !basic_info.has_id() {
+/// Location of an id-carrying group, in terms a record-batch predicate can use:
+/// project the group's first leaf to materialize the group in the filter batch,
+/// then walk `path[1..]` down from the top-level batch column to reach it.
+#[derive(Debug)]
+pub(super) struct GroupFieldLocation {
+    pub(super) first_leaf_idx: usize,
+    /// Struct-field names from the record-batch root down to the group;
+    /// `path[0]` names the top-level column.
+    pub(super) path: Vec<String>,
+}
+
+impl FileFieldResolution {
+    fn insert_leaf(&mut self, id: i32, leaf_idx: usize) -> Result<()> {
+        if self.group_map.contains_key(&id) || self.leaf_map.insert(id, leaf_idx).is_some() {
+            return Err(duplicate_field_id_error(id));
+        }
+        Ok(())
+    }
+
+    fn insert_group(&mut self, id: i32, location: GroupFieldLocation) -> Result<()> {
+        if self.leaf_map.contains_key(&id) || self.group_map.insert(id, location).is_some() {
+            return Err(duplicate_field_id_error(id));
+        }
+        Ok(())
+    }
+}
+
+fn duplicate_field_id_error(id: i32) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!("Field id {id} occurs on more than one node of the Parquet schema"),
+    )
+}
+
+/// Java `ParquetSchemaUtil.hasIds`: the file has ids if any node carries one.
+/// The same decision drives both projection (pipeline) and predicate resolution.
+pub(super) fn parquet_schema_has_ids(parquet_schema: &SchemaDescriptor) -> bool {
+    fn walk(ty: &ParquetType) -> bool {
+        match ty {
+            ParquetType::PrimitiveType { basic_info, .. } => basic_info.has_id(),
+            ParquetType::GroupType { basic_info, fields } => {
+                basic_info.has_id() || fields.iter().any(|field| walk(field))
+            }
+        }
+    }
+    parquet_schema
+        .root_schema()
+        .get_fields()
+        .iter()
+        .any(|field| walk(field))
+}
+
+/// Whether a group materializes as a plain struct column (not list/map innards),
+/// so that a batch can be walked down through it by field name.
+fn parquet_group_is_struct_like(basic_info: &parquet::schema::types::BasicTypeInfo) -> bool {
+    let is_list_or_map = matches!(
+        basic_info.logical_type_ref(),
+        Some(LogicalType::List | LogicalType::Map)
+    ) || matches!(
+        basic_info.converted_type(),
+        ConvertedType::LIST | ConvertedType::MAP
+    );
+    let is_repeated =
+        basic_info.has_repetition() && basic_info.repetition() == Repetition::REPEATED;
+    !is_list_or_map && !is_repeated
+}
+
+/// Where a node's field id comes from. Java writes name-mapping / fallback ids
+/// back into the Parquet `MessageType`; this port assigns them to the Arrow
+/// schema instead (top-level fields only), so the id-less branch reads them from
+/// there while leaf numbering always comes from the Parquet tree.
+enum FieldIdSource<'a> {
+    Embedded,
+    TopLevelArrow(&'a ArrowSchemaRef),
+}
+
+impl FieldIdSource<'_> {
+    /// `top_position` is the node's root-level index, None below the top level.
+    fn node_field_id(
+        &self,
+        basic_info: &parquet::schema::types::BasicTypeInfo,
+        top_position: Option<usize>,
+    ) -> Result<Option<i32>> {
+        match self {
+            FieldIdSource::Embedded => Ok(basic_info.has_id().then(|| basic_info.id())),
+            FieldIdSource::TopLevelArrow(arrow_schema) => {
+                let Some(field) = top_position.and_then(|pos| arrow_schema.fields().get(pos))
+                else {
                     return Ok(None);
-                }
-                column_map.insert(basic_info.id(), idx);
+                };
+                let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
+                    return Ok(None);
+                };
+                i32::from_str(value).map(Some).map_err(|_| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Invalid field id metadata `{value}` on column `{}`",
+                            field.name()
+                        ),
+                    )
+                })
             }
-            ParquetType::GroupType { .. } => {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Leaf column in schema should be primitive type but got {field_type:?}"
-                    ),
-                ));
-            }
-        };
-    }
-
-    Ok(Some(column_map))
-}
-
-/// Build a fallback field ID map for Parquet files without embedded field IDs.
-///
-/// Returns the number of primitive (leaf) columns in a Parquet type, recursing into groups.
-fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
-    if ty.is_primitive() {
-        1
-    } else {
-        ty.get_fields().iter().map(|f| leaf_count(f)).sum()
+        }
     }
 }
 
-/// Builds a mapping from fallback field IDs to leaf column indices for Parquet files
-/// without embedded field IDs. Returns entries only for primitive top-level fields.
-///
-/// Must use top-level field positions (not leaf column positions) to stay consistent
-/// with `add_fallback_field_ids_to_arrow_schema`, which assigns ordinal IDs to
-/// top-level Arrow fields. Using leaf positions instead would produce wrong indices
-/// when nested types (struct/list/map) expand into multiple leaf columns.
-///
-/// Mirrors iceberg-java's ParquetSchemaUtil.addFallbackIds() which iterates
-/// fileSchema.getFields() assigning ordinal IDs to top-level fields.
-pub(super) fn build_fallback_field_id_map(
+/// Resolve the referenced iceberg field ids to Parquet columns. A single walk
+/// over the Parquet tree does the leaf numbering; only the id source differs
+/// between a file with embedded ids and an id-less (migrated) one.
+pub(super) fn resolve_file_field_ids(
     parquet_schema: &SchemaDescriptor,
-) -> HashMap<i32, usize> {
-    let mut column_map = HashMap::new();
-    let mut leaf_idx = 0;
-
-    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
-        let field_id = (top_pos + 1) as i32;
-        if field.is_primitive() {
-            column_map.insert(field_id, leaf_idx);
+    arrow_schema: &ArrowSchemaRef,
+    referenced_ids: &HashSet<i32>,
+) -> Result<FileFieldResolution> {
+    // `descendable`: every ancestor is a struct, so `path` is walkable in a batch.
+    // Groups under lists/maps are not recorded (unreachable by a walk, unbindable).
+    #[allow(clippy::too_many_arguments)]
+    fn walk<'a>(
+        ty: &'a ParquetType,
+        top_position: Option<usize>,
+        path: &mut Vec<&'a str>,
+        descendable: bool,
+        next_leaf: &mut usize,
+        source: &FieldIdSource<'_>,
+        referenced_ids: &HashSet<i32>,
+        resolution: &mut FileFieldResolution,
+    ) -> Result<()> {
+        match ty {
+            ParquetType::PrimitiveType { basic_info, .. } => {
+                if let Some(id) = source.node_field_id(basic_info, top_position)?
+                    && referenced_ids.contains(&id)
+                {
+                    resolution.insert_leaf(id, *next_leaf)?;
+                }
+                *next_leaf += 1;
+            }
+            ParquetType::GroupType { basic_info, fields } => {
+                let first_leaf_idx = *next_leaf;
+                let struct_like = parquet_group_is_struct_like(basic_info);
+                for field in fields {
+                    path.push(field.name());
+                    walk(
+                        field.as_ref(),
+                        None,
+                        path,
+                        descendable && struct_like,
+                        next_leaf,
+                        source,
+                        referenced_ids,
+                        resolution,
+                    )?;
+                    path.pop();
+                }
+                // An empty group has no leaf to project, so it cannot be located.
+                if descendable
+                    && struct_like
+                    && *next_leaf > first_leaf_idx
+                    && let Some(id) = source.node_field_id(basic_info, top_position)?
+                    && referenced_ids.contains(&id)
+                {
+                    resolution.insert_group(id, GroupFieldLocation {
+                        first_leaf_idx,
+                        path: path.iter().map(|name| name.to_string()).collect(),
+                    })?;
+                }
+            }
         }
-        leaf_idx += leaf_count(field);
+        Ok(())
     }
 
-    column_map
+    let source = if parquet_schema_has_ids(parquet_schema) {
+        FieldIdSource::Embedded
+    } else {
+        FieldIdSource::TopLevelArrow(arrow_schema)
+    };
+    let mut resolution = FileFieldResolution {
+        ids_from_arrow: matches!(source, FieldIdSource::TopLevelArrow(_)),
+        ..Default::default()
+    };
+    let mut next_leaf = 0;
+    let mut path = Vec::new();
+    for (top_position, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
+        path.push(field.name());
+        walk(
+            field.as_ref(),
+            Some(top_position),
+            &mut path,
+            true,
+            &mut next_leaf,
+            &source,
+            referenced_ids,
+            &mut resolution,
+        )?;
+        path.pop();
+    }
+    Ok(resolution)
 }
-
-/// Builds a mapping from field IDs to leaf column indices using the field-id metadata
-/// carried by the Arrow schema.
-///
-/// Used for Parquet files without embedded field IDs when a name mapping has assigned
-/// IDs to the Arrow schema (see [`apply_name_mapping_to_arrow_schema`]): the Parquet
-/// schema descriptor itself still has no IDs, but the Arrow leaves are flattened in the
-/// same depth-first order as Parquet leaf columns, so the Arrow leaf index lines up with
-/// the Parquet column index. Columns the mapping did not match carry no field-id
-/// metadata and are simply absent from the map.
-fn build_field_id_map_from_arrow_schema(arrow_schema: &ArrowSchemaRef) -> HashMap<i32, usize> {
-    let mut column_map = HashMap::new();
-    arrow_schema.fields().filter_leaves(|idx, field| {
-        if let Some(field_id) = field
-            .metadata()
-            .get(PARQUET_FIELD_ID_META_KEY)
-            .and_then(|value| i32::from_str(value).ok())
-        {
-            column_map.insert(field_id, idx);
-        }
-        false
-    });
-    column_map
-}
-
 /// Apply name mapping to Arrow schema for Parquet files lacking field IDs.
 ///
 /// Assigns Iceberg field IDs based on column names using the name mapping,
@@ -620,7 +731,7 @@ pub(super) fn add_fallback_field_ids_to_arrow_schema(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::sync::Arc;
 
@@ -642,7 +753,7 @@ mod tests {
     use crate::scan::{FileScanTask, FileScanTaskStream};
     use crate::spec::{
         DataFileFormat, Datum, ListType, MapType, MappedField, NameMapping, NestedField,
-        PrimitiveType, Schema, StructType, Type, VariantType,
+        PrimitiveType, Schema, SchemaRef, StructType, Type, VariantType,
     };
     use crate::{ErrorKind, Runtime};
 
@@ -1058,6 +1169,886 @@ message schema {
             Some(r#""hello""#),
             Some("42")
         ]);
+    }
+
+    #[test]
+    fn test_resolve_file_field_ids() {
+        let message_type = "
+        message schema {
+            optional int32 id = 1;
+            optional group v = 2 {
+                required binary metadata;
+                optional binary value;
+            }
+            optional group s = 5 {
+                optional group v2 = 4 {
+                    required binary metadata;
+                    optional binary value;
+                }
+            }
+            optional binary name (STRING) = 3;
+        }
+        ";
+        let schema = parse_message_type(message_type).unwrap();
+        let descriptor = SchemaDescriptor::new(Arc::new(schema));
+        let empty_arrow_schema = Arc::new(ArrowSchema::empty());
+
+        // Embedded ids: leaves resolve directly (id-less leaves must not shift
+        // `name`); group-level ids resolve to the group's first leaf plus the
+        // struct path down to it. Only referenced ids are recorded.
+        let referenced = HashSet::from_iter([1, 2, 3, 4]);
+        let resolution =
+            super::resolve_file_field_ids(&descriptor, &empty_arrow_schema, &referenced).unwrap();
+        assert!(!resolution.ids_from_arrow);
+        assert_eq!(resolution.leaf_map, HashMap::from_iter([(1, 0), (3, 5)]));
+        let v = &resolution.group_map[&2];
+        assert_eq!(
+            (v.first_leaf_idx, v.path.clone()),
+            (1, vec!["v".to_string()])
+        );
+        let v2 = &resolution.group_map[&4];
+        assert_eq!(
+            (v2.first_leaf_idx, v2.path.clone()),
+            (3, vec!["s".to_string(), "v2".to_string()])
+        );
+        assert!(!resolution.group_map.contains_key(&5));
+
+        // No embedded ids: resolution comes from the Arrow schema onto which name
+        // mapping or position fallback assigned the ids.
+        let id_less = parse_message_type(
+            "message schema {
+                optional int32 id;
+                optional group v {
+                    required binary metadata;
+                    optional binary value;
+                }
+            }",
+        )
+        .unwrap();
+        let id_less_descriptor = SchemaDescriptor::new(Arc::new(id_less));
+        let mapped_arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            variant_arrow_field("v", 2, true),
+        ]));
+        let resolution = super::resolve_file_field_ids(
+            &id_less_descriptor,
+            &mapped_arrow_schema,
+            &HashSet::from_iter([1, 2]),
+        )
+        .unwrap();
+        assert!(resolution.ids_from_arrow);
+        assert_eq!(resolution.leaf_map, HashMap::from_iter([(1, 0)]));
+        let v = &resolution.group_map[&2];
+        assert_eq!(
+            (v.first_leaf_idx, v.path.clone()),
+            (1, vec!["v".to_string()])
+        );
+
+        // A duplicate field id is rejected rather than silently resolved.
+        let duplicated = parse_message_type(
+            "message schema {
+                optional int32 a = 7;
+                optional int32 b = 7;
+            }",
+        )
+        .unwrap();
+        let err = super::resolve_file_field_ids(
+            &SchemaDescriptor::new(Arc::new(duplicated)),
+            &empty_arrow_schema,
+            &HashSet::from_iter([7]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more than one node"), "{err}");
+    }
+
+    async fn try_scan_batches_with_predicate(
+        file_path: &str,
+        schema: &SchemaRef,
+        project_field_ids: Vec<i32>,
+        name_mapping: Option<Arc<NameMapping>>,
+        predicate: &crate::expr::Predicate,
+        row_selection_enabled: bool,
+    ) -> crate::Result<Vec<RecordBatch>> {
+        let file_len = std::fs::metadata(file_path).unwrap().len();
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_row_selection_enabled(row_selection_enabled)
+            .build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(file_len)
+            .with_start(0)
+            .with_length(file_len)
+            .with_data_file_path(file_path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(project_field_ids)
+            .with_case_sensitive(false)
+            .with_name_mapping(name_mapping)
+            .with_predicate(Some(predicate.clone().bind(schema.clone(), true).unwrap()))
+            .build())])) as FileScanTaskStream;
+
+        reader
+            .read(tasks)?
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+    }
+
+    async fn scan_ids_with_predicate(
+        file_path: &str,
+        schema: &SchemaRef,
+        project_field_ids: Vec<i32>,
+        name_mapping: Option<Arc<NameMapping>>,
+        predicate: &crate::expr::Predicate,
+        row_selection_enabled: bool,
+    ) -> Vec<i32> {
+        let batches = try_scan_batches_with_predicate(
+            file_path,
+            schema,
+            project_field_ids,
+            name_mapping,
+            predicate,
+            row_selection_enabled,
+        )
+        .await
+        .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    // IS NULL / IS NOT NULL are the only predicate operators that bind on a variant
+    // column; they must evaluate exactly (via the storage group's validity) under
+    // every reader configuration and every field-id source: ids embedded in the
+    // file, ids assigned by a name mapping, or position-fallback ids.
+    #[tokio::test]
+    async fn test_variant_null_predicates_evaluate_exactly() {
+        use arrow_array::{BinaryArray, Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        #[derive(Clone, Copy, Debug)]
+        enum IdSource {
+            Embedded,
+            NameMapped,
+            PositionFallback,
+        }
+
+        for id_source in [
+            IdSource::Embedded,
+            IdSource::NameMapped,
+            IdSource::PositionFallback,
+        ] {
+            let with_ids = matches!(id_source, IdSource::Embedded);
+            let id_field = Field::new("id", DataType::Int32, false);
+            let id_field = if with_ids {
+                id_field.with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )]))
+            } else {
+                id_field
+            };
+            let v_field = {
+                let field = variant_arrow_field("v", 2, true);
+                if with_ids {
+                    field
+                } else {
+                    // A migrated file: same storage layout, no field-id metadata.
+                    Field::new("v", field.data_type().clone(), true)
+                }
+            };
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![id_field, v_field.clone()]));
+
+            let tmp_dir = TempDir::new().unwrap();
+            let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+
+            // Row 0: a variant value; row 1: SQL NULL variant (struct-level null).
+            let id_data = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+            let metadata =
+                Arc::new(BinaryArray::from(vec![&[1u8, 0, 0][..], &[1u8, 0, 0][..]])) as ArrayRef;
+            let value = Arc::new(BinaryArray::from(vec![
+                &[0x09u8, b'H', b'I'][..],
+                &[0u8][..],
+            ])) as ArrayRef;
+            let DataType::Struct(v_fields) = v_field.data_type() else {
+                panic!("variant storage must be a struct");
+            };
+            let v_data = Arc::new(StructArray::new(
+                v_fields.clone(),
+                vec![metadata, value],
+                Some(NullBuffer::from(vec![true, false])),
+            )) as ArrayRef;
+
+            let to_write =
+                RecordBatch::try_new(arrow_schema.clone(), vec![id_data, v_data]).unwrap();
+            let file = File::create(&file_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+            writer.write(&to_write).expect("Writing batch");
+            writer.close().unwrap();
+
+            let name_mapping = match id_source {
+                IdSource::NameMapped => Some(Arc::new(NameMapping::new(vec![
+                    MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+                    MappedField::new(Some(2), vec!["v".to_string()], vec![]),
+                ]))),
+                _ => None,
+            };
+            // Project only `id` for the id-less sources: materializing a variant
+            // column is out of scope for this predicate test.
+            let project_field_ids = if with_ids { vec![1, 2] } else { vec![1] };
+
+            for row_selection_enabled in [false, true] {
+                for (predicate, expected_ids) in [
+                    (Reference::new("v").is_null(), vec![2]),
+                    (Reference::new("v").is_not_null(), vec![1]),
+                    (
+                        Reference::new("v")
+                            .is_not_null()
+                            .and(Reference::new("id").equal_to(Datum::int(2))),
+                        vec![],
+                    ),
+                ] {
+                    let ids = scan_ids_with_predicate(
+                        &file_path,
+                        &schema,
+                        project_field_ids.clone(),
+                        name_mapping.clone(),
+                        &predicate,
+                        row_selection_enabled,
+                    )
+                    .await;
+                    assert_eq!(
+                        ids, expected_ids,
+                        "id_source={id_source:?}, predicate={predicate}, row_selection={row_selection_enabled}"
+                    );
+                }
+            }
+        }
+    }
+
+    // A variant nested in a struct binds (`s.v IS NULL`) and must evaluate through
+    // the ancestor chain: a NULL `s` makes `s.v` NULL, like java's accessors that
+    // return null through a null layer.
+    #[tokio::test]
+    async fn test_nested_variant_null_predicates_evaluate_exactly() {
+        use arrow_array::{BinaryArray, Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        3,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]));
+        let v_field = variant_arrow_field("v", 2, true);
+        let s_field = Field::new(
+            "s",
+            DataType::Struct(vec![Arc::new(v_field.clone())].into()),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "3".to_string(),
+        )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![id_field, s_field.clone()]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+
+        // Row 0: s is NULL; row 1: s.v is NULL; row 2: s.v holds a value.
+        let id_data = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let metadata = Arc::new(BinaryArray::from(vec![
+            &[1u8, 0, 0][..],
+            &[1u8, 0, 0][..],
+            &[1u8, 0, 0][..],
+        ])) as ArrayRef;
+        let value = Arc::new(BinaryArray::from(vec![
+            &[0u8][..],
+            &[0u8][..],
+            &[0x09u8, b'H', b'I'][..],
+        ])) as ArrayRef;
+        let DataType::Struct(v_fields) = v_field.data_type() else {
+            panic!("variant storage must be a struct");
+        };
+        let v_data = Arc::new(StructArray::new(
+            v_fields.clone(),
+            vec![metadata, value],
+            Some(NullBuffer::from(vec![false, false, true])),
+        )) as ArrayRef;
+        let DataType::Struct(s_fields) = s_field.data_type() else {
+            panic!("struct field");
+        };
+        let s_data = Arc::new(StructArray::new(
+            s_fields.clone(),
+            vec![v_data],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )) as ArrayRef;
+
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id_data, s_data]).unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        for row_selection_enabled in [false, true] {
+            for (predicate, expected_ids) in [
+                (Reference::new("s.v").is_null(), vec![1, 2]),
+                (Reference::new("s.v").is_not_null(), vec![3]),
+                (
+                    Reference::new("s.v")
+                        .is_not_null()
+                        .and(Reference::new("id").equal_to(Datum::int(2))),
+                    vec![],
+                ),
+            ] {
+                let ids = scan_ids_with_predicate(
+                    &file_path,
+                    &schema,
+                    vec![1],
+                    None,
+                    &predicate,
+                    row_selection_enabled,
+                )
+                .await;
+                assert_eq!(
+                    ids, expected_ids,
+                    "predicate={predicate}, row_selection={row_selection_enabled}"
+                );
+            }
+        }
+    }
+
+    // Two variants under one struct root share a single filter-batch column.
+    #[tokio::test]
+    async fn test_two_variants_under_one_struct_root() {
+        use arrow_array::{BinaryArray, Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        5,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(2, "v1", Type::Variant(VariantType)).into(),
+                            NestedField::optional(4, "v2", Type::Variant(VariantType)).into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]));
+        let v1_field = variant_arrow_field("v1", 2, true);
+        let v2_field = variant_arrow_field("v2", 4, true);
+        let s_field = Field::new(
+            "s",
+            DataType::Struct(vec![Arc::new(v1_field.clone()), Arc::new(v2_field.clone())].into()),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "5".to_string(),
+        )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![id_field, s_field.clone()]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+
+        // Row 0: s NULL; row 1: only v2 set; row 2: only v1 set; row 3: both set.
+        let variant_column = |field: &Field, validity: [bool; 4]| {
+            let metadata = Arc::new(BinaryArray::from(vec![&[1u8, 0, 0][..]; 4])) as ArrayRef;
+            let value = Arc::new(BinaryArray::from(vec![&[0x09u8, b'H', b'I'][..]; 4])) as ArrayRef;
+            let DataType::Struct(fields) = field.data_type() else {
+                panic!("variant storage must be a struct");
+            };
+            Arc::new(StructArray::new(
+                fields.clone(),
+                vec![metadata, value],
+                Some(NullBuffer::from(validity.to_vec())),
+            )) as ArrayRef
+        };
+        let v1_data = variant_column(&v1_field, [false, false, true, true]);
+        let v2_data = variant_column(&v2_field, [false, true, false, true]);
+        let DataType::Struct(s_fields) = s_field.data_type() else {
+            panic!("struct field");
+        };
+        let s_data = Arc::new(StructArray::new(
+            s_fields.clone(),
+            vec![v1_data, v2_data],
+            Some(NullBuffer::from(vec![false, true, true, true])),
+        )) as ArrayRef;
+        let id_data = Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef;
+
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id_data, s_data]).unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        for row_selection_enabled in [false, true] {
+            for (predicate, expected_ids) in [
+                (Reference::new("s.v1").is_null(), vec![1, 2]),
+                (
+                    Reference::new("s.v1")
+                        .is_null()
+                        .and(Reference::new("s.v2").is_not_null()),
+                    vec![2],
+                ),
+                (
+                    Reference::new("s.v1")
+                        .is_not_null()
+                        .and(Reference::new("s.v2").is_null()),
+                    vec![3],
+                ),
+            ] {
+                let ids = scan_ids_with_predicate(
+                    &file_path,
+                    &schema,
+                    vec![1],
+                    None,
+                    &predicate,
+                    row_selection_enabled,
+                )
+                .await;
+                assert_eq!(
+                    ids, expected_ids,
+                    "predicate={predicate}, row_selection={row_selection_enabled}"
+                );
+            }
+        }
+    }
+
+    // A stray nested id makes the whole file count as id-carrying (java hasIds),
+    // for projection and predicates alike: the name mapping is ignored by both,
+    // never by only one of them.
+    #[tokio::test]
+    async fn test_stray_nested_id_disables_name_mapping_consistently() {
+        use arrow_array::{Int32Array, StructArray};
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let k_field = Field::new("k", DataType::Int32, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "99".to_string(),
+        )]));
+        let meta_field = Field::new(
+            "meta",
+            DataType::Struct(vec![Arc::new(k_field.clone())].into()),
+            true,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            meta_field.clone(),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let id_data = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let DataType::Struct(meta_fields) = meta_field.data_type() else {
+            panic!("struct field");
+        };
+        let meta_data = Arc::new(StructArray::new(
+            meta_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let to_write =
+            RecordBatch::try_new(arrow_schema.clone(), vec![id_data, meta_data]).unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let name_mapping = Some(Arc::new(NameMapping::new(vec![MappedField::new(
+            Some(1),
+            vec!["id".to_string()],
+            vec![],
+        )])));
+
+        // `id` resolves nowhere: missing-column constants for the filter, NULL
+        // fill for the projection.
+        for (predicate, expected_rows) in [
+            (Reference::new("id").is_null(), 2),
+            (Reference::new("id").equal_to(Datum::int(2)), 0),
+        ] {
+            let batches = try_scan_batches_with_predicate(
+                &file_path,
+                &schema,
+                vec![1],
+                name_mapping.clone(),
+                &predicate,
+                false,
+            )
+            .await
+            .unwrap();
+            let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+            assert_eq!(rows, expected_rows, "predicate={predicate}");
+            let nulls: usize = batches
+                .iter()
+                .map(|batch| batch.column(0).null_count())
+                .sum();
+            assert_eq!(nulls, expected_rows, "predicate={predicate}");
+        }
+    }
+
+    // Any embedded id makes the file id-carrying: the name mapping must not
+    // resurrect the id-less columns for the filter only.
+    #[tokio::test]
+    async fn test_partial_ids_trust_embedded_ids() {
+        use arrow_array::Int32Array;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(7, "b", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "7".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        ])
+        .unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let name_mapping = Some(Arc::new(NameMapping::new(vec![
+            MappedField::new(Some(1), vec!["a".to_string()], vec![]),
+            MappedField::new(Some(7), vec!["b".to_string()], vec![]),
+        ])));
+
+        for (predicate, expected_ids) in [
+            (Reference::new("b").equal_to(Datum::int(2)), vec![2]),
+            (Reference::new("a").is_null(), vec![1, 2]),
+            (Reference::new("a").is_not_null(), vec![]),
+        ] {
+            let ids = scan_ids_with_predicate(
+                &file_path,
+                &schema,
+                vec![7],
+                name_mapping.clone(),
+                &predicate,
+                false,
+            )
+            .await;
+            assert_eq!(ids, expected_ids, "predicate={predicate}");
+        }
+    }
+
+    // A predicate whose columns are all missing from the file projects nothing;
+    // padding an arbitrary leaf broke files whose first column is a map.
+    #[tokio::test]
+    async fn test_missing_column_predicate_on_map_first_file() {
+        use arrow_array::Int32Array;
+        use arrow_array::builder::{MapBuilder, StringBuilder};
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(
+                        3,
+                        "m",
+                        Type::Map(MapType::optional(
+                            11,
+                            Type::Primitive(PrimitiveType::String),
+                            12,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                    )
+                    .into(),
+                    NestedField::required(2, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(9, "b", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for _ in 0..2 {
+            map_builder.keys().append_value("k");
+            map_builder.values().append_value("x");
+            map_builder.append(true).unwrap();
+        }
+        let map_data = Arc::new(map_builder.finish()) as ArrayRef;
+        let map_field = Field::new("m", map_data.data_type().clone(), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            map_field,
+            Field::new("a", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            map_data,
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        ])
+        .unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        for (predicate, expected_ids) in [
+            (Reference::new("b").is_null(), vec![10, 20]),
+            (Reference::new("b").is_not_null(), vec![]),
+        ] {
+            let ids =
+                scan_ids_with_predicate(&file_path, &schema, vec![2], None, &predicate, false)
+                    .await;
+            assert_eq!(ids, expected_ids, "predicate={predicate}");
+        }
+    }
+
+    // Name mapping covers top-level fields only, so a nested variant on an
+    // id-less file is undecidable and must error rather than silently answer.
+    #[tokio::test]
+    async fn test_nested_variant_predicate_errors_without_embedded_ids() {
+        use arrow_array::{BinaryArray, Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        3,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let v_shape = variant_arrow_field("v", 2, true);
+        let v_field = Field::new("v", v_shape.data_type().clone(), true);
+        let s_field = Field::new(
+            "s",
+            DataType::Struct(vec![Arc::new(v_field.clone())].into()),
+            true,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            s_field.clone(),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let metadata = Arc::new(BinaryArray::from(vec![&[1u8, 0, 0][..]])) as ArrayRef;
+        let value = Arc::new(BinaryArray::from(vec![&[0u8][..]])) as ArrayRef;
+        let DataType::Struct(v_fields) = v_field.data_type() else {
+            panic!("variant storage must be a struct");
+        };
+        let v_data = Arc::new(StructArray::new(
+            v_fields.clone(),
+            vec![metadata, value],
+            Some(NullBuffer::from(vec![true])),
+        )) as ArrayRef;
+        let DataType::Struct(s_fields) = s_field.data_type() else {
+            panic!("struct field");
+        };
+        let s_data = Arc::new(StructArray::new(s_fields.clone(), vec![v_data], None)) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            s_data,
+        ])
+        .unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let name_mapping = Some(Arc::new(NameMapping::new(vec![
+            MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+            MappedField::new(Some(3), vec!["s".to_string()], vec![]),
+        ])));
+
+        let err = try_scan_batches_with_predicate(
+            &file_path,
+            &schema,
+            vec![1],
+            name_mapping,
+            &Reference::new("s.v").is_null(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("without embedded field ids"),
+            "{err}"
+        );
+    }
+
+    // A variant reference resolving to non-variant storage errors instead of
+    // silently answering from the wrong column.
+    #[tokio::test]
+    async fn test_variant_predicate_on_non_variant_storage_errors() {
+        use arrow_array::{Int32Array, StructArray};
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let name_mapping = Some(Arc::new(NameMapping::new(vec![
+            MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+            MappedField::new(Some(2), vec!["v".to_string()], vec![]),
+        ])));
+
+        // File stores `v` as a plain int: the id resolves to a leaf.
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = format!("{}/leaf.parquet", tmp_dir.path().to_str().unwrap());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![5])) as ArrayRef,
+        ])
+        .unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let err = try_scan_batches_with_predicate(
+            &file_path,
+            &schema,
+            vec![1],
+            name_mapping.clone(),
+            &Reference::new("v").is_null(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("non-group column"), "{err}");
+
+        // File stores `v` as a plain struct: no binary `metadata` child.
+        let file_path = format!("{}/struct.parquet", tmp_dir.path().to_str().unwrap());
+        let a_field = Field::new("a", DataType::Int32, true);
+        let v_field = Field::new(
+            "v",
+            DataType::Struct(vec![Arc::new(a_field.clone())].into()),
+            true,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            v_field.clone(),
+        ]));
+        let DataType::Struct(v_fields) = v_field.data_type() else {
+            panic!("struct field");
+        };
+        let v_data = Arc::new(StructArray::new(
+            v_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![5])) as ArrayRef],
+            None,
+        )) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            v_data,
+        ])
+        .unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("Writing batch");
+        writer.close().unwrap();
+
+        let err = try_scan_batches_with_predicate(
+            &file_path,
+            &schema,
+            vec![1],
+            name_mapping,
+            &Reference::new("v").is_null(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not stored as variant"), "{err}");
     }
 
     /// Test schema evolution: reading old Parquet file (with only column 'a')

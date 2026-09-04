@@ -448,6 +448,12 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<RowSelection> {
+        // A variant has no id-carrying leaf and would be misread as a missing
+        // column; like java's ParquetMetricsRowGroupFilter, leave it to the row filter.
+        if reference.is_variant() {
+            return self.select_all_rows();
+        }
+
         let field_id = reference.field().id;
 
         self.calc_row_selection(
@@ -462,6 +468,10 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<RowSelection> {
+        if reference.is_variant() {
+            return self.select_all_rows();
+        }
+
         let field_id = reference.field().id;
 
         self.calc_row_selection(

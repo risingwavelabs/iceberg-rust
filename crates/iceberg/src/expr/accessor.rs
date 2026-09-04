@@ -27,6 +27,10 @@ pub struct StructAccessor {
     position: usize,
     r#type: PrimitiveType,
     inner: Option<Box<StructAccessor>>,
+    /// A variant leaf: locatable so unary predicates can bind, but its value cannot
+    /// be read as a [`Datum`]. `r#type` holds a `Binary` placeholder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    variant: bool,
 }
 
 pub(crate) type StructAccessorRef = Arc<StructAccessor>;
@@ -37,13 +41,29 @@ impl StructAccessor {
             position,
             r#type,
             inner: None,
+            variant: false,
         }
+    }
+
+    pub(crate) fn new_variant(position: usize) -> Self {
+        StructAccessor {
+            position,
+            r#type: PrimitiveType::Binary,
+            inner: None,
+            variant: true,
+        }
+    }
+
+    /// Whether this accessor reaches through at least one enclosing struct.
+    pub(crate) fn is_nested(&self) -> bool {
+        self.inner.is_some()
     }
 
     pub(crate) fn wrap(position: usize, inner: Box<StructAccessor>) -> Self {
         StructAccessor {
             position,
             r#type: inner.r#type().clone(),
+            variant: inner.variant,
             inner: Some(inner),
         }
     }
@@ -60,6 +80,10 @@ impl StructAccessor {
         match &self.inner {
             None => match &container[self.position] {
                 None => Ok(None),
+                Some(_) if self.variant => Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "A variant value cannot be read as a datum",
+                )),
                 Some(Literal::Primitive(literal)) => {
                     Ok(Some(Datum::new(self.r#type().clone(), literal.clone())))
                 }
