@@ -29,7 +29,8 @@ use super::{
 };
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus, Operation,
+    DataContentType, DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus,
+    Operation,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -37,7 +38,7 @@ use crate::transaction::{ActionCommit, TransactionAction};
 
 /// Which snapshot [`Operation`] a file replacement records.
 ///
-/// `rewrite_files` and `overwrite_files` differ only in this value
+/// Also determines the default manifest merge policy for file replacements.
 pub(crate) trait ReplaceFilesMode: Send + Sync + 'static {
     const OPERATION: Operation;
 }
@@ -158,6 +159,14 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
+            // Old deletion-only manifests are not needed by the new snapshot.
+            // Retained snapshots still reference the original immutable files;
+            // this commit's deletion entries are written separately below.
+            // Unknown counts are conservatively treated as potentially live.
+            if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
+                continue;
+            }
+
             let manifest = manifest_file.load_manifest(file_io_ref).await?;
 
             let found_deleted_files: HashSet<_> = manifest
@@ -219,7 +228,7 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     target_size_bytes: u32,
     min_count_to_merge: u32,
-    merge_enabled: bool,
+    merge_enabled: Option<bool>,
 
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
@@ -243,6 +252,11 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
 pub type RewriteFilesAction = ReplaceFilesAction<Rewrite>;
 
 /// Rewrites files as a logical overwrite.
+///
+/// For V1/V2 tables, manifests are merged by default using the usual size/count
+/// thresholds. This can be overridden with `commit.manifest-merge.enabled` in
+/// the snapshot properties. V3 keeps the previous default because merging
+/// manifests does not yet preserve row lineage.
 pub type OverwriteFilesAction = ReplaceFilesAction<Overwrite>;
 
 #[allow(private_bounds)]
@@ -251,7 +265,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         Self {
             target_size_bytes: MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
             min_count_to_merge: MANIFEST_MIN_MERGE_COUNT_DEFAULT,
-            merge_enabled: MANIFEST_MERGE_ENABLED_DEFAULT,
+            merge_enabled: None,
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::new(),
@@ -308,8 +322,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             .unwrap_or(MANIFEST_MIN_MERGE_COUNT_DEFAULT);
         let merge_enabled = properties
             .get(MANIFEST_MERGE_ENABLED)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
+            .and_then(|s| s.parse().ok());
 
         self.target_size_bytes = target_size_bytes;
         self.min_count_to_merge = min_count_to_merge;
@@ -437,7 +450,16 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             snapshot_producer.validate_data_file_changes().await?;
         }
 
-        if self.merge_enabled {
+        let merge_enabled = self.merge_enabled.unwrap_or_else(|| {
+            if M::OPERATION == Operation::Overwrite
+                && table.metadata().format_version() < FormatVersion::V3
+            {
+                true
+            } else {
+                MANIFEST_MERGE_ENABLED_DEFAULT
+            }
+        });
+        if merge_enabled {
             let process =
                 MergeManifestProcess::new(self.target_size_bytes, self.min_count_to_merge);
             snapshot_producer
@@ -626,5 +648,372 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("must not exceed"));
+    }
+
+    fn memory_table() -> crate::table::Table {
+        let table = crate::transaction::tests::make_v2_minimal_table();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_location("memory:///cow-overwrite".to_string())
+            .build()
+            .unwrap()
+            .metadata;
+        table.with_metadata(Arc::new(metadata))
+    }
+
+    fn data_file(table: &crate::table::Table, path: &str) -> crate::spec::DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(
+                if table.metadata().default_partition_spec().is_unpartitioned() {
+                    Struct::empty()
+                } else {
+                    Struct::from_iter([Some(Literal::long(300))])
+                },
+            )
+            .build()
+            .unwrap()
+    }
+
+    async fn commit_action(
+        table: crate::table::Table,
+        action: impl TransactionAction + 'static,
+    ) -> crate::table::Table {
+        let commit = Arc::new(action).commit(&table).await.unwrap();
+        Transaction::apply(table, commit, &mut vec![], &mut vec![]).unwrap()
+    }
+
+    async fn entries(table: &crate::table::Table) -> Vec<crate::spec::ManifestEntry> {
+        let list = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        let mut entries = vec![];
+        for manifest in list.entries() {
+            entries.extend(
+                manifest
+                    .load_manifest(table.file_io())
+                    .await
+                    .unwrap()
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.as_ref().clone()),
+            );
+        }
+        entries
+    }
+
+    #[tokio::test]
+    async fn test_cow_overwrite_prunes_old_tombstones_without_changing_history() {
+        use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention};
+
+        let mut table = memory_table();
+        let retained = data_file(&table, "data/retained.parquet");
+        let mut replaced = data_file(&table, "data/0.parquet");
+        let append = Transaction::new(&table)
+            .fast_append()
+            .add_data_files([retained.clone(), replaced.clone()]);
+        table = commit_action(table, append).await;
+        let initial = table.clone();
+        let retained_entry = entries(&table)
+            .await
+            .into_iter()
+            .find(|entry| entry.data_file().file_path() == retained.file_path())
+            .unwrap();
+        let ingestion_id = table.metadata().current_snapshot_id().unwrap();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_ref(
+                "ingestion",
+                SnapshotReference::new(ingestion_id, SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                }),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        table = table.with_metadata(Arc::new(metadata));
+
+        for i in 1..=20 {
+            let next = data_file(&table, &format!("data/{i}.parquet"));
+            let before = table.clone();
+            let action = Transaction::new(&table)
+                .overwrite_files()
+                .add_data_files([next.clone()])
+                .delete_files([replaced.clone()])
+                .set_target_branch(MAIN_BRANCH.to_string())
+                .set_check_file_existence(true);
+            table = commit_action(table, action).await;
+            let snapshot = table.metadata().current_snapshot().unwrap();
+            let manifests = snapshot
+                .load_manifest_list(table.file_io(), table.metadata())
+                .await
+                .unwrap();
+            assert_eq!(
+                manifests.entries().len(),
+                3,
+                "overwrite {i} must not accumulate tombstones"
+            );
+            assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+            assert_eq!(
+                snapshot.summary().additional_properties["total-data-files"],
+                "2"
+            );
+            assert_eq!(
+                table.metadata().snapshots().count(),
+                before.metadata().snapshots().count() + 1
+            );
+            assert_eq!(
+                table
+                    .metadata()
+                    .snapshot_for_ref("ingestion")
+                    .unwrap()
+                    .snapshot_id(),
+                ingestion_id
+            );
+            let current = entries(&table).await;
+            let mut live_paths = current
+                .iter()
+                .filter(|entry| entry.is_alive())
+                .map(|entry| entry.data_file().file_path())
+                .collect::<Vec<_>>();
+            live_paths.sort();
+            let mut expected = vec![retained.file_path(), next.file_path()];
+            expected.sort();
+            assert_eq!(live_paths, expected);
+            let survivor = current
+                .iter()
+                .find(|entry| entry.data_file().file_path() == retained.file_path())
+                .unwrap();
+            assert_eq!(survivor.snapshot_id(), retained_entry.snapshot_id());
+            assert_eq!(survivor.sequence_number(), retained_entry.sequence_number());
+            assert_eq!(
+                survivor.file_sequence_number(),
+                retained_entry.file_sequence_number()
+            );
+            let deleted = current
+                .iter()
+                .filter(|entry| !entry.is_alive())
+                .collect::<Vec<_>>();
+            assert_eq!(deleted.len(), 1);
+            assert_eq!(deleted[0].data_file().file_path(), replaced.file_path());
+            assert_eq!(deleted[0].snapshot_id(), Some(snapshot.snapshot_id()));
+            // Metadata-only pruning must leave retained snapshots readable.
+            assert!(
+                entries(&before).await.iter().any(|entry| entry.is_alive()
+                    && entry.data_file().file_path() == replaced.file_path())
+            );
+            replaced = next;
+        }
+        assert_eq!(entries(&initial).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cow_overwrite_merges_manifests_and_preserves_entry_sequences() {
+        use crate::transaction::MANIFEST_MIN_MERGE_COUNT;
+
+        let mut table = memory_table();
+        let mut files = vec![];
+        for i in 0..3 {
+            let file = data_file(&table, &format!("data/{i}.parquet"));
+            let append = Transaction::new(&table)
+                .fast_append()
+                .add_data_files([file.clone()]);
+            table = commit_action(table, append).await;
+            files.push(file);
+        }
+        let before = table.clone();
+        let before_entries = entries(&table).await;
+        let next = data_file(&table, "data/replacement.parquet");
+        let starting_sequence = table.metadata().last_sequence_number();
+        let mut action = Transaction::new(&table)
+            .overwrite_files()
+            .add_data_files([next.clone()])
+            .delete_files([files[0].clone()])
+            .set_new_data_file_sequence_number(starting_sequence)
+            .set_check_file_existence(true);
+        // CommitManager always sets custom snapshot properties; that must not
+        // reset overwrite's merge default back to false.
+        action.set_snapshot_properties(HashMap::from([
+            (MANIFEST_MIN_MERGE_COUNT.to_string(), "2".to_string()),
+            ("rw.test.checkpoint".to_string(), "123".to_string()),
+        ]));
+        table = commit_action(table, action).await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifests = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        assert_eq!(manifests.entries().len(), 1);
+        assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+        assert_eq!(
+            snapshot.summary().additional_properties["rw.test.checkpoint"],
+            "123"
+        );
+        assert_eq!(
+            snapshot.summary().additional_properties["total-data-files"],
+            "3"
+        );
+        assert_eq!(
+            table.metadata().snapshots().count(),
+            before.metadata().snapshots().count() + 1
+        );
+        let current = entries(&table).await;
+        assert_eq!(current.len(), 4);
+        for previous in before_entries
+            .iter()
+            .filter(|entry| entry.data_file().file_path() != files[0].file_path())
+        {
+            let survivor = current
+                .iter()
+                .find(|entry| entry.data_file().file_path() == previous.data_file().file_path())
+                .unwrap();
+            assert_eq!(survivor.status(), ManifestStatus::Existing);
+            assert_eq!(survivor.snapshot_id(), previous.snapshot_id());
+            assert_eq!(survivor.sequence_number(), previous.sequence_number());
+            assert_eq!(
+                survivor.file_sequence_number(),
+                previous.file_sequence_number()
+            );
+        }
+        let added = current
+            .iter()
+            .find(|entry| entry.data_file().file_path() == next.file_path())
+            .unwrap();
+        assert_eq!(added.status(), ManifestStatus::Added);
+        assert_eq!(added.sequence_number(), Some(starting_sequence));
+        let deleted = current
+            .iter()
+            .find(|entry| entry.data_file().file_path() == files[0].file_path())
+            .unwrap();
+        assert_eq!(deleted.status(), ManifestStatus::Deleted);
+        assert_eq!(deleted.snapshot_id(), Some(snapshot.snapshot_id()));
+        assert_eq!(entries(&before).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cow_overwrite_merge_preserves_evolved_partition_specs() {
+        use crate::spec::UnboundPartitionSpec;
+        use crate::transaction::{MANIFEST_MERGE_ENABLED, MANIFEST_MIN_MERGE_COUNT};
+
+        let mut table = memory_table();
+        for i in 0..2 {
+            let file = data_file(&table, &format!("data/old-spec-{i}.parquet"));
+            let append = Transaction::new(&table)
+                .fast_append()
+                .add_data_files([file]);
+            table = commit_action(table, append).await;
+        }
+        let old_spec_id = table.metadata().default_partition_spec_id();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .add_partition_spec(UnboundPartitionSpec::builder().build())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        table = table.with_metadata(Arc::new(metadata));
+        let new_spec_id = table.metadata().default_partition_spec_id();
+        let next = data_file(&table, "data/new-spec.parquet");
+        let mut action = Transaction::new(&table)
+            .overwrite_files()
+            .add_data_files([next]);
+        action.set_snapshot_properties(HashMap::from([
+            (MANIFEST_MERGE_ENABLED.to_string(), "true".to_string()),
+            (MANIFEST_MIN_MERGE_COUNT.to_string(), "2".to_string()),
+        ]));
+        table = commit_action(table, action).await;
+        let list = table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        assert_eq!(list.entries().len(), 2);
+        for manifest_file in list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.data_file().file_path().contains("old-spec") {
+                    assert_eq!(manifest_file.partition_spec_id, old_spec_id);
+                    assert_eq!(
+                        entry.data_file().partition(),
+                        &Struct::from_iter([Some(Literal::long(300))])
+                    );
+                } else {
+                    assert_eq!(manifest_file.partition_spec_id, new_spec_id);
+                    assert_eq!(entry.data_file().partition(), &Struct::empty());
+                }
+            }
+        }
+        assert_eq!(entries(&table).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cow_overwrite_merge_opt_out_and_v3_default() {
+        use crate::spec::FormatVersion;
+        use crate::transaction::{MANIFEST_MERGE_ENABLED, MANIFEST_MIN_MERGE_COUNT};
+
+        for format in [FormatVersion::V2, FormatVersion::V3] {
+            let mut table = memory_table();
+            if format == FormatVersion::V3 {
+                let metadata = table
+                    .metadata()
+                    .clone()
+                    .into_builder(None)
+                    .upgrade_format_version(format)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata;
+                table = table.with_metadata(Arc::new(metadata));
+            }
+            for i in 0..2 {
+                let file = data_file(&table, &format!("data/{i}.parquet"));
+                let action = Transaction::new(&table)
+                    .fast_append()
+                    .add_data_files([file]);
+                table = commit_action(table, action).await;
+            }
+            let next = data_file(&table, "data/next.parquet");
+            let mut action = Transaction::new(&table)
+                .overwrite_files()
+                .add_data_files([next]);
+            let mut properties =
+                HashMap::from([(MANIFEST_MIN_MERGE_COUNT.to_string(), "2".to_string())]);
+            if format == FormatVersion::V2 {
+                properties.insert(MANIFEST_MERGE_ENABLED.to_string(), "false".to_string());
+            }
+            action.set_snapshot_properties(properties);
+            table = commit_action(table, action).await;
+            let list = table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .load_manifest_list(table.file_io(), table.metadata())
+                .await
+                .unwrap();
+            assert_eq!(list.entries().len(), 3);
+            assert_eq!(entries(&table).await.len(), 3);
+        }
     }
 }
