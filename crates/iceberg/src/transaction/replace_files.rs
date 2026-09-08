@@ -35,11 +35,10 @@ use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
 use crate::transaction::{ActionCommit, TransactionAction};
 
-/// Which snapshot [`Operation`] a file replacement records.
-///
-/// `rewrite_files` and `overwrite_files` differ only in this value
+/// Snapshot operation and default manifest merge policy for file replacements.
 pub(crate) trait ReplaceFilesMode: Send + Sync + 'static {
     const OPERATION: Operation;
+    const MERGE_ENABLED_DEFAULT: bool = MANIFEST_MERGE_ENABLED_DEFAULT;
 }
 
 /// Files were added and removed without changing table data (compaction,
@@ -55,6 +54,7 @@ impl ReplaceFilesMode for Rewrite {
 
 impl ReplaceFilesMode for Overwrite {
     const OPERATION: Operation = Operation::Overwrite;
+    const MERGE_ENABLED_DEFAULT: bool = true;
 }
 
 /// A blanket `impl<M: ReplaceFilesMode> SnapshotProduceOperation for M` would
@@ -158,6 +158,12 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
+            // Drop old deletion-only manifests; retained snapshots keep their references.
+            // This commit's deletion entries are written separately.
+            if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
+                continue;
+            }
+
             let manifest = manifest_file.load_manifest(file_io_ref).await?;
 
             let found_deleted_files: HashSet<_> = manifest
@@ -243,6 +249,8 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
 pub type RewriteFilesAction = ReplaceFilesAction<Rewrite>;
 
 /// Rewrites files as a logical overwrite.
+///
+/// Manifest merging is enabled by default and can be overridden by snapshot properties.
 pub type OverwriteFilesAction = ReplaceFilesAction<Overwrite>;
 
 #[allow(private_bounds)]
@@ -251,7 +259,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         Self {
             target_size_bytes: MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
             min_count_to_merge: MANIFEST_MIN_MERGE_COUNT_DEFAULT,
-            merge_enabled: MANIFEST_MERGE_ENABLED_DEFAULT,
+            merge_enabled: M::MERGE_ENABLED_DEFAULT,
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::new(),
@@ -309,7 +317,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         let merge_enabled = properties
             .get(MANIFEST_MERGE_ENABLED)
             .and_then(|s| s.parse().ok())
-            .unwrap_or(MANIFEST_MERGE_ENABLED_DEFAULT);
+            .unwrap_or(M::MERGE_ENABLED_DEFAULT);
 
         self.target_size_bytes = target_size_bytes;
         self.min_count_to_merge = min_count_to_merge;

@@ -1181,7 +1181,8 @@ impl MergeManifestManager {
                             Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
                         >)
                 } else {
-                    let writer = snapshot_produce.new_manifest_writer(self.content, snapshot_produce.table.metadata().default_partition_spec_id())?;
+                    // Preserve the bin's partition spec after table partition evolution.
+                    let writer = snapshot_produce.new_manifest_writer(self.content, manifest_bin[0].partition_spec_id)?;
                     let snapshot_id = snapshot_produce.snapshot_id;
                     let file_io = snapshot_produce.table.file_io().clone();
                     Ok((Box::pin(async move {
