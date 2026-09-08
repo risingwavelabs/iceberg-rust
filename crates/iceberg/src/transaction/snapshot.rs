@@ -464,7 +464,7 @@ impl<'a> SnapshotProducer<'a> {
         let format_version = self.table.metadata().format_version();
         let manifest_entries = added_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
-                .status(crate::spec::ManifestStatus::Added)
+                .status(ManifestStatus::Added)
                 .data_file(data_file)
                 .sequence_number_opt(data_sequence_number);
             if format_version == FormatVersion::V1 {
