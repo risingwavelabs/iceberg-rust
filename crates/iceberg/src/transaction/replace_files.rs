@@ -160,6 +160,12 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
+            // Drop old deletion-only manifests; retained snapshots keep their references.
+            // This commit's deletion entries are written separately.
+            if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
+                continue;
+            }
+
             let manifest = manifest_file
                 .load_manifest(snapshot_produce.table.file_io())
                 .await?;
@@ -245,6 +251,8 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
 pub type RewriteFilesAction = ReplaceFilesAction<Rewrite>;
 
 /// Rewrites files as a logical overwrite.
+///
+/// Manifest merging is enabled by default and can be overridden by snapshot properties.
 pub type OverwriteFilesAction = ReplaceFilesAction<Overwrite>;
 
 #[allow(private_bounds)]

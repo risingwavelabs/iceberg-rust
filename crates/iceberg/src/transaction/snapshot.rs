@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,13 +26,17 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
-    ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
-    Operation, PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties, Transform,
-    UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
+    ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
+    ManifestWriterBuilder, Operation, PartitionSpec, Snapshot, SnapshotReference,
+    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
+    Transform, UNASSIGNED_SEQUENCE_NUMBER, update_snapshot_summaries,
 };
 use crate::table::Table;
-use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
+use crate::transaction::{
+    ActionCommit, MANIFEST_MERGE_ENABLED, MANIFEST_MIN_MERGE_COUNT,
+    MANIFEST_MIN_MERGE_COUNT_DEFAULT, MANIFEST_TARGET_SIZE_BYTES,
+    MANIFEST_TARGET_SIZE_BYTES_DEFAULT, ManifestFilterManager, ManifestWriterContext,
+};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 pub(crate) type DataFileIdentity = (String, Option<i64>, Option<i64>);
@@ -604,7 +608,100 @@ impl<'a> SnapshotProducer<'a> {
         let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
         manifest_files.extend(self.write_delete_manifests(deleted_entries).await?);
 
+        if snapshot_produce_operation.operation() == Operation::Overwrite {
+            manifest_files = self.merge_data_manifests(manifest_files).await?;
+        }
+
         Ok(manifest_process.process_manifests(self, manifest_files))
+    }
+
+    async fn merge_data_manifests(
+        &self,
+        manifests: Vec<ManifestFile>,
+    ) -> Result<Vec<ManifestFile>> {
+        let property = |key| {
+            self.snapshot_properties
+                .get(key)
+                .or_else(|| self.table.metadata().properties().get(key))
+        };
+        if !property(MANIFEST_MERGE_ENABLED)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(true)
+        {
+            return Ok(manifests);
+        }
+        let target_size = property(MANIFEST_TARGET_SIZE_BYTES)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(MANIFEST_TARGET_SIZE_BYTES_DEFAULT as u64);
+        let min_count = property(MANIFEST_MIN_MERGE_COUNT)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(MANIFEST_MIN_MERGE_COUNT_DEFAULT as usize);
+        let first_manifest = manifests
+            .iter()
+            .find(|manifest| manifest.content == ManifestContentType::Data)
+            .map(|manifest| manifest.manifest_path.clone());
+
+        let mut groups: BTreeMap<i32, Vec<ManifestFile>> = BTreeMap::new();
+        let mut result = Vec::new();
+        for manifest in manifests {
+            if manifest.content == ManifestContentType::Data {
+                groups
+                    .entry(manifest.partition_spec_id)
+                    .or_default()
+                    .push(manifest);
+            } else {
+                result.push(manifest);
+            }
+        }
+
+        for (spec_id, group) in groups {
+            let mut bins: Vec<(u64, Vec<ManifestFile>)> = Vec::new();
+            for manifest in group {
+                let size = manifest.manifest_length as u64;
+                if let Some((weight, bin)) = bins
+                    .iter_mut()
+                    .find(|(weight, _)| weight.saturating_add(size) <= target_size)
+                {
+                    *weight += size;
+                    bin.push(manifest);
+                } else {
+                    bins.push((size, vec![manifest]));
+                }
+            }
+            for (_, bin) in bins {
+                // Apply the count threshold to the first bin so larger manifests
+                // do not prevent merging older groups, matching the release policy.
+                if bin.len() == 1
+                    || (bin.len() < min_count
+                        && bin.iter().any(|manifest| {
+                            Some(&manifest.manifest_path) == first_manifest.as_ref()
+                        }))
+                {
+                    result.extend(bin);
+                    continue;
+                }
+
+                let mut writer = self.new_manifest_writer(ManifestContentType::Data, spec_id)?;
+                for manifest_file in bin {
+                    let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+                    for entry in manifest.entries() {
+                        let current = entry.snapshot_id() == Some(self.snapshot_id);
+                        match entry.status() {
+                            ManifestStatus::Added if current => {
+                                writer.add_entry(entry.as_ref().clone())?
+                            }
+                            ManifestStatus::Deleted if current => {
+                                writer.add_delete_entry(entry.as_ref().clone())?
+                            }
+                            ManifestStatus::Deleted => {}
+                            _ => writer.add_existing_entry(entry.as_ref().clone())?,
+                        }
+                    }
+                }
+                result.push(writer.write_manifest_file().await?);
+            }
+        }
+        Ok(result)
     }
 
     // Returns a `Summary` of the current snapshot
