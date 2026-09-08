@@ -1181,9 +1181,7 @@ impl MergeManifestManager {
                             Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
                         >)
                 } else {
-                    // A bin only contains manifests from one partition spec.
-                    // The table's default spec may have changed since those
-                    // manifests were written.
+                    // Preserve the bin's partition spec after table partition evolution.
                     let writer = snapshot_produce.new_manifest_writer(self.content, manifest_bin[0].partition_spec_id)?;
                     let snapshot_id = snapshot_produce.snapshot_id;
                     let file_io = snapshot_produce.table.file_io().clone();
