@@ -17,14 +17,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, SnapshotProducer, data_file_identity};
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus, Operation,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestStatus, Operation, UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -35,6 +37,7 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// `rewrite_files` and `overwrite_files` differ only in this value
 pub(crate) trait ReplaceFilesMode: Send + Sync + 'static {
     const OPERATION: Operation;
+    const ENABLE_APPEND_RETRY_REUSE: bool;
 }
 
 /// Files were added and removed without changing table data (compaction,
@@ -46,21 +49,61 @@ pub struct Overwrite;
 
 impl ReplaceFilesMode for Rewrite {
     const OPERATION: Operation = Operation::Replace;
+    const ENABLE_APPEND_RETRY_REUSE: bool = true;
 }
 
 impl ReplaceFilesMode for Overwrite {
     const OPERATION: Operation = Operation::Overwrite;
+    const ENABLE_APPEND_RETRY_REUSE: bool = false;
 }
 
 /// A blanket `impl<M: ReplaceFilesMode> SnapshotProduceOperation for M` would
 /// collide with `impl SnapshotProduceOperation for FastAppendOperation`: the
 /// compiler cannot prove `FastAppendOperation` will never implement
 /// `ReplaceFilesMode`. This wrapper carries the shared implementation instead.
-pub(crate) struct ReplaceFilesOperation<M: ReplaceFilesMode>(PhantomData<M>);
+pub(crate) struct ReplaceFilesOperation<M: ReplaceFilesMode> {
+    current_manifests: Option<Vec<ManifestFile>>,
+    _mode: PhantomData<M>,
+}
 
 impl<M: ReplaceFilesMode> ReplaceFilesOperation<M> {
     pub(crate) fn new() -> Self {
-        Self(PhantomData)
+        Self {
+            current_manifests: None,
+            _mode: PhantomData,
+        }
+    }
+
+    fn with_current_manifests(current_manifests: Vec<ManifestFile>) -> Self {
+        Self {
+            current_manifests: Some(current_manifests),
+            _mode: PhantomData,
+        }
+    }
+
+    async fn current_manifests(
+        &self,
+        snapshot_produce: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestFile>> {
+        if let Some(manifests) = &self.current_manifests {
+            return Ok(manifests.clone());
+        }
+
+        let Some(snapshot) = snapshot_produce
+            .table
+            .metadata()
+            .snapshot_for_ref(snapshot_produce.target_branch())
+        else {
+            return Ok(vec![]);
+        };
+
+        Ok(snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await?
+            .entries()
+            .to_vec())
     }
 }
 
@@ -80,27 +123,21 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         }
 
         // generate delete manifest entries from removed files
-        let snapshot = snapshot_produce
+        if snapshot_produce
             .table
             .metadata()
-            .snapshot_for_ref(snapshot_produce.target_branch());
-
-        if let Some(snapshot) = snapshot {
+            .snapshot_for_ref(snapshot_produce.target_branch())
+            .is_some()
+        {
             let gen_manifest_entry = |old_entry: &Arc<ManifestEntry>| {
                 let mut entry = old_entry.as_ref().clone();
                 entry.status = ManifestStatus::Deleted;
                 entry
             };
 
-            let manifest_list = snapshot_produce
-                .table
-                .manifest_list_reader(snapshot)
-                .load()
-                .await?;
-
             let mut deleted_entries = Vec::new();
 
-            for manifest_file in manifest_list.entries() {
+            for manifest_file in self.current_manifests(snapshot_produce).await? {
                 let manifest = manifest_file
                     .load_manifest(snapshot_produce.table.file_io())
                     .await?;
@@ -137,35 +174,31 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce
+        if snapshot_produce
             .table
             .metadata()
             .snapshot_for_ref(snapshot_produce.target_branch())
-        else {
+            .is_none()
+        {
             return Ok(vec![]);
-        };
+        }
 
-        let manifest_list = snapshot_produce
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
+        let current_manifests = self.current_manifests(snapshot_produce).await?;
 
         if snapshot_produce.removed_data_file_identities.is_empty()
             && snapshot_produce.removed_delete_file_identities.is_empty()
         {
-            return Ok(manifest_list.entries().to_vec());
+            return Ok(current_manifests);
         }
 
         let mut existing_files = Vec::new();
 
-        for manifest_file in manifest_list.entries() {
+        for manifest_file in &current_manifests {
             // Drop old deletion-only manifests; retained snapshots keep their references.
             // This commit's deletion entries are written separately.
             if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
                 continue;
             }
-
             let manifest = manifest_file
                 .load_manifest(snapshot_produce.table.file_io())
                 .await?;
@@ -223,6 +256,36 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
     }
 }
 
+#[derive(Clone)]
+struct PreparedRewriteFiles {
+    /// The exact parent manifests whose contents produced `output_manifests`.
+    source_manifests: Vec<ManifestFile>,
+    output_manifests: Vec<ManifestFile>,
+    format_version: FormatVersion,
+    last_sequence_number: i64,
+}
+
+struct RewriteFilesState {
+    /// Identity and output artifacts shared by transaction retry attempts.
+    commit_uuid: Option<Uuid>,
+    proposed_snapshot_id: Option<i64>,
+    manifest_counter: Arc<AtomicU64>,
+    manifest_list_attempt: i64,
+    prepared: Option<PreparedRewriteFiles>,
+}
+
+impl Default for RewriteFilesState {
+    fn default() -> Self {
+        Self {
+            commit_uuid: None,
+            proposed_snapshot_id: None,
+            manifest_counter: Arc::new(AtomicU64::new(0)),
+            manifest_list_attempt: 0,
+            prepared: None,
+        }
+    }
+}
+
 /// Transaction action that replaces one set of files with another.
 ///
 /// `M` is sealed to [`Rewrite`] and [`Overwrite`] via the [`RewriteFilesAction`] /
@@ -243,6 +306,8 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     target_branch: Option<String>,
     enable_delete_filter_manager: bool,
     check_file_existence: bool,
+
+    state: Mutex<RewriteFilesState>,
 
     _mode: PhantomData<M>,
 }
@@ -271,6 +336,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             target_branch: None,
             enable_delete_filter_manager: true,
             check_file_existence: false,
+            state: Mutex::new(RewriteFilesState::default()),
             _mode: PhantomData,
         }
     }
@@ -358,6 +424,150 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         self.check_file_existence = check;
         self
     }
+
+    async fn current_manifests(&self, table: &Table) -> Result<Vec<ManifestFile>> {
+        let target_branch = self
+            .target_branch
+            .as_deref()
+            .unwrap_or(crate::spec::MAIN_BRANCH);
+        let Some(snapshot) = table.metadata().snapshot_for_ref(target_branch) else {
+            return Ok(vec![]);
+        };
+
+        Ok(table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await?
+            .entries()
+            .to_vec())
+    }
+
+    fn new_snapshot_producer<'a>(
+        &self,
+        table: &'a Table,
+        commit_uuid: Uuid,
+        snapshot_id: Option<i64>,
+        manifest_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<SnapshotProducer<'a>> {
+        let mut snapshot_producer = SnapshotProducer::new(
+            table,
+            commit_uuid,
+            snapshot_id,
+            self.snapshot_properties.clone(),
+            self.added_data_files.clone(),
+            self.added_delete_files.clone(),
+            self.removed_data_files.clone(),
+            self.removed_delete_files.clone(),
+        );
+
+        if let Some(manifest_counter) = manifest_counter {
+            snapshot_producer.set_manifest_counter(manifest_counter);
+        }
+        if let Some(seq) = self.new_data_file_sequence_number {
+            snapshot_producer.set_new_data_file_sequence_number(seq);
+        }
+        if let Some(seq) = self.delete_file_cleanup_min_data_sequence_number {
+            snapshot_producer.set_delete_file_cleanup_min_data_sequence_number(seq);
+        }
+        if let Some(branch) = &self.target_branch {
+            snapshot_producer.set_target_branch(branch.clone());
+        }
+        if self.enable_delete_filter_manager {
+            snapshot_producer.enable_delete_filter_manager()?;
+        }
+
+        Ok(snapshot_producer)
+    }
+
+    async fn append_only_delta(
+        &self,
+        table: &Table,
+        prepared: &PreparedRewriteFiles,
+        current_manifests: &[ManifestFile],
+    ) -> Result<Option<Vec<ManifestFile>>> {
+        if table.metadata().format_version() != prepared.format_version {
+            return Ok(None);
+        }
+
+        let current_by_path: HashMap<&str, &ManifestFile> = current_manifests
+            .iter()
+            .map(|manifest| (manifest.manifest_path.as_str(), manifest))
+            .collect();
+        if prepared.source_manifests.iter().any(|source| {
+            current_by_path
+                .get(source.manifest_path.as_str())
+                .is_none_or(|current| *current != source)
+        }) {
+            return Ok(None);
+        }
+
+        let source_paths: HashSet<&str> = prepared
+            .source_manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.as_str())
+            .collect();
+        let delta: Vec<ManifestFile> = current_manifests
+            .iter()
+            .filter(|manifest| !source_paths.contains(manifest.manifest_path.as_str()))
+            .cloned()
+            .collect();
+
+        // Delete manifests and backdated data can change delete applicability.
+        if delta.iter().any(|manifest| {
+            manifest.content != ManifestContentType::Data
+                || manifest.min_sequence_number == UNASSIGNED_SEQUENCE_NUMBER
+                || manifest.min_sequence_number < prepared.last_sequence_number
+        }) {
+            return Ok(None);
+        }
+
+        let removed_identities: HashSet<_> = self
+            .removed_data_files
+            .iter()
+            .chain(self.removed_delete_files.iter())
+            .map(data_file_identity)
+            .collect();
+        let removed_data_paths: HashSet<&str> = self
+            .removed_data_files
+            .iter()
+            .map(|file| file.file_path())
+            .collect();
+        let added_identities: HashSet<_> = self
+            .added_data_files
+            .iter()
+            .chain(self.added_delete_files.iter())
+            .map(data_file_identity)
+            .collect();
+
+        for manifest_file in &delta {
+            let manifest = manifest_file.load_manifest(table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.status() != ManifestStatus::Added {
+                    return Ok(None);
+                }
+                let file = entry.data_file();
+                if removed_identities.contains(&data_file_identity(file))
+                    || removed_data_paths.contains(file.file_path())
+                    || (self.check_file_existence
+                        && added_identities.contains(&data_file_identity(file)))
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(delta))
+    }
+
+    fn has_new_delete_manifest(
+        prepared: &PreparedRewriteFiles,
+        current_manifests: &[ManifestFile],
+    ) -> bool {
+        current_manifests.iter().any(|manifest| {
+            manifest.content == ManifestContentType::Deletes
+                && !prepared.source_manifests.contains(manifest)
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -414,42 +624,133 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             }
         }
 
-        let mut snapshot_producer = SnapshotProducer::new(
+        if !M::ENABLE_APPEND_RETRY_REUSE {
+            let snapshot_producer = self.new_snapshot_producer(
+                table,
+                self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+                self.snapshot_id,
+                None,
+            )?;
+            snapshot_producer.validate_added_files(&self.added_data_files)?;
+            snapshot_producer.validate_added_files(&self.added_delete_files)?;
+            if self.check_file_existence {
+                snapshot_producer.validate_data_file_changes().await?;
+            }
+            return snapshot_producer
+                .commit(ReplaceFilesOperation::<M>::new(), DefaultManifestProcess)
+                .await;
+        }
+
+        let (commit_uuid, proposed_snapshot_id, manifest_counter, prepared, manifest_list_attempt) = {
+            let mut state = self.state.lock().expect("rewrite-files state poisoned");
+            let commit_uuid = self
+                .commit_uuid
+                .or(state.commit_uuid)
+                .unwrap_or_else(Uuid::now_v7);
+            state.commit_uuid = Some(commit_uuid);
+            let manifest_list_attempt = state.manifest_list_attempt;
+            state.manifest_list_attempt += 1;
+            (
+                commit_uuid,
+                self.snapshot_id.or(state.proposed_snapshot_id),
+                Arc::clone(&state.manifest_counter),
+                state.prepared.clone(),
+                manifest_list_attempt,
+            )
+        };
+
+        let mut snapshot_producer = self.new_snapshot_producer(
             table,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.snapshot_id,
-            self.snapshot_properties.clone(),
-            self.added_data_files.clone(),
-            self.added_delete_files.clone(),
-            self.removed_data_files.clone(),
-            self.removed_delete_files.clone(),
-        );
-
-        if let Some(seq) = self.new_data_file_sequence_number {
-            snapshot_producer.set_new_data_file_sequence_number(seq);
-        }
-
-        if let Some(seq) = self.delete_file_cleanup_min_data_sequence_number {
-            snapshot_producer.set_delete_file_cleanup_min_data_sequence_number(seq);
-        }
-
-        if let Some(branch) = &self.target_branch {
-            snapshot_producer.set_target_branch(branch.clone());
-        }
-
-        if self.enable_delete_filter_manager {
-            snapshot_producer.enable_delete_filter_manager()?;
+            commit_uuid,
+            proposed_snapshot_id,
+            Some(manifest_counter),
+        )?;
+        {
+            let mut state = self.state.lock().expect("rewrite-files state poisoned");
+            state.proposed_snapshot_id = Some(snapshot_producer.snapshot_id());
         }
 
         snapshot_producer.validate_added_files(&self.added_data_files)?;
         snapshot_producer.validate_added_files(&self.added_delete_files)?;
 
+        let current_manifests = self.current_manifests(table).await?;
+        let operation =
+            ReplaceFilesOperation::<M>::with_current_manifests(current_manifests.clone());
+        let is_retry = prepared.is_some();
+        let has_new_delete_manifest = prepared
+            .as_ref()
+            .is_some_and(|prepared| Self::has_new_delete_manifest(prepared, &current_manifests));
+
+        if let Some(prepared) = prepared
+            && let Some(delta) = self
+                .append_only_delta(table, &prepared, &current_manifests)
+                .await?
+        {
+            let summary = snapshot_producer
+                .prepare_summary(&operation)
+                .map_err(|err| {
+                    crate::Error::new(
+                        crate::ErrorKind::Unexpected,
+                        "Failed to create snapshot summary.",
+                    )
+                    .with_source(err)
+                })?;
+            let mut output_manifests = prepared.output_manifests;
+            output_manifests.extend(delta);
+            {
+                let mut state = self.state.lock().expect("rewrite-files state poisoned");
+                state.prepared = Some(PreparedRewriteFiles {
+                    source_manifests: current_manifests,
+                    output_manifests: output_manifests.clone(),
+                    format_version: table.metadata().format_version(),
+                    last_sequence_number: table.metadata().last_sequence_number(),
+                });
+            }
+            return snapshot_producer
+                .commit_prepared(output_manifests, summary, manifest_list_attempt)
+                .await;
+        }
+
+        // Replacement data was produced before a concurrent row-level delete.
+        // Replaying only the metadata transaction could resurrect deleted rows.
+        if has_new_delete_manifest && !self.removed_data_files.is_empty() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Cannot retry rewrite files after new delete manifests were committed",
+            ));
+        }
+
+        // A cache-invalidating retry must prove that every planned input still
+        // exists before it can safely add the already-produced replacement.
         if self.check_file_existence {
             snapshot_producer.validate_data_file_changes().await?;
+        } else if is_retry {
+            snapshot_producer.validate_removed_data_files().await?;
+        }
+        let summary = snapshot_producer
+            .prepare_summary(&operation)
+            .map_err(|err| {
+                crate::Error::new(
+                    crate::ErrorKind::Unexpected,
+                    "Failed to create snapshot summary.",
+                )
+                .with_source(err)
+            })?;
+        let output_manifests = snapshot_producer
+            .prepare_manifests(&operation, &DefaultManifestProcess)
+            .await?;
+        {
+            let mut state = self.state.lock().expect("rewrite-files state poisoned");
+            state.prepared = Some(PreparedRewriteFiles {
+                source_manifests: current_manifests,
+                output_manifests: output_manifests.clone(),
+                format_version: table.metadata().format_version(),
+                last_sequence_number: table.metadata().last_sequence_number(),
+            });
         }
 
         snapshot_producer
-            .commit(ReplaceFilesOperation::<M>::new(), DefaultManifestProcess)
+            .commit_prepared(output_manifests, summary, manifest_list_attempt)
             .await
     }
 }
@@ -462,16 +763,18 @@ impl<M: ReplaceFilesMode> Default for ReplaceFilesAction<M> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use uuid::Uuid;
 
     use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
+    use crate::catalog::MockCatalog;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
-        ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus,
         ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
     };
@@ -485,6 +788,189 @@ mod tests {
     };
     use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{ErrorKind, TableRequirement, TableUpdate};
+
+    fn retry_test_table() -> Table {
+        let base = make_v2_minimal_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("memory:///test/location/metadata/v1.json".to_string()))
+            .set_location("memory:///test/location".to_string())
+            .set_properties(HashMap::from([
+                ("commit.retry.min-wait-ms".to_string(), "1".to_string()),
+                ("commit.retry.max-wait-ms".to_string(), "1".to_string()),
+                (
+                    "commit.retry.total-timeout-ms".to_string(),
+                    "1000".to_string(),
+                ),
+                ("commit.retry.num-retries".to_string(), "2".to_string()),
+            ]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        base.with_metadata(Arc::new(metadata))
+    }
+
+    fn retry_test_data_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap()
+    }
+
+    async fn write_retry_test_manifest(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        files: Vec<DataFile>,
+    ) -> ManifestFile {
+        let mut writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(path).unwrap(),
+            Some(snapshot_id),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_data();
+        for file in files {
+            writer
+                .add_existing_file(file, snapshot_id, sequence_number, Some(sequence_number))
+                .unwrap();
+        }
+        let mut manifest = writer.write_manifest_file().await.unwrap();
+        manifest.sequence_number = sequence_number;
+        manifest.min_sequence_number = sequence_number;
+        manifest
+    }
+
+    async fn write_retry_test_added_manifest(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        file: DataFile,
+    ) -> ManifestFile {
+        let mut writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(path).unwrap(),
+            Some(snapshot_id),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_data();
+        writer.add_file(file, sequence_number).unwrap();
+        let mut manifest = writer.write_manifest_file().await.unwrap();
+        manifest.sequence_number = sequence_number;
+        manifest.min_sequence_number = sequence_number;
+        manifest
+    }
+
+    async fn write_retry_test_added_delete_manifest(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        file: DataFile,
+    ) -> ManifestFile {
+        let mut writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(path).unwrap(),
+            Some(snapshot_id),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_deletes();
+        writer.add_file(file, sequence_number).unwrap();
+        let mut manifest = writer.write_manifest_file().await.unwrap();
+        manifest.sequence_number = sequence_number;
+        manifest.min_sequence_number = sequence_number;
+        manifest
+    }
+
+    async fn write_retry_test_snapshot(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        parent_snapshot_id: Option<i64>,
+        manifests: Vec<ManifestFile>,
+        total_data_files: usize,
+    ) -> Snapshot {
+        let mut writer = ManifestListWriter::v2(
+            table
+                .file_io()
+                .new_output(path)
+                .unwrap()
+                .writer()
+                .await
+                .unwrap(),
+            snapshot_id,
+            parent_snapshot_id,
+            sequence_number,
+        );
+        writer.add_manifests(manifests.into_iter()).unwrap();
+        writer.close().await.unwrap();
+
+        Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(parent_snapshot_id)
+            .with_timestamp_ms(table.metadata().last_updated_ms() + snapshot_id)
+            .with_sequence_number(sequence_number)
+            .with_schema_id(0)
+            .with_manifest_list(path)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from([
+                    ("total-data-files".to_string(), total_data_files.to_string()),
+                    (
+                        "total-records".to_string(),
+                        (total_data_files * 10).to_string(),
+                    ),
+                    (
+                        "total-files-size".to_string(),
+                        (total_data_files * 100).to_string(),
+                    ),
+                ]),
+            })
+            .build()
+    }
+
+    fn retry_test_table_at_snapshot(base: &Table, snapshot: Snapshot) -> Table {
+        let snapshot_id = snapshot.snapshot_id();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some(format!(
+                "memory:///test/location/metadata/v{snapshot_id}.json"
+            )))
+            .add_snapshot(snapshot)
+            .unwrap()
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(snapshot_id, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        base.clone().with_metadata(Arc::new(metadata))
+    }
+
+    fn committed_snapshot(mut commit: crate::transaction::ActionCommit) -> Snapshot {
+        commit
+            .take_updates()
+            .into_iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .expect("replace-files commit should add a snapshot")
+    }
 
     async fn delete_file_statuses(table: &Table, snapshot: &Snapshot) -> Vec<ManifestStatus> {
         let manifest_list = table
@@ -523,6 +1009,627 @@ mod tests {
             ReplaceFilesOperation::<Overwrite>::new().operation(),
             Operation::Overwrite
         );
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reuses_prepared_manifests_after_append() {
+        // S101 contains the files selected for compaction.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/removed.parquet");
+        let retained = retry_test_data_file("test/retained.parquet");
+        let replacement = retry_test_data_file("test/replacement.parquet");
+        let original_manifest_path = "memory:///test/location/metadata/original.avro";
+        let original_manifest =
+            write_retry_test_manifest(&base, original_manifest_path, 101, 1, vec![
+                removed.clone(),
+                retained,
+            ])
+            .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-101.avro",
+            101,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+
+        // The first action invocation prepares and caches all replacement manifests.
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .set_check_file_existence(true)
+                .delete_files([removed])
+                .add_data_files([replacement]),
+        );
+        let first_snapshot =
+            committed_snapshot(Arc::clone(&action).commit(&table_v1).await.unwrap());
+        let first_output_paths = {
+            let state = action.state.lock().unwrap();
+            state
+                .prepared
+                .as_ref()
+                .unwrap()
+                .output_manifests
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone())
+                .collect::<HashSet<_>>()
+        };
+
+        // S102 advances the table with an independent data append only.
+        let appended_file = retry_test_data_file("test/appended.parquet");
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/appended.avro",
+            102,
+            2,
+            appended_file,
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-102.avro",
+            102,
+            2,
+            Some(101),
+            vec![original_manifest, appended_manifest.clone()],
+            3,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // A reusable retry must not open any original manifest body. Removing it
+        // makes an accidental full scan fail while leaving its list entry intact.
+        table_v2
+            .file_io()
+            .delete(original_manifest_path)
+            .await
+            .unwrap();
+        let second_snapshot =
+            committed_snapshot(Arc::clone(&action).commit(&table_v2).await.unwrap());
+
+        // The retry rebases the same proposed snapshot onto S102 with a new manifest list.
+        assert_eq!(second_snapshot.snapshot_id(), first_snapshot.snapshot_id());
+        assert_eq!(second_snapshot.parent_snapshot_id(), Some(102));
+        assert_eq!(second_snapshot.sequence_number(), 3);
+        assert_ne!(
+            second_snapshot.manifest_list(),
+            first_snapshot.manifest_list()
+        );
+
+        let manifest_list = table_v2
+            .manifest_list_reader(&SnapshotRef::new(second_snapshot))
+            .load()
+            .await
+            .unwrap();
+        let second_paths = manifest_list
+            .entries()
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect::<HashSet<_>>();
+
+        // Cached rewrite output is preserved and the concurrent append is carried forward.
+        assert!(first_output_paths.is_subset(&second_paths));
+        assert!(second_paths.contains(&appended_manifest.manifest_path));
+        assert_eq!(second_paths.len(), first_output_paths.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn test_transaction_retries_rewrite_files_without_rereading_source_manifests() {
+        // S301 is the table state used to prepare the first rewrite attempt.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/transaction-removed.parquet");
+        let retained = retry_test_data_file("test/transaction-retained.parquet");
+        let replacement = retry_test_data_file("test/transaction-replacement.parquet");
+        let original_manifest_path = "memory:///test/location/metadata/transaction-original.avro";
+        let original_manifest =
+            write_retry_test_manifest(&base, original_manifest_path, 301, 1, vec![
+                removed.clone(),
+                retained,
+            ])
+            .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-301.avro",
+            301,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+
+        // S302 simulates the concurrent append that wins the catalog race.
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/transaction-appended.avro",
+            302,
+            2,
+            retry_test_data_file("test/transaction-appended.parquet"),
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-302.avro",
+            302,
+            2,
+            Some(301),
+            vec![original_manifest, appended_manifest],
+            3,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // The transaction sees S301 initially, then refreshes to S302 after the conflict.
+        let load_attempt = Arc::new(AtomicU32::new(0));
+        let mut catalog = MockCatalog::new();
+        let load_attempt_ref = Arc::clone(&load_attempt);
+        let load_v1 = table_v1.clone();
+        let load_v2 = table_v2.clone();
+        catalog.expect_load_table().times(2).returning_st(move |_| {
+            let table = if load_attempt_ref.fetch_add(1, Ordering::SeqCst) == 0 {
+                load_v1.clone()
+            } else {
+                load_v2.clone()
+            };
+            Box::pin(async move { Ok(table) })
+        });
+
+        // After attempt one has prepared its output, remove the source object as a
+        // tripwire: retry succeeds only if it reuses the cache and reads just the append.
+        let update_attempt = Arc::new(AtomicU32::new(0));
+        let update_attempt_ref = Arc::clone(&update_attempt);
+        let file_io = table_v2.file_io().clone();
+        let committed_table = table_v2.clone();
+        catalog
+            .expect_update_table()
+            .times(2)
+            .returning_st(move |_| {
+                let attempt = update_attempt_ref.fetch_add(1, Ordering::SeqCst);
+                let file_io = file_io.clone();
+                let committed_table = committed_table.clone();
+                Box::pin(async move {
+                    if attempt == 0 {
+                        file_io.delete(original_manifest_path).await.unwrap();
+                        Err(crate::Error::new(
+                            ErrorKind::CatalogCommitConflicts,
+                            "injected conflict",
+                        )
+                        .with_retryable(true))
+                    } else {
+                        Ok(committed_table)
+                    }
+                })
+            });
+
+        // Exercise the real transaction retry loop rather than replaying the action directly.
+        let tx = Transaction::new(&table_v1);
+        let tx = tx
+            .rewrite_files()
+            .set_check_file_existence(true)
+            .delete_files([removed])
+            .add_data_files([replacement])
+            .apply(tx)
+            .unwrap();
+        tx.commit(&catalog).await.unwrap();
+        assert_eq!(load_attempt.load(Ordering::SeqCst), 2);
+        assert_eq!(update_attempt.load(Ordering::SeqCst), 2);
+    }
+
+    // Test to verify that rewrite files action reruns full preparations if the latest
+    // changes to the table invalidate the cached state of the transaction.
+    #[tokio::test]
+    async fn test_transaction_reprepares_rewrite_files_when_conflict_replaces_source_manifest() {
+        // S401 is the table state used for the first rewrite preparation.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/hard-refresh-removed.parquet");
+        let retained = retry_test_data_file("test/hard-refresh-retained.parquet");
+        let replacement = retry_test_data_file("test/hard-refresh-replacement.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/hard-refresh-original.avro",
+            401,
+            1,
+            vec![removed.clone(), retained.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-401.avro",
+            401,
+            1,
+            None,
+            vec![original_manifest],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+
+        // The conflicting commit rewrites the source manifest while preserving
+        // the files. Its descriptor no longer matches the cached source.
+        let rewritten_source = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/hard-refresh-rewritten-source.avro",
+            402,
+            2,
+            vec![removed.clone(), retained],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-402.avro",
+            402,
+            2,
+            Some(401),
+            vec![rewritten_source.clone()],
+            2,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // Keep the action handle so both attempts' prepared output can be compared.
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .set_check_file_existence(true)
+                .delete_files([removed])
+                .add_data_files([replacement]),
+        );
+        let first_output_paths = Arc::new(std::sync::Mutex::new(None));
+
+        // The retry loop loads S401 first, then the conflicting S402 state.
+        let load_attempt = Arc::new(AtomicU32::new(0));
+        let mut catalog = MockCatalog::new();
+        let load_attempt_ref = Arc::clone(&load_attempt);
+        let load_v1 = table_v1.clone();
+        let load_v2 = table_v2.clone();
+        catalog.expect_load_table().times(2).returning_st(move |_| {
+            let table = if load_attempt_ref.fetch_add(1, Ordering::SeqCst) == 0 {
+                load_v1.clone()
+            } else {
+                load_v2.clone()
+            };
+            Box::pin(async move { Ok(table) })
+        });
+
+        // Capture attempt one's output before injecting the catalog conflict.
+        let update_attempt = Arc::new(AtomicU32::new(0));
+        let update_attempt_ref = Arc::clone(&update_attempt);
+        let action_ref = Arc::clone(&action);
+        let first_output_paths_ref = Arc::clone(&first_output_paths);
+        let committed_table = table_v2.clone();
+        catalog
+            .expect_update_table()
+            .times(2)
+            .returning_st(move |_| {
+                let attempt = update_attempt_ref.fetch_add(1, Ordering::SeqCst);
+                let committed_table = committed_table.clone();
+                if attempt == 0 {
+                    let paths = action_ref
+                        .state
+                        .lock()
+                        .unwrap()
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .output_manifests
+                        .iter()
+                        .map(|manifest| manifest.manifest_path.clone())
+                        .collect::<HashSet<_>>();
+                    *first_output_paths_ref.lock().unwrap() = Some(paths);
+                }
+                Box::pin(async move {
+                    if attempt == 0 {
+                        Err(crate::Error::new(
+                            ErrorKind::CatalogCommitConflicts,
+                            "injected invalidating conflict",
+                        )
+                        .with_retryable(true))
+                    } else {
+                        Ok(committed_table)
+                    }
+                })
+            });
+
+        // Run the transaction through both attempts using the same stateful action.
+        let mut tx = Transaction::new(&table_v1);
+        tx.actions.push(action.clone());
+        tx.commit(&catalog).await.unwrap();
+
+        let first_output_paths = first_output_paths.lock().unwrap().take().unwrap();
+        let state = action.state.lock().unwrap();
+        let prepared = state.prepared.as_ref().unwrap();
+
+        // S402's source and disjoint outputs prove the retry performed a full preparation.
+        assert_eq!(prepared.source_manifests, vec![rewritten_source]);
+        let retry_output_paths = prepared
+            .output_manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect::<HashSet<_>>();
+        assert!(first_output_paths.is_disjoint(&retry_output_paths));
+        assert_eq!(load_attempt.load(Ordering::SeqCst), 2);
+        assert_eq!(update_attempt.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reprepares_when_source_manifest_changes() {
+        // Prepare the rewrite and retain its first set of output manifest paths.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/removed.parquet");
+        let retained = retry_test_data_file("test/retained.parquet");
+        let replacement = retry_test_data_file("test/replacement.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/original-fallback.avro",
+            201,
+            1,
+            vec![removed.clone(), retained.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-201.avro",
+            201,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .set_check_file_existence(true)
+                .delete_files([removed.clone()])
+                .add_data_files([replacement]),
+        );
+        Arc::clone(&action).commit(&table_v1).await.unwrap();
+        let first_output_paths = {
+            let state = action.state.lock().unwrap();
+            state
+                .prepared
+                .as_ref()
+                .unwrap()
+                .output_manifests
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone())
+                .collect::<HashSet<_>>()
+        };
+
+        // Replace the source manifest without changing its live files.
+        let rewritten_source = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/rewritten-source.avro",
+            202,
+            2,
+            vec![removed, retained],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-202.avro",
+            202,
+            2,
+            Some(201),
+            vec![rewritten_source.clone()],
+            2,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // Replaying the same action must discard the cache and prepare from the new source.
+        Arc::clone(&action).commit(&table_v2).await.unwrap();
+
+        let state = action.state.lock().unwrap();
+        let prepared = state.prepared.as_ref().unwrap();
+        assert_eq!(prepared.source_manifests, vec![rewritten_source]);
+        let second_output_paths = prepared
+            .output_manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect::<HashSet<_>>();
+        assert!(first_output_paths.is_disjoint(&second_output_paths));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reprepare_rejects_missing_input() {
+        // Prime the cache without opting into first-attempt existence validation.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/missing-retry-input.parquet");
+        let retained = retry_test_data_file("test/missing-retry-retained.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/missing-retry-original.avro",
+            501,
+            1,
+            vec![removed.clone(), retained.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-501.avro",
+            501,
+            1,
+            None,
+            vec![original_manifest],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file(
+                    "test/missing-retry-replacement.parquet",
+                )]),
+        );
+        Arc::clone(&action).commit(&table_v1).await.unwrap();
+
+        // A concurrent rewrite removes the selected input before this action retries.
+        let rewritten_source = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/missing-retry-new-source.avro",
+            502,
+            2,
+            vec![retained],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-502.avro",
+            502,
+            2,
+            Some(501),
+            vec![rewritten_source],
+            1,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // Cache misses always validate removals, preventing duplicate replacement data.
+        let err = match Arc::clone(&action).commit(&table_v2).await {
+            Ok(_) => panic!("retry with a missing input should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("not in the target branch"));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_retry_rejects_new_delete_manifest_without_reusing_cache() {
+        // Prepare replacement data before any concurrent row-level delete exists.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/delete-conflict-input.parquet");
+        let retained = retry_test_data_file("test/delete-conflict-retained.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/delete-conflict-original.avro",
+            601,
+            1,
+            vec![removed.clone(), retained],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-601.avro",
+            601,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file(
+                    "test/delete-conflict-replacement.parquet",
+                )]),
+        );
+        Arc::clone(&action).commit(&table_v1).await.unwrap();
+
+        // The refreshed table includes a delete manifest committed after planning.
+        let delete_manifest = write_retry_test_added_delete_manifest(
+            &base,
+            "memory:///test/location/metadata/concurrent-delete.avro",
+            602,
+            2,
+            position_delete_file(&base, "test/concurrent-position-delete.parquet"),
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-602.avro",
+            602,
+            2,
+            Some(601),
+            vec![original_manifest, delete_manifest],
+            2,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // Reusing or replaying the stale replacement could resurrect deleted rows.
+        let err = match Arc::clone(&action).commit(&table_v2).await {
+            Ok(_) => panic!("retry after a concurrent delete should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("new delete manifests"));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_reprepare_rejects_duplicate_removed_identity() {
+        // Prime the cache with one live occurrence of the selected input file.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/duplicate-retry-input.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-retry-original.avro",
+            701,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-701.avro",
+            701,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            1,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .delete_files([removed.clone()])
+                .add_data_files([retry_test_data_file(
+                    "test/duplicate-retry-replacement.parquet",
+                )]),
+        );
+        Arc::clone(&action).commit(&table_v1).await.unwrap();
+
+        // A concurrent append introduces a second live entry for the same identity.
+        let duplicate_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-retry-added.avro",
+            702,
+            2,
+            removed,
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-702.avro",
+            702,
+            2,
+            Some(701),
+            vec![original_manifest, duplicate_manifest],
+            2,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // Full preparation rejects the invalid duplicate instead of corrupting totals.
+        let err = match Arc::clone(&action).commit(&table_v2).await {
+            Ok(_) => panic!("retry with duplicate rewrite inputs should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(err.message().contains("referenced multiple times"));
     }
 
     /// A logical overwrite may replace only part of a table. Its summary must account for the
