@@ -45,6 +45,8 @@ use opendal::Operator;
 use opendal::layers::RetryLayer;
 #[cfg(not(madsim))]
 use opendal::layers::TimeoutLayer;
+#[cfg(feature = "prometheus")]
+use opendal_layer_prometheus::PrometheusLayer;
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
 
@@ -112,6 +114,25 @@ cfg_if! {
 
 mod resolving;
 pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
+
+#[cfg(feature = "prometheus")]
+static PROMETHEUS_LAYER: OnceCell<PrometheusLayer> = OnceCell::new();
+
+/// Installs OpenDAL metrics into the supplied Prometheus registry.
+///
+/// Call this once, before creating any [`OpenDalStorage`] operators. The first
+/// successful call selects the registry used by all subsequently created
+/// operators in this process.
+#[cfg(feature = "prometheus")]
+pub fn install_prometheus_metrics(registry: &prometheus::Registry) -> Result<()> {
+    PROMETHEUS_LAYER
+        .get_or_try_init(|| {
+            PrometheusLayer::builder()
+                .register(registry)
+                .map_err(from_opendal_error)
+        })
+        .map(|_| ())
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct OpenDalStorageOptions {
@@ -763,6 +784,13 @@ impl OpenDalStorage {
             retry = retry.with_max_delay(Duration::from_millis(max_delay_ms));
         }
         let operator = operator.layer(retry);
+
+        #[cfg(feature = "prometheus")]
+        let operator = match PROMETHEUS_LAYER.get() {
+            Some(layer) => operator.layer(layer.clone()),
+            None => operator,
+        };
+
         Ok((operator, relative_path))
     }
 
@@ -1529,6 +1557,26 @@ mod tests {
     fn test_default_memory_operator() {
         let op = default_memory_operator();
         assert_eq!(op.info().scheme().to_string(), "memory");
+    }
+
+    #[cfg(all(feature = "opendal-memory", feature = "prometheus"))]
+    #[tokio::test]
+    async fn test_prometheus_metrics() {
+        let registry = prometheus::Registry::new();
+        install_prometheus_metrics(&registry).unwrap();
+
+        let storage = OpenDalStorage::Memory(default_memory_operator());
+        storage
+            .write("memory:/metrics.txt", Bytes::from_static(b"metrics"))
+            .await
+            .unwrap();
+
+        assert!(
+            registry
+                .gather()
+                .iter()
+                .any(|family| family.name() == "opendal_operation_duration_seconds")
+        );
     }
 
     #[cfg(feature = "opendal-memory")]
