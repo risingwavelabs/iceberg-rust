@@ -220,6 +220,8 @@ enum OperatorBackendConfig {
     S3(Arc<S3Config>),
     #[cfg(feature = "opendal-gcs")]
     Gcs(Arc<GcsConfig>),
+    #[cfg(feature = "opendal-azdls")]
+    Azdls(Arc<AzdlsConfig>),
 }
 
 /// Cache entries are scoped by everything that affects the resulting operator.
@@ -228,6 +230,9 @@ enum OperatorBackendConfig {
 #[derive(Clone, PartialEq, Eq)]
 struct OperatorCacheKey {
     backend_config: OperatorBackendConfig,
+    /// The bucket name for S3 and GCS. For ADLS this is
+    /// `<scheme>://<filesystem>@<account host>`, because the operator's
+    /// endpoint is derived from the path scheme and host unless configured.
     bucket: String,
     layer_options: OperatorLayerOptions,
 }
@@ -315,7 +320,7 @@ fn default_operator_cache() -> SharedOperatorCache {
 struct ConfiguredOpenDalStorage {
     storage: OpenDalStorage,
     options: OpenDalStorageOptions,
-    /// Shared factory-owned cache for fully configured S3 and GCS operators.
+    /// Shared factory-owned cache for fully configured S3, GCS and ADLS operators.
     #[serde(skip, default = "default_operator_cache")]
     operator_cache: SharedOperatorCache,
 }
@@ -589,19 +594,38 @@ impl OpenDalStorage {
             OpenDalStorage::S3 { config, .. } => OperatorBackendConfig::S3(config.clone()),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorage::Gcs { config } => OperatorBackendConfig::Gcs(config.clone()),
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorage::Azdls { config } => OperatorBackendConfig::Azdls(config.clone()),
             _ => return Ok(None),
         };
 
         let url = url::Url::parse(path)?;
-        let bucket = url.host_str().ok_or_else(|| {
+        let host = url.host_str().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 format!("Invalid object storage url: {path}, missing bucket"),
             )
         })?;
+        let bucket = match &backend_config {
+            #[cfg(feature = "opendal-azdls")]
+            OperatorBackendConfig::Azdls(_) => {
+                // `azdls_config_build` selects the filesystem from the path and,
+                // unless an endpoint is configured, derives the endpoint from the
+                // path's scheme and account host. All of them scope the operator.
+                let filesystem = url.username();
+                if filesystem.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid object storage url: {path}, missing filesystem"),
+                    ));
+                }
+                format!("{}://{filesystem}@{host}", url.scheme())
+            }
+            _ => host.to_string(),
+        };
         Ok(Some(OperatorCacheKey {
             backend_config,
-            bucket: bucket.to_string(),
+            bucket,
             layer_options: options.into(),
         }))
     }
@@ -1353,12 +1377,108 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "opendal-s3")]
+    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
     fn create_cached_operator(storage: &ConfiguredOpenDalStorage, path: &str) {
         storage
             .storage
             .create_operator_with_options(&path, &storage.options, Some(&storage.operator_cache))
             .unwrap();
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    fn test_azdls_storage(endpoint: Option<&str>) -> ConfiguredOpenDalStorage {
+        let storage = OpenDalStorage::Azdls {
+            config: Arc::new(AzdlsConfig {
+                account_name: Some("myaccount".to_string()),
+                account_key: Some("bXlhY2NvdW50a2V5".to_string()),
+                endpoint: endpoint.map(str::to_string),
+                ..Default::default()
+            }),
+        };
+        ConfiguredOpenDalStorage::new(storage, &StorageConfig::new(), default_operator_cache())
+            .unwrap()
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_operator_cache_reuses_operator_per_filesystem() {
+        let storage = test_azdls_storage(None);
+
+        create_cached_operator(
+            &storage,
+            "abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet",
+        );
+        create_cached_operator(
+            &storage,
+            "abfss://myfs@myaccount.dfs.core.windows.net/other/two.parquet",
+        );
+        assert_eq!(storage.operator_cache.len(), 1);
+
+        create_cached_operator(
+            &storage,
+            "abfss://otherfs@myaccount.dfs.core.windows.net/path/to/one.parquet",
+        );
+        assert_eq!(storage.operator_cache.len(), 2);
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_operator_cache_key_scopes_scheme_filesystem_and_host() {
+        let storage = test_azdls_storage(None);
+        let key = |path: &str| {
+            storage
+                .storage
+                .operator_cache_key(path, &storage.options)
+                .unwrap()
+                .expect("azdls operators are cached")
+        };
+
+        let base = key("abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet");
+        assert_eq!(base.bucket, "abfss://myfs@myaccount.dfs.core.windows.net");
+        assert!(base == key("abfss://myfs@myaccount.dfs.core.windows.net/other/two.parquet"));
+        assert!(base != key("abfs://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet"));
+        assert!(base != key("abfss://otherfs@myaccount.dfs.core.windows.net/path/to/one.parquet"));
+        assert!(base != key("abfss://myfs@otheraccount.dfs.core.windows.net/path/to/one.parquet"));
+
+        assert!(
+            storage
+                .storage
+                .operator_cache_key(
+                    "abfss://myaccount.dfs.core.windows.net/path/to/one.parquet",
+                    &storage.options
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_operator_cache_validates_path_before_lookup() {
+        let storage = test_azdls_storage(Some("https://myaccount.dfs.core.windows.net"));
+        create_cached_operator(
+            &storage,
+            "abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet",
+        );
+        assert_eq!(storage.operator_cache.len(), 1);
+
+        for invalid in [
+            // account name differs from the configured one
+            "abfss://myfs@otheraccount.dfs.core.windows.net/path/to/one.parquet",
+            // endpoint suffix differs from the configured endpoint
+            "abfss://myfs@myaccount.dfs.core.chinacloudapi.cn/path/to/one.parquet",
+        ] {
+            assert!(
+                storage
+                    .storage
+                    .create_operator_with_options(
+                        &invalid,
+                        &storage.options,
+                        Some(&storage.operator_cache)
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(storage.operator_cache.len(), 1);
     }
 
     #[cfg(feature = "opendal-s3")]
