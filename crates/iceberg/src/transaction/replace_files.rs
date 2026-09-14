@@ -538,7 +538,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             snapshot_producer.set_target_branch(branch.clone());
         }
         if self.enable_delete_filter_manager {
-            snapshot_producer.enable_delete_filter_manager()?;
+            snapshot_producer.enable_delete_filter_manager(self.manifest_load_concurrency)?;
         }
 
         Ok(snapshot_producer)
