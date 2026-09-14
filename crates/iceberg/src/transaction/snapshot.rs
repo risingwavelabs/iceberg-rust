@@ -1047,7 +1047,7 @@ impl<'a> SnapshotProducer<'a> {
         &self.target_branch
     }
 
-    pub(crate) fn enable_delete_filter_manager(&mut self) -> Result<()> {
+    pub(crate) fn enable_delete_filter_manager(&mut self, load_concurrency: usize) -> Result<()> {
         if self.delete_filter_manager.is_some() {
             return Ok(());
         }
@@ -1065,6 +1065,7 @@ impl<'a> SnapshotProducer<'a> {
                 self.table.encryption_manager_ref(),
             ),
         );
+        manager.set_load_concurrency(load_concurrency);
 
         for file in &self.removed_delete_files {
             manager.delete_file(file.clone())?;
