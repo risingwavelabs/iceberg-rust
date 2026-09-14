@@ -215,14 +215,33 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) async fn validate_data_file_changes(&self) -> Result<()> {
-        self.validate_data_file_changes_impl(true).await
+        self.validate_data_file_changes_impl(true, None, None).await
     }
 
-    pub(crate) async fn validate_removed_data_files(&self) -> Result<()> {
-        self.validate_data_file_changes_impl(false).await
+    pub(crate) async fn validate_data_file_changes_with_manifests(
+        &self,
+        manifest_files: &[ManifestFile],
+        concurrency_limit: usize,
+    ) -> Result<()> {
+        self.validate_data_file_changes_impl(true, Some(manifest_files), Some(concurrency_limit))
+            .await
     }
 
-    async fn validate_data_file_changes_impl(&self, validate_additions: bool) -> Result<()> {
+    pub(crate) async fn validate_removed_data_files_with_manifests(
+        &self,
+        manifest_files: &[ManifestFile],
+        concurrency_limit: usize,
+    ) -> Result<()> {
+        self.validate_data_file_changes_impl(false, Some(manifest_files), Some(concurrency_limit))
+            .await
+    }
+
+    async fn validate_data_file_changes_impl(
+        &self,
+        validate_additions: bool,
+        manifest_files: Option<&[ManifestFile]>,
+        concurrency_limit: Option<usize>,
+    ) -> Result<()> {
         let mut files_to_delete: HashSet<DataFileIdentity> = self
             .removed_data_files
             .iter()
@@ -262,12 +281,22 @@ impl<'a> SnapshotProducer<'a> {
             ));
         };
 
-        let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
-        let manifest_files = manifest_list.entries().to_vec();
+        let manifest_files = if let Some(manifest_files) = manifest_files {
+            manifest_files.to_vec()
+        } else {
+            self.table
+                .manifest_list_reader(snapshot)
+                .load()
+                .await?
+                .entries()
+                .to_vec()
+        };
         let file_io = self.table.file_io().clone();
-        let concurrency_limit = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
+        let concurrency_limit = concurrency_limit.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        });
         let mut manifests = futures::stream::iter(manifest_files)
             .map(|manifest_file| {
                 let file_io = file_io.clone();

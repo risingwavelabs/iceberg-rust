@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use futures::StreamExt;
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, SnapshotProducer, data_file_identity};
@@ -31,6 +32,8 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
 use crate::transaction::{ActionCommit, TransactionAction};
+
+const DEFAULT_MANIFEST_LOAD_CONCURRENCY: usize = 16;
 
 /// Which snapshot [`Operation`] a file replacement records.
 ///
@@ -63,6 +66,8 @@ impl ReplaceFilesMode for Overwrite {
 /// `ReplaceFilesMode`. This wrapper carries the shared implementation instead.
 pub(crate) struct ReplaceFilesOperation<M: ReplaceFilesMode> {
     current_manifests: Option<Vec<ManifestFile>>,
+    manifest_load_concurrency: usize,
+    deleted_entries: Mutex<Option<Vec<ManifestEntry>>>,
     _mode: PhantomData<M>,
 }
 
@@ -70,13 +75,20 @@ impl<M: ReplaceFilesMode> ReplaceFilesOperation<M> {
     pub(crate) fn new() -> Self {
         Self {
             current_manifests: None,
+            manifest_load_concurrency: DEFAULT_MANIFEST_LOAD_CONCURRENCY,
+            deleted_entries: Mutex::new(None),
             _mode: PhantomData,
         }
     }
 
-    fn with_current_manifests(current_manifests: Vec<ManifestFile>) -> Self {
+    fn with_current_manifests(
+        current_manifests: Vec<ManifestFile>,
+        manifest_load_concurrency: usize,
+    ) -> Self {
         Self {
             current_manifests: Some(current_manifests),
+            manifest_load_concurrency,
+            deleted_entries: Mutex::new(None),
             _mode: PhantomData,
         }
     }
@@ -120,6 +132,16 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
             && snapshot_produce.removed_delete_file_identities.is_empty()
         {
             return Ok(vec![]);
+        }
+
+        if let Some(deleted_entries) = self
+            .deleted_entries
+            .lock()
+            .expect("replace-files deleted entries poisoned")
+            .as_ref()
+            .cloned()
+        {
+            return Ok(deleted_entries);
         }
 
         // generate delete manifest entries from removed files
@@ -192,17 +214,24 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         }
 
         let mut existing_files = Vec::new();
-
-        for manifest_file in &current_manifests {
+        let mut deleted_entries = Vec::new();
+        let file_io = snapshot_produce.table.file_io().clone();
+        let mut manifests = futures::stream::iter(current_manifests.into_iter().filter(|manifest| {
             // Drop old deletion-only manifests; retained snapshots keep their references.
             // This commit's deletion entries are written separately.
-            if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
-                continue;
-            }
-            let manifest = manifest_file
-                .load_manifest(snapshot_produce.table.file_io())
-                .await?;
+            manifest.has_added_files() || manifest.has_existing_files()
+        }))
+            .map(|manifest_file| {
+                let file_io = file_io.clone();
+                async move {
+                    let manifest = manifest_file.load_manifest(&file_io).await?;
+                    Result::Ok((manifest_file, manifest))
+                }
+            })
+            .buffered(self.manifest_load_concurrency);
 
+        while let Some(manifest) = manifests.next().await {
+            let (manifest_file, manifest) = manifest?;
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()
@@ -216,6 +245,9 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                                 .removed_delete_file_identities
                                 .contains(&identity))
                     {
+                        let mut deleted_entry = entry.as_ref().clone();
+                        deleted_entry.status = ManifestStatus::Deleted;
+                        deleted_entries.push(deleted_entry);
                         Some(identity)
                     } else {
                         None
@@ -251,6 +283,11 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                 }
             }
         }
+
+        *self
+            .deleted_entries
+            .lock()
+            .expect("replace-files deleted entries poisoned") = Some(deleted_entries);
 
         Ok(existing_files)
     }
@@ -306,6 +343,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     target_branch: Option<String>,
     enable_delete_filter_manager: bool,
     check_file_existence: bool,
+    manifest_load_concurrency: usize,
 
     state: Mutex<RewriteFilesState>,
 
@@ -336,6 +374,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             target_branch: None,
             enable_delete_filter_manager: true,
             check_file_existence: false,
+            manifest_load_concurrency: DEFAULT_MANIFEST_LOAD_CONCURRENCY,
             state: Mutex::new(RewriteFilesState::default()),
             _mode: PhantomData,
         }
@@ -422,6 +461,16 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
 
     pub fn set_check_file_existence(mut self, check: bool) -> Self {
         self.check_file_existence = check;
+        self
+    }
+
+    /// Set the maximum number of manifest bodies loaded concurrently.
+    pub fn set_manifest_load_concurrency(mut self, limit: usize) -> Self {
+        assert!(
+            limit > 0,
+            "manifest load concurrency must be greater than zero"
+        );
+        self.manifest_load_concurrency = limit;
         self
     }
 
@@ -674,8 +723,10 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
         snapshot_producer.validate_added_files(&self.added_delete_files)?;
 
         let current_manifests = self.current_manifests(table).await?;
-        let operation =
-            ReplaceFilesOperation::<M>::with_current_manifests(current_manifests.clone());
+        let operation = ReplaceFilesOperation::<M>::with_current_manifests(
+            current_manifests.clone(),
+            self.manifest_load_concurrency,
+        );
         let is_retry = prepared.is_some();
         let has_new_delete_manifest = prepared
             .as_ref()
@@ -723,9 +774,19 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
         // A cache-invalidating retry must prove that every planned input still
         // exists before it can safely add the already-produced replacement.
         if self.check_file_existence {
-            snapshot_producer.validate_data_file_changes().await?;
+            snapshot_producer
+                .validate_data_file_changes_with_manifests(
+                    &current_manifests,
+                    self.manifest_load_concurrency,
+                )
+                .await?;
         } else if is_retry {
-            snapshot_producer.validate_removed_data_files().await?;
+            snapshot_producer
+                .validate_removed_data_files_with_manifests(
+                    &current_manifests,
+                    self.manifest_load_concurrency,
+                )
+                .await?;
         }
         let summary = snapshot_producer
             .prepare_summary(&operation)
@@ -1115,6 +1176,99 @@ mod tests {
         assert!(first_output_paths.is_subset(&second_paths));
         assert!(second_paths.contains(&appended_manifest.manifest_path));
         assert_eq!(second_paths.len(), first_output_paths.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_validation_reuses_current_manifest_list() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/validation-removed.parquet");
+        let manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/validation-source.avro",
+            111,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let manifest_list_path = "memory:///test/location/metadata/validation-list.avro";
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            manifest_list_path,
+            111,
+            1,
+            None,
+            vec![manifest.clone()],
+            1,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+        let producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![removed],
+            vec![],
+        );
+
+        table.file_io().delete(manifest_list_path).await.unwrap();
+        producer
+            .validate_data_file_changes_with_manifests(&[manifest], 1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_collects_deleted_entries_while_rewriting_survivors() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/fused-removed.parquet");
+        let retained = retry_test_data_file("test/fused-retained.parquet");
+        let manifest_path = "memory:///test/location/metadata/fused-source.avro";
+        let manifest = write_retry_test_manifest(&base, manifest_path, 112, 1, vec![
+            removed.clone(),
+            retained,
+        ])
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/fused-list.avro",
+            112,
+            1,
+            None,
+            vec![manifest.clone()],
+            2,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+        let mut producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![removed],
+            vec![],
+        );
+        let operation = ReplaceFilesOperation::<Rewrite>::with_current_manifests(vec![manifest], 1);
+
+        let existing = operation.existing_manifest(&mut producer).await.unwrap();
+        assert_eq!(existing.len(), 1);
+
+        // The deleted entry must come from the survivor pass, not a second source read.
+        table.file_io().delete(manifest_path).await.unwrap();
+        let deleted_entries = operation.delete_entries(&producer).await.unwrap();
+        assert_eq!(deleted_entries.len(), 1);
+        assert_eq!(deleted_entries[0].status(), ManifestStatus::Deleted);
+        assert_eq!(
+            deleted_entries[0].data_file().file_path(),
+            "test/fused-removed.parquet"
+        );
+        assert_eq!(deleted_entries[0].snapshot_id(), Some(112));
+        assert_eq!(deleted_entries[0].sequence_number(), Some(1));
+        assert_eq!(deleted_entries[0].file_sequence_number, Some(1));
     }
 
     #[tokio::test]
