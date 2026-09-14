@@ -66,6 +66,7 @@ impl ReplaceFilesMode for Overwrite {
 /// `ReplaceFilesMode`. This wrapper carries the shared implementation instead.
 pub(crate) struct ReplaceFilesOperation<M: ReplaceFilesMode> {
     current_manifests: Option<Vec<ManifestFile>>,
+    affected_manifest_paths: Option<HashSet<String>>,
     manifest_load_concurrency: usize,
     deleted_entries: Mutex<Option<Vec<ManifestEntry>>>,
     _mode: PhantomData<M>,
@@ -75,6 +76,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesOperation<M> {
     pub(crate) fn new() -> Self {
         Self {
             current_manifests: None,
+            affected_manifest_paths: None,
             manifest_load_concurrency: DEFAULT_MANIFEST_LOAD_CONCURRENCY,
             deleted_entries: Mutex::new(None),
             _mode: PhantomData,
@@ -83,10 +85,12 @@ impl<M: ReplaceFilesMode> ReplaceFilesOperation<M> {
 
     fn with_current_manifests(
         current_manifests: Vec<ManifestFile>,
+        affected_manifest_paths: Option<HashSet<String>>,
         manifest_load_concurrency: usize,
     ) -> Self {
         Self {
             current_manifests: Some(current_manifests),
+            affected_manifest_paths,
             manifest_load_concurrency,
             deleted_entries: Mutex::new(None),
             _mode: PhantomData,
@@ -223,8 +227,16 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         }))
             .map(|manifest_file| {
                 let file_io = file_io.clone();
+                let should_load = self
+                    .affected_manifest_paths
+                    .as_ref()
+                    .is_none_or(|paths| paths.contains(&manifest_file.manifest_path));
                 async move {
-                    let manifest = manifest_file.load_manifest(&file_io).await?;
+                    let manifest = if should_load {
+                        Some(manifest_file.load_manifest(&file_io).await?)
+                    } else {
+                        None
+                    };
                     Result::Ok((manifest_file, manifest))
                 }
             })
@@ -232,6 +244,10 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
         while let Some(manifest) = manifests.next().await {
             let (manifest_file, manifest) = manifest?;
+            let Some(manifest) = manifest else {
+                existing_files.push(manifest_file);
+                continue;
+            };
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()
@@ -723,10 +739,6 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
         snapshot_producer.validate_added_files(&self.added_delete_files)?;
 
         let current_manifests = self.current_manifests(table).await?;
-        let operation = ReplaceFilesOperation::<M>::with_current_manifests(
-            current_manifests.clone(),
-            self.manifest_load_concurrency,
-        );
         let is_retry = prepared.is_some();
         let has_new_delete_manifest = prepared
             .as_ref()
@@ -738,7 +750,7 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                 .await?
         {
             let summary = snapshot_producer
-                .prepare_summary(&operation)
+                .prepare_summary(&ReplaceFilesOperation::<M>::new())
                 .map_err(|err| {
                     crate::Error::new(
                         crate::ErrorKind::Unexpected,
@@ -773,21 +785,32 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
 
         // A cache-invalidating retry must prove that every planned input still
         // exists before it can safely add the already-produced replacement.
-        if self.check_file_existence {
-            snapshot_producer
-                .validate_data_file_changes_with_manifests(
-                    &current_manifests,
-                    self.manifest_load_concurrency,
-                )
-                .await?;
+        let affected_manifest_paths = if self.check_file_existence {
+            Some(
+                snapshot_producer
+                    .validate_data_file_changes_with_manifests(
+                        &current_manifests,
+                        self.manifest_load_concurrency,
+                    )
+                    .await?,
+            )
         } else if is_retry {
-            snapshot_producer
-                .validate_removed_data_files_with_manifests(
-                    &current_manifests,
-                    self.manifest_load_concurrency,
-                )
-                .await?;
-        }
+            Some(
+                snapshot_producer
+                    .validate_removed_data_files_with_manifests(
+                        &current_manifests,
+                        self.manifest_load_concurrency,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let operation = ReplaceFilesOperation::<M>::with_current_manifests(
+            current_manifests.clone(),
+            affected_manifest_paths,
+            self.manifest_load_concurrency,
+        );
         let summary = snapshot_producer
             .prepare_summary(&operation)
             .map_err(|err| {
@@ -1214,10 +1237,14 @@ mod tests {
         );
 
         table.file_io().delete(manifest_list_path).await.unwrap();
-        producer
+        let affected = producer
             .validate_data_file_changes_with_manifests(&[manifest], 1)
             .await
             .unwrap();
+        assert_eq!(
+            affected,
+            HashSet::from(["memory:///test/location/metadata/validation-source.avro".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -1231,14 +1258,21 @@ mod tests {
             retained,
         ])
         .await;
+        let unaffected_manifest_path =
+            "memory:///test/location/metadata/fused-unaffected-source.avro";
+        let unaffected_manifest =
+            write_retry_test_manifest(&base, unaffected_manifest_path, 112, 1, vec![
+                retry_test_data_file("test/fused-unaffected.parquet"),
+            ])
+            .await;
         let snapshot = write_retry_test_snapshot(
             &base,
             "memory:///test/location/metadata/fused-list.avro",
             112,
             1,
             None,
-            vec![manifest.clone()],
-            2,
+            vec![manifest.clone(), unaffected_manifest.clone()],
+            3,
         )
         .await;
         let table = retry_test_table_at_snapshot(&base, snapshot);
@@ -1252,10 +1286,21 @@ mod tests {
             vec![removed],
             vec![],
         );
-        let operation = ReplaceFilesOperation::<Rewrite>::with_current_manifests(vec![manifest], 1);
+        let operation = ReplaceFilesOperation::<Rewrite>::with_current_manifests(
+            vec![manifest, unaffected_manifest.clone()],
+            Some(HashSet::from([manifest_path.to_string()])),
+            1,
+        );
 
+        // Unaffected descriptors must be carried forward without opening their bodies.
+        table
+            .file_io()
+            .delete(unaffected_manifest_path)
+            .await
+            .unwrap();
         let existing = operation.existing_manifest(&mut producer).await.unwrap();
-        assert_eq!(existing.len(), 1);
+        assert_eq!(existing.len(), 2);
+        assert_eq!(existing[1], unaffected_manifest);
 
         // The deleted entry must come from the survivor pass, not a second source read.
         table.file_io().delete(manifest_path).await.unwrap();

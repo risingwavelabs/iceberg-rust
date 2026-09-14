@@ -215,14 +215,16 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub(crate) async fn validate_data_file_changes(&self) -> Result<()> {
-        self.validate_data_file_changes_impl(true, None, None).await
+        self.validate_data_file_changes_impl(true, None, None)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn validate_data_file_changes_with_manifests(
         &self,
         manifest_files: &[ManifestFile],
         concurrency_limit: usize,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         self.validate_data_file_changes_impl(true, Some(manifest_files), Some(concurrency_limit))
             .await
     }
@@ -231,7 +233,7 @@ impl<'a> SnapshotProducer<'a> {
         &self,
         manifest_files: &[ManifestFile],
         concurrency_limit: usize,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         self.validate_data_file_changes_impl(false, Some(manifest_files), Some(concurrency_limit))
             .await
     }
@@ -241,7 +243,7 @@ impl<'a> SnapshotProducer<'a> {
         validate_additions: bool,
         manifest_files: Option<&[ManifestFile]>,
         concurrency_limit: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         let mut files_to_delete: HashSet<DataFileIdentity> = self
             .removed_data_files
             .iter()
@@ -260,12 +262,12 @@ impl<'a> SnapshotProducer<'a> {
         };
 
         if files_to_add.is_empty() && files_to_delete.is_empty() {
-            return Ok(());
+            return Ok(HashSet::new());
         }
 
         let Some(snapshot) = self.table.metadata().snapshot_for_ref(&self.target_branch) else {
             if files_to_delete.is_empty() {
-                return Ok(());
+                return Ok(HashSet::new());
             }
             let mut paths = files_to_delete
                 .iter()
@@ -300,15 +302,21 @@ impl<'a> SnapshotProducer<'a> {
         let mut manifests = futures::stream::iter(manifest_files)
             .map(|manifest_file| {
                 let file_io = file_io.clone();
-                async move { manifest_file.load_manifest(&file_io).await }
+                async move {
+                    let manifest_path = manifest_file.manifest_path.clone();
+                    let manifest = manifest_file.load_manifest(&file_io).await?;
+                    Result::Ok((manifest_path, manifest))
+                }
             })
             .buffer_unordered(concurrency_limit);
         let mut duplicate_files = HashSet::new();
         let mut found_deletes = HashSet::new();
         let mut duplicate_deletes = HashSet::new();
+        let mut affected_manifests = HashSet::new();
 
         while let Some(manifest) = manifests.next().await {
-            let manifest = manifest?;
+            let (manifest_path, manifest) = manifest?;
+            let mut manifest_is_affected = false;
             for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
                 let identity = data_file_identity(entry.data_file());
                 if files_to_add.contains(&identity) {
@@ -318,7 +326,12 @@ impl<'a> SnapshotProducer<'a> {
                 {
                     duplicate_deletes.insert(identity.clone());
                 }
-                files_to_delete.remove(&identity);
+                if files_to_delete.remove(&identity) || requested_deletes.contains(&identity) {
+                    manifest_is_affected = true;
+                }
+            }
+            if manifest_is_affected {
+                affected_manifests.insert(manifest_path);
             }
         }
 
@@ -367,7 +380,7 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        Ok(())
+        Ok(affected_manifests)
     }
 
     pub(crate) fn generate_unique_snapshot_id(table: &Table) -> i64 {
