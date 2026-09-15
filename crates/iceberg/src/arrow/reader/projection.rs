@@ -571,14 +571,42 @@ fn apply_name_mapping_to_field(
     field: &arrow_schema::FieldRef,
     siblings: &[&MappedField],
 ) -> arrow_schema::FieldRef {
-    let mapped = siblings
-        .iter()
-        .find(|f| f.names().contains(&field.name().to_string()));
+    apply_mapped_field(field, find_mapped_field(siblings, field.name()))
+}
 
+/// Find the entry for `name` within one level of a name mapping.
+fn find_mapped_field<'a>(candidates: &[&'a MappedField], name: &str) -> Option<&'a MappedField> {
+    candidates
+        .iter()
+        .copied()
+        .find(|f| f.names().iter().any(|n| n == name))
+}
+
+/// Apply an already-resolved mapping entry to `field`, then recurse into its children.
+///
+/// A list's element and a map's key/value are resolved by the spec's canonical names
+/// (`element`, `key`, `value`) rather than by the child's physical Parquet/Arrow name,
+/// because that is the only name a mapping ever carries for them: "List types should
+/// contain a mapping in `fields` for `element`. Map types should contain mappings in
+/// `fields` for `key` and `value`". Java normalizes the same way —
+/// `ApplyNameMapping::beforeElementField`/`beforeKeyField`/`beforeValueField` push those
+/// constants onto the lookup path instead of the actual field names — and pyiceberg
+/// follows suit.
+///
+/// This matters for exactly the files that need a name mapping in the first place:
+/// arrow-rs and DataFusion write the list child as `item` and maps as
+/// `entries{keys, values}`, and legacy Spark/Hive write `array`/`array_element`. Matching
+/// on the physical name would leave those children ID-less, so projection could not
+/// resolve the leaf and the column would be silently null-filled.
+///
+/// Struct children keep ordinary name matching, since a struct's mapping entries are
+/// keyed by the real field names.
+fn apply_mapped_field(
+    field: &arrow_schema::FieldRef,
+    mapped: Option<&MappedField>,
+) -> arrow_schema::FieldRef {
     let mut metadata = field.metadata().clone();
-    if let Some(mapped) = mapped
-        && let Some(field_id) = mapped.field_id()
-    {
+    if let Some(field_id) = mapped.and_then(|m| m.field_id()) {
         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
     }
 
@@ -589,13 +617,12 @@ fn apply_name_mapping_to_field(
         .unwrap_or_default();
     let children = children.as_slice();
 
+    let element = || find_mapped_field(children, "element");
     let data_type = match field.data_type() {
-        DataType::List(child) => DataType::List(apply_name_mapping_to_field(child, children)),
-        DataType::LargeList(child) => {
-            DataType::LargeList(apply_name_mapping_to_field(child, children))
-        }
+        DataType::List(child) => DataType::List(apply_mapped_field(child, element())),
+        DataType::LargeList(child) => DataType::LargeList(apply_mapped_field(child, element())),
         DataType::FixedSizeList(child, len) => {
-            DataType::FixedSizeList(apply_name_mapping_to_field(child, children), *len)
+            DataType::FixedSizeList(apply_mapped_field(child, element()), *len)
         }
         DataType::Struct(fields) => DataType::Struct(
             fields
@@ -603,22 +630,25 @@ fn apply_name_mapping_to_field(
                 .map(|f| apply_name_mapping_to_field(f, children))
                 .collect(),
         ),
-        // A Map's entries are a struct of {key, value}; the mapping describes key/value
-        // directly, so match the entry struct's children against the map's own children.
+        // A Map's entries are a struct of {key, value} and the mapping describes key/value
+        // directly (there is no entry for the intermediate struct, and Java's
+        // `beforeRepeatedKeyValue` likewise contributes nothing to the path), so resolve
+        // the entry struct's two children positionally as key then value — which is what
+        // Java's visitor does: `beforeKeyField(fields[0])`, `beforeValueField(fields[1])`.
         DataType::Map(entries, sorted) => {
             let mapped_entries = match entries.data_type() {
-                DataType::Struct(kv) => Arc::new(
-                    Field::new(
-                        entries.name(),
-                        DataType::Struct(
-                            kv.iter()
-                                .map(|f| apply_name_mapping_to_field(f, children))
-                                .collect(),
-                        ),
-                        entries.is_nullable(),
+                DataType::Struct(kv) if kv.len() == 2 => {
+                    let kv = arrow_schema::Fields::from(vec![
+                        apply_mapped_field(&kv[0], find_mapped_field(children, "key")),
+                        apply_mapped_field(&kv[1], find_mapped_field(children, "value")),
+                    ]);
+                    Arc::new(
+                        entries
+                            .as_ref()
+                            .clone()
+                            .with_data_type(DataType::Struct(kv)),
                     )
-                    .with_metadata(entries.metadata().clone()),
-                ),
+                }
                 _ => entries.clone(),
             };
             DataType::Map(mapped_entries, *sorted)
@@ -626,7 +656,15 @@ fn apply_name_mapping_to_field(
         other => other.clone(),
     };
 
-    Arc::new(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
+    // Rebuild from the original field rather than `Field::new`, so attributes beyond
+    // name/type/nullability survive.
+    Arc::new(
+        field
+            .as_ref()
+            .clone()
+            .with_data_type(data_type)
+            .with_metadata(metadata),
+    )
 }
 
 /// Add position-based fallback field IDs to Arrow schema for Parquet files lacking them.
@@ -685,6 +723,7 @@ mod tests {
     use parquet::schema::types::SchemaDescriptor;
     use tempfile::TempDir;
 
+    use super::apply_name_mapping_to_arrow_schema;
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
@@ -2645,6 +2684,285 @@ message schema {
         assert!(
             msg.contains("cannot cast list") && msg.contains("non-list"),
             "expected a cast failure, got: {err}"
+        );
+    }
+
+    fn mapped_field_id(field: &Field) -> Option<i32> {
+        field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .map(|id| id.parse().unwrap())
+    }
+
+    /// A list's `element` and a map's `key`/`value` must be resolved by those canonical
+    /// names rather than by the child's physical name, because that is the only name a
+    /// mapping ever carries for them (spec: "List types should contain a mapping in
+    /// `fields` for `element`. Map types should contain mappings in `fields` for `key` and
+    /// `value`"), and it is what Java does — `ApplyNameMapping`'s
+    /// `beforeElementField`/`beforeKeyField`/`beforeValueField` push the constants onto
+    /// the lookup path instead of the actual names.
+    ///
+    /// This matters precisely for the files that need a name mapping: arrow-rs and
+    /// DataFusion write the list child as `item` and maps as `entries{keys, values}`,
+    /// legacy Spark/Hive write `array`/`array_element`. Matching on the physical name
+    /// leaves those children ID-less, so projection cannot resolve the leaf and the
+    /// column is silently null-filled.
+    #[test]
+    fn test_name_mapping_resolves_nested_children_by_canonical_name() {
+        // Physical names as arrow-rs writes them: nothing is called `element`/`key`/`value`.
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "props",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("keys", DataType::Utf8, false)),
+                                Arc::new(Field::new(
+                                    "values",
+                                    DataType::Struct(
+                                        vec![Arc::new(Field::new("unit", DataType::Utf8, true))]
+                                            .into(),
+                                    ),
+                                    true,
+                                )),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+
+        // Shaped like any mapping derived from an Iceberg schema (Java's
+        // `MappingUtil.create`, or this crate's schema conversion).
+        let mapping = NameMapping::new(vec![
+            MappedField::new(Some(1), vec!["tags".to_string()], vec![MappedField::new(
+                Some(2),
+                vec!["element".to_string()],
+                vec![],
+            )]),
+            MappedField::new(Some(3), vec!["props".to_string()], vec![
+                MappedField::new(Some(4), vec!["key".to_string()], vec![]),
+                MappedField::new(Some(5), vec!["value".to_string()], vec![MappedField::new(
+                    Some(6),
+                    vec!["unit".to_string()],
+                    vec![],
+                )]),
+            ]),
+        ]);
+
+        let mapped = apply_name_mapping_to_arrow_schema(file_schema, &mapping).unwrap();
+
+        let tags = mapped.field_with_name("tags").unwrap();
+        assert_eq!(mapped_field_id(tags), Some(1));
+        let DataType::List(element) = tags.data_type() else {
+            panic!("expected a list, got {}", tags.data_type());
+        };
+        assert_eq!(
+            element.name(),
+            "item",
+            "the file's physical child name must be preserved"
+        );
+        assert_eq!(
+            mapped_field_id(element),
+            Some(2),
+            "list child must resolve through the mapping's `element`"
+        );
+
+        let props = mapped.field_with_name("props").unwrap();
+        assert_eq!(mapped_field_id(props), Some(3));
+        let DataType::Map(entries, _) = props.data_type() else {
+            panic!("expected a map, got {}", props.data_type());
+        };
+        let DataType::Struct(kv) = entries.data_type() else {
+            panic!("expected a struct, got {}", entries.data_type());
+        };
+        assert_eq!(
+            (mapped_field_id(&kv[0]), mapped_field_id(&kv[1])),
+            (Some(4), Some(5)),
+            "map entries must resolve positionally through `key` then `value`"
+        );
+
+        // Struct children keep ordinary name matching, here below a map value.
+        let DataType::Struct(value_fields) = kv[1].data_type() else {
+            panic!("expected a struct, got {}", kv[1].data_type());
+        };
+        assert_eq!(mapped_field_id(&value_fields[0]), Some(6));
+    }
+
+    /// End-to-end counterpart of the above: a field-ID-less file written with arrow-rs
+    /// default child names, read through a spec-conventional mapping. Both nested columns
+    /// must come back populated rather than null-filled.
+    async fn read_arrow_default_child_names_fixture() -> Vec<RecordBatch> {
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+        use arrow_array::{Int32Array, ListArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "tags",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                3,
+                                Type::Primitive(PrimitiveType::String),
+                                true,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        4,
+                        "props",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(5, Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::map_value_element(
+                                6,
+                                Type::Primitive(PrimitiveType::Int),
+                                true,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // arrow-rs defaults: the list child is `item`, the map is `entries{keys, values}`.
+        let tags = Arc::new(ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0, 2, 3].into()),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            None,
+        )) as ArrayRef;
+        let mut props = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        props.keys().append_value("k1");
+        props.values().append_value(1);
+        props.append(true).unwrap();
+        props.keys().append_value("k2");
+        props.values().append_value(2);
+        props.append(true).unwrap();
+        let props = Arc::new(props.finish()) as ArrayRef;
+        let id = Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef;
+
+        // Sanity: the point of the fixture is that no child is named
+        // `element`/`key`/`value`, so a spec-conventional mapping cannot match on the
+        // physical names.
+        let DataType::List(item) = tags.data_type() else {
+            panic!("expected a list, got {}", tags.data_type());
+        };
+        let DataType::Map(entries, _) = props.data_type() else {
+            panic!("expected a map, got {}", props.data_type());
+        };
+        let DataType::Struct(kv) = entries.data_type() else {
+            panic!("expected a struct, got {}", entries.data_type());
+        };
+        assert_eq!(
+            [
+                item.name().as_str(),
+                kv[0].name().as_str(),
+                kv[1].name().as_str()
+            ],
+            ["item", "keys", "values"],
+            "fixture must exercise arrow-rs' default nested child names"
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tags", tags.data_type().clone(), true),
+            Field::new("props", props.data_type().clone(), true),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = format!("{}/1.parquet", tmp_dir.path().to_str().unwrap());
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![id, tags, props]).unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, to_write.schema(), None).unwrap();
+        writer.write(&to_write).expect("writing batch");
+        writer.close().unwrap();
+
+        let mapping = NameMapping::new(vec![
+            MappedField::new(Some(1), vec!["id".to_string()], vec![]),
+            MappedField::new(Some(2), vec!["tags".to_string()], vec![MappedField::new(
+                Some(3),
+                vec!["element".to_string()],
+                vec![],
+            )]),
+            MappedField::new(Some(4), vec!["props".to_string()], vec![
+                MappedField::new(Some(5), vec!["key".to_string()], vec![]),
+                MappedField::new(Some(6), vec!["value".to_string()], vec![]),
+            ]),
+        ]);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1, 2, 4])
+            .with_case_sensitive(false)
+            .with_name_mapping(Some(Arc::new(mapping)))
+            .build())])) as FileScanTaskStream;
+
+        reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("name mapping must bind nested columns by canonical name")
+    }
+
+    #[tokio::test]
+    async fn test_name_mapping_resolves_arrow_default_child_names() {
+        let batches = read_arrow_default_child_names_fixture().await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        let tags = batch.column(1).as_list::<i32>();
+        assert_eq!(
+            tags.null_count(),
+            0,
+            "list child `item` must resolve via the mapping's `element`"
+        );
+        assert_eq!(tags.value(0).as_string::<i32>().value(1), "b");
+        assert_eq!(tags.value(1).as_string::<i32>().value(0), "c");
+
+        let props = batch.column(2).as_map();
+        assert_eq!(
+            props.null_count(),
+            0,
+            "map `keys`/`values` must resolve via the mapping's `key`/`value`"
+        );
+        assert_eq!(props.keys().as_string::<i32>().value(1), "k2");
+        assert_eq!(
+            props
+                .values()
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(1),
+            2
         );
     }
 }
