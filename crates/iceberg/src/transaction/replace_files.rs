@@ -220,11 +220,12 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         let mut existing_files = Vec::new();
         let mut deleted_entries = Vec::new();
         let file_io = snapshot_produce.table.file_io().clone();
-        let mut manifests = futures::stream::iter(current_manifests.into_iter().filter(|manifest| {
-            // Drop old deletion-only manifests; retained snapshots keep their references.
-            // This commit's deletion entries are written separately.
-            manifest.has_added_files() || manifest.has_existing_files()
-        }))
+        let mut manifests =
+            futures::stream::iter(current_manifests.into_iter().filter(|manifest| {
+                // Drop old deletion-only manifests; retained snapshots keep their references.
+                // This commit's deletion entries are written separately.
+                manifest.has_added_files() || manifest.has_existing_files()
+            }))
             .map(|manifest_file| {
                 let file_io = file_io.clone();
                 let should_load = self
