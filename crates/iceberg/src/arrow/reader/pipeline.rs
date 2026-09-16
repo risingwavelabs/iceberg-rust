@@ -30,6 +30,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, RowNumber};
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
+use super::projection::parquet_schema_has_ids;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema,
@@ -132,15 +133,11 @@ impl FileScanTaskReader {
         )
         .await?;
 
-        // Check if Parquet file has embedded field IDs
-        // Corresponds to Java's ParquetSchemaUtil.hasIds()
-        // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
-        let missing_field_ids = arrow_metadata
-            .schema()
-            .fields()
-            .iter()
-            .next()
-            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
+        // Embedded-id check on the parquet schema itself, any node at any depth
+        // (java's ParquetSchemaUtil.hasIds); predicate resolution uses the same
+        // check, so projection and filtering cannot pick different id sources.
+        let missing_field_ids =
+            !parquet_schema_has_ids(arrow_metadata.metadata().file_metadata().schema_descr());
 
         // Position-based fallback applies only when the file has no embedded field IDs
         // AND no name mapping is available. With a name mapping, field IDs are assigned
@@ -393,18 +390,18 @@ impl FileScanTaskReader {
         }
 
         if let Some(predicate) = final_predicate {
-            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
-                record_batch_stream_builder.parquet_schema(),
-                record_batch_stream_builder.schema(),
-                &predicate,
-                use_position_fallback,
-            )?;
+            let (iceberg_field_ids, field_resolution) =
+                ArrowReader::build_field_id_set_and_resolution(
+                    record_batch_stream_builder.parquet_schema(),
+                    record_batch_stream_builder.schema(),
+                    &predicate,
+                )?;
 
             let row_filter = ArrowReader::get_row_filter(
                 &predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
-                &field_id_map,
+                &field_resolution,
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
@@ -412,7 +409,7 @@ impl FileScanTaskReader {
                 let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
                     &predicate,
                     record_batch_stream_builder.metadata(),
-                    &field_id_map,
+                    &field_resolution.leaf_map,
                     &task.schema,
                 )?;
 
@@ -436,7 +433,7 @@ impl FileScanTaskReader {
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
-                    &field_id_map,
+                    &field_resolution.leaf_map,
                     &task.schema,
                 )?;
             }

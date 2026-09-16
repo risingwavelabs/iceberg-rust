@@ -383,16 +383,22 @@ impl Bind for Predicate {
                 })
             }
             Predicate::Unary(expr) => {
-                let bound_expr = expr.bind(schema, case_sensitive)?;
+                let bound_expr = expr.bind(schema.clone(), case_sensitive)?;
 
+                // Like java's UnboundPredicate, a null check folds only when every
+                // ancestor is also required: a null optional ancestor makes even a
+                // required nested field null.
+                let never_null = |field: &crate::spec::NestedField| {
+                    field.required && schema.all_ancestors_required(field.id)
+                };
                 match &bound_expr.op {
                     &PredicateOperator::IsNull => {
-                        if bound_expr.term.field().required {
+                        if never_null(bound_expr.term.field()) {
                             return Ok(BoundPredicate::AlwaysFalse);
                         }
                     }
                     &PredicateOperator::NotNull => {
-                        if bound_expr.term.field().required {
+                        if never_null(bound_expr.term.field()) {
                             return Ok(BoundPredicate::AlwaysTrue);
                         }
                     }
@@ -823,8 +829,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::expr::Predicate::{AlwaysFalse, AlwaysTrue};
-    use crate::expr::{Bind, BoundPredicate, Reference};
-    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::expr::{
+        Bind, BoundPredicate, Predicate, PredicateOperator, Reference, UnaryExpression,
+    };
+    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type, VariantType};
 
     #[test]
     fn test_logical_or_rewrite_not() {
@@ -1025,6 +1033,97 @@ mod tests {
         let serialized = serde_json::to_string(&bound_predicate).unwrap();
         let deserialized: BoundPredicate = serde_json::from_str(&serialized).unwrap();
         assert_eq!(bound_predicate, deserialized);
+    }
+
+    /// IS NULL / IS NOT NULL are the only predicate operators that bind on a
+    /// variant column, like java; every stats/filter evaluator relies on this to
+    /// only handle variant references in its null-check arms.
+    #[test]
+    fn test_bind_predicates_on_variant_column() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        Reference::new("v")
+            .is_null()
+            .bind(schema.clone(), true)
+            .unwrap();
+        Reference::new("v")
+            .is_not_null()
+            .bind(schema.clone(), true)
+            .unwrap();
+
+        for predicate in [
+            Reference::new("v").equal_to(Datum::int(2)),
+            Reference::new("v").less_than(Datum::int(2)),
+            Reference::new("v").starts_with(Datum::string("x")),
+            Reference::new("v").is_in([Datum::int(1), Datum::int(2)]),
+            Predicate::Unary(UnaryExpression::new(
+                PredicateOperator::IsNan,
+                Reference::new("v"),
+            )),
+        ] {
+            predicate.bind(schema.clone(), true).unwrap_err();
+        }
+    }
+
+    /// A null check folds to a constant only when the field and every ancestor
+    /// are required, like java's `allAncestorFieldsAreRequired`.
+    #[test]
+    fn test_bind_null_checks_consider_optional_ancestors() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(
+                        3,
+                        "s",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::required(2, "v", Type::Variant(VariantType)).into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::required(
+                        5,
+                        "t",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::required(4, "w", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // Optional ancestor: the nested field can still be null, no folding.
+        let bound = Reference::new("s.v")
+            .is_null()
+            .bind(schema.clone(), true)
+            .unwrap();
+        assert!(matches!(bound, BoundPredicate::Unary(_)), "{bound:?}");
+        let bound = Reference::new("s.v")
+            .is_not_null()
+            .bind(schema.clone(), true)
+            .unwrap();
+        assert!(matches!(bound, BoundPredicate::Unary(_)), "{bound:?}");
+
+        // Required all the way down: folds to a constant.
+        let bound = Reference::new("t.w")
+            .is_null()
+            .bind(schema.clone(), true)
+            .unwrap();
+        assert!(matches!(bound, BoundPredicate::AlwaysFalse), "{bound:?}");
+        let bound = Reference::new("t.w")
+            .is_not_null()
+            .bind(schema, true)
+            .unwrap();
+        assert!(matches!(bound, BoundPredicate::AlwaysTrue), "{bound:?}");
     }
 
     #[test]

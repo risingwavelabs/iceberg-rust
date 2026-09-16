@@ -19,7 +19,7 @@
 //! Arrow-level evaluation: collecting referenced field IDs and producing
 //! per-record-batch predicate closures.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
@@ -32,8 +32,10 @@ use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, DataType};
 use arrow_string::like::starts_with;
 use fnv::FnvHashSet;
-use parquet::schema::types::SchemaDescriptor;
+use parquet::basic::Type as PhysicalType;
+use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
+use super::projection::{FileFieldResolution, GroupFieldLocation};
 use crate::arrow::get_arrow_datum;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::BoundPredicateVisitor;
@@ -200,10 +202,55 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
 pub(super) struct PredicateConverter<'a> {
     /// The Parquet schema descriptor.
     pub(super) parquet_schema: &'a SchemaDescriptor,
-    /// The map between field id and leaf column index in Parquet schema.
-    pub(super) column_map: &'a HashMap<i32, usize>,
+    /// Where this file's field ids resolve (leaf columns and id-carrying groups).
+    pub(super) resolution: &'a FileFieldResolution,
     /// The required column indices in Parquet schema for the predicates.
     pub(super) column_indices: &'a Vec<usize>,
+}
+
+/// Where a variant reference evaluates in the filter batch: the top-level column,
+/// plus the struct-field names to walk down to the variant's storage group.
+struct VariantEvalTarget {
+    batch_position: usize,
+    descent: Vec<String>,
+}
+
+/// The variant's validity: AND-ed down from the top-level column so a null
+/// ancestor struct makes the variant null, like java's null-layer accessors.
+fn variant_is_defined(
+    batch: &RecordBatch,
+    target: &VariantEvalTarget,
+) -> std::result::Result<BooleanArray, ArrowError> {
+    let mut column = batch.column(target.batch_position).clone();
+    let mut defined = is_not_null(&column)?;
+    for name in &target.descent {
+        let child = column
+            .as_struct_opt()
+            .and_then(|strct| strct.column_by_name(name))
+            .ok_or_else(|| {
+                ArrowError::SchemaError(format!(
+                    "Cannot descend to variant column: no struct child `{name}` in {}",
+                    column.data_type()
+                ))
+            })?
+            .clone();
+        defined = and(&defined, &is_not_null(&child)?)?;
+        column = child;
+    }
+    Ok(defined)
+}
+
+/// A variant column's value is opaque binary that cannot be compared with a datum.
+/// Binding already rejects these operators on variant columns, so this is only
+/// reachable through a hand-crafted scan task; refuse rather than guess.
+fn unsupported_variant_predicate(reference: &BoundReference) -> Error {
+    Error::new(
+        ErrorKind::FeatureUnsupported,
+        format!(
+            "Cannot evaluate predicate on variant column `{}`",
+            reference.field().name
+        ),
+    )
 }
 
 impl PredicateConverter<'_> {
@@ -212,8 +259,12 @@ impl PredicateConverter<'_> {
     /// Return None if the field id is not found in the column map, which is possible
     /// due to schema evolution.
     fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<usize>> {
+        if reference.is_variant() {
+            return Err(unsupported_variant_predicate(reference));
+        }
+
         // The leaf column's index in Parquet schema.
-        if let Some(column_idx) = self.column_map.get(&reference.field().id) {
+        if let Some(column_idx) = self.resolution.leaf_map.get(&reference.field().id) {
             if self.parquet_schema.get_column_root(*column_idx).is_group() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -224,23 +275,143 @@ impl PredicateConverter<'_> {
                 ));
             }
 
-            // The leaf column's index in the required column indices.
-            let index = self
-                .column_indices
-                .iter()
-                .position(|&idx| idx == *column_idx)
-                .ok_or(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
+            let index = self.batch_column_position(*column_idx).ok_or(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
                 "Leaf column `{}` in predicates cannot be found in the required column indices.",
                 reference.field().name
             ),
-                ))?;
+            ))?;
 
             Ok(Some(index))
         } else {
+            self.check_unresolved_reference(reference)?;
             Ok(None)
         }
+    }
+
+    /// An unresolved reference means "column missing" only when the id source
+    /// could have seen it: name mapping / position fallback assign top-level ids
+    /// only, so a nested reference on an id-less file is undecidable and must
+    /// error (java's recursive ApplyNameMapping resolves it instead).
+    fn check_unresolved_reference(&self, reference: &BoundReference) -> Result<()> {
+        if self.resolution.ids_from_arrow && reference.accessor().is_nested() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Cannot resolve nested column `{}` on a file without embedded field ids",
+                    reference.field().name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The filter batch contains one top-level column per distinct root among the
+    /// projected leaves, in leaf order (Parquet leaves of one root are contiguous,
+    /// and `column_indices` is sorted). Map a projected leaf to its batch column.
+    fn batch_column_position(&self, leaf_idx: usize) -> Option<usize> {
+        debug_assert!(
+            self.column_indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "column_indices must be sorted and deduplicated"
+        );
+        let mut roots_seen = 0;
+        let mut prev_root = None;
+        for &projected_leaf in self.column_indices {
+            let root = self.parquet_schema.get_column_root_idx(projected_leaf);
+            if prev_root != Some(root) {
+                prev_root = Some(root);
+                roots_seen += 1;
+            }
+            if projected_leaf == leaf_idx {
+                return Some(roots_seen - 1);
+            }
+        }
+        None
+    }
+
+    /// Resolve a variant reference (a group-level field id) to where it evaluates
+    /// in the filter batch. Returns None if the column is missing from the file,
+    /// so the unary arms can apply exact missing-column semantics.
+    fn bound_variant_reference(
+        &mut self,
+        reference: &BoundReference,
+    ) -> Result<Option<VariantEvalTarget>> {
+        let field_id = reference.field().id;
+        let Some(location) = self.resolution.group_map.get(&field_id) else {
+            if self.resolution.leaf_map.contains_key(&field_id) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Field id {field_id} of variant column `{}` resolves to a non-group column in this file",
+                        reference.field().name
+                    ),
+                ));
+            }
+            self.check_unresolved_reference(reference)?;
+            return Ok(None);
+        };
+
+        self.validate_variant_storage(location, reference)?;
+
+        let batch_position = self
+            .batch_column_position(location.first_leaf_idx)
+            .ok_or(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Variant column `{}` in predicates cannot be found in the required column indices.",
+                    reference.field().name
+                ),
+            ))?;
+
+        Ok(Some(VariantEvalTarget {
+            batch_position,
+            descent: location.path[1..].to_vec(),
+        }))
+    }
+
+    /// The resolved group must hold variant storage — a binary `metadata` child,
+    /// present in both shredded and unshredded layouts. A filter-only reference
+    /// would otherwise silently evaluate a mismatched column's validity.
+    fn validate_variant_storage(
+        &self,
+        location: &GroupFieldLocation,
+        reference: &BoundReference,
+    ) -> Result<()> {
+        let mismatch = || {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Column `{}` of variant type is not stored as variant in this file",
+                    reference.field().name
+                ),
+            )
+        };
+
+        let mut fields = self.parquet_schema.root_schema().get_fields();
+        let mut group = None;
+        for name in &location.path {
+            let field = fields
+                .iter()
+                .find(|field| field.name() == name.as_str())
+                .ok_or_else(mismatch)?;
+            fields = match field.as_ref() {
+                ParquetType::GroupType { fields, .. } => fields,
+                ParquetType::PrimitiveType { .. } => return Err(mismatch()),
+            };
+            group = Some(field);
+        }
+        let has_binary_metadata = group.is_some_and(|group| {
+            group.as_ref().get_fields().iter().any(|child| {
+                child.name() == "metadata"
+                    && child.is_primitive()
+                    && child.get_physical_type() == PhysicalType::BYTE_ARRAY
+            })
+        });
+        if !has_binary_metadata {
+            return Err(mismatch());
+        }
+        Ok(())
     }
 
     /// Build an Arrow predicate that always returns true.
@@ -353,6 +524,16 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
+        if reference.is_variant() {
+            return match self.bound_variant_reference(reference)? {
+                Some(target) => Ok(Box::new(move |batch| {
+                    let defined = variant_is_defined(&batch, &target)?;
+                    not(&defined)
+                })),
+                // A missing column, treating it as null.
+                None => self.build_always_true(),
+            };
+        }
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
                 let column = project_column(&batch, idx)?;
@@ -369,6 +550,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
+        if reference.is_variant() {
+            return match self.bound_variant_reference(reference)? {
+                Some(target) => Ok(Box::new(move |batch| variant_is_defined(&batch, &target))),
+                // A missing column, treating it as null.
+                None => self.build_always_false(),
+            };
+        }
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
                 let column = project_column(&batch, idx)?;
@@ -665,7 +853,7 @@ mod tests {
     use parquet::schema::parser::parse_message_type;
     use parquet::schema::types::SchemaDescriptor;
 
-    use super::{CollectFieldIdVisitor, PredicateConverter};
+    use super::{CollectFieldIdVisitor, FileFieldResolution, PredicateConverter};
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, Predicate, Reference};
     use crate::spec::{NestedField, PrimitiveType, Schema, SchemaRef, Type};
@@ -759,12 +947,16 @@ mod tests {
         let parquet_type = parse_message_type(message_type).expect("parse schema");
         let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
 
-        let column_map = HashMap::from([(4i32, 0usize)]);
+        let resolution = FileFieldResolution {
+            leaf_map: HashMap::from([(4i32, 0usize)]),
+            group_map: HashMap::new(),
+            ids_from_arrow: false,
+        };
         let column_indices = vec![0usize];
 
         let mut converter = PredicateConverter {
             parquet_schema: &parquet_schema,
-            column_map: &column_map,
+            resolution: &resolution,
             column_indices: &column_indices,
         };
 

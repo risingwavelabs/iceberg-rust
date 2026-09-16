@@ -26,7 +26,7 @@ use crate::expr::accessor::{StructAccessor, StructAccessorRef};
 use crate::expr::{
     BinaryExpression, Bind, Predicate, PredicateOperator, SetExpression, UnaryExpression,
 };
-use crate::spec::{Datum, NestedField, NestedFieldRef, SchemaRef};
+use crate::spec::{Datum, NestedField, NestedFieldRef, SchemaRef, Type};
 use crate::{Error, ErrorKind};
 
 /// Unbound term before binding to a schema.
@@ -365,6 +365,10 @@ impl BoundReference {
     /// Return the field of this reference.
     pub fn field(&self) -> &NestedField {
         &self.field
+    }
+
+    pub(crate) fn is_variant(&self) -> bool {
+        matches!(self.field.field_type.as_ref(), Type::Variant(_))
     }
 
     /// Get this BoundReference's Accessor

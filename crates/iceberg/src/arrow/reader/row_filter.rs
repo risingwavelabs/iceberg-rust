@@ -28,6 +28,7 @@ use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
+use super::projection::FileFieldResolution;
 use super::{ArrowReader, PredicateConverter};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
@@ -41,20 +42,31 @@ impl ArrowReader {
         predicates: &BoundPredicate,
         parquet_schema: &SchemaDescriptor,
         iceberg_field_ids: &HashSet<i32>,
-        field_id_map: &HashMap<i32, usize>,
+        resolution: &FileFieldResolution,
     ) -> Result<RowFilter> {
-        // Collect Parquet column indices from field ids.
-        // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
+        // The Parquet leaf to project per referenced field id (a group-level id
+        // projects its first leaf); unresolvable ids are ignored due to schema evolution.
         let mut column_indices = iceberg_field_ids
             .iter()
-            .filter_map(|field_id| field_id_map.get(field_id).cloned())
+            .filter_map(|field_id| {
+                resolution.leaf_map.get(field_id).copied().or_else(|| {
+                    resolution
+                        .group_map
+                        .get(field_id)
+                        .map(|location| location.first_leaf_idx)
+                })
+            })
             .collect::<Vec<_>>();
-        column_indices.sort();
+        column_indices.sort_unstable();
+        column_indices.dedup();
+        // May be empty when the predicate references only columns missing from this
+        // file: every arm is then a constant, and an empty projection still yields
+        // filter batches with the right row count.
 
         // The converter that converts `BoundPredicates` to `ArrowPredicates`
         let mut converter = PredicateConverter {
             parquet_schema,
-            column_map: field_id_map,
+            resolution,
             column_indices: &column_indices,
         };
 

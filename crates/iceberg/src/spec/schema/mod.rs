@@ -208,6 +208,10 @@ impl SchemaBuilder {
                         map.insert(field_id, new_accessor.clone());
                     }
                 }
+                Type::Variant(_) => {
+                    // A variant is a leaf: position-only accessor so unary predicates can bind.
+                    map.insert(field.id, Arc::new(StructAccessor::new_variant(pos)));
+                }
                 _ => {
                     // Accessors don't get built for Map or List types
                 }
@@ -235,6 +239,9 @@ impl SchemaBuilder {
                         });
 
                     results.extend(wrapped_nested_accessors);
+                }
+                Type::Variant(_) => {
+                    results.push((field.id, Box::new(StructAccessor::new_variant(pos))));
                 }
                 _ => {
                     // Accessors don't get built for Map or List types
@@ -374,6 +381,22 @@ impl Schema {
     #[inline]
     pub fn schema_id(&self) -> SchemaId {
         self.schema_id
+    }
+
+    /// Whether every ancestor of the field is a required struct field, so the
+    /// field can never be null through a null ancestor.
+    pub(crate) fn all_ancestors_required(&self, field_id: i32) -> bool {
+        let Ok(id_to_parent) = index_parents(&self.r#struct) else {
+            return false;
+        };
+        let mut current = field_id;
+        while let Some(&parent) = id_to_parent.get(&current) {
+            match self.field_by_id(parent) {
+                Some(field) if field.required => current = parent,
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Returns [`r#struct`].
