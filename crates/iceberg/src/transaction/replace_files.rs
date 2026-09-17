@@ -368,9 +368,6 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
 }
 
 /// Rewrites files without changing table data — compaction and friends.
-///
-/// A retry that removes data files rejects changed delete-manifest descriptors. Reusing
-/// replacement data prepared against a stale delete set could lose or resurrect rows.
 pub type RewriteFilesAction = ReplaceFilesAction<Rewrite>;
 
 /// Rewrites files as a logical overwrite.
@@ -583,11 +580,18 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             .cloned()
             .collect();
 
-        // Delete manifests and backdated data can change delete applicability.
+        // Backdated data requires full preparation. Delete manifests are checked entry by entry
+        // below because newer equality and referenced position deletes can be carried forward.
         if delta.iter().any(|manifest| {
-            manifest.content != ManifestContentType::Data
-                || manifest.min_sequence_number == UNASSIGNED_SEQUENCE_NUMBER
-                || manifest.min_sequence_number < prepared.last_sequence_number
+            manifest.min_sequence_number == UNASSIGNED_SEQUENCE_NUMBER
+                || match manifest.content {
+                    ManifestContentType::Data => {
+                        manifest.min_sequence_number < prepared.last_sequence_number
+                    }
+                    ManifestContentType::Deletes => {
+                        manifest.min_sequence_number <= prepared.last_sequence_number
+                    }
+                }
         }) {
             return Ok(None);
         }
@@ -624,28 +628,34 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
                 {
                     return Ok(None);
                 }
+
+                if manifest_file.content == ManifestContentType::Deletes {
+                    match file.content_type() {
+                        DataContentType::EqualityDeletes => {
+                            let Some(new_data_sequence_number) = self.new_data_file_sequence_number
+                            else {
+                                return Ok(None);
+                            };
+                            if entry.sequence_number().is_none_or(|sequence_number| {
+                                sequence_number <= new_data_sequence_number
+                            }) {
+                                return Ok(None);
+                            }
+                        }
+                        DataContentType::PositionDeletes => {
+                            if file.referenced_data_file().is_none_or(|referenced| {
+                                removed_data_paths.contains(referenced.as_str())
+                            }) {
+                                return Ok(None);
+                            }
+                        }
+                        DataContentType::Data => return Ok(None),
+                    }
+                }
             }
         }
 
         Ok(Some(delta))
-    }
-
-    fn delete_manifests_changed(
-        prepared: &PreparedRewriteFiles,
-        current_manifests: &[ManifestFile],
-    ) -> bool {
-        // Full descriptor equality deliberately treats metadata-only rewrites as conflicts. A
-        // future optimization could inspect delete applicability before rejecting the retry.
-        let prepared_deletes: HashSet<_> = prepared
-            .source_manifests
-            .iter()
-            .filter(|manifest| manifest.content == ManifestContentType::Deletes)
-            .collect();
-        let current_deletes: HashSet<_> = current_manifests
-            .iter()
-            .filter(|manifest| manifest.content == ManifestContentType::Deletes)
-            .collect();
-        prepared_deletes != current_deletes
     }
 }
 
@@ -756,18 +766,6 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
 
         let current_manifests = self.current_manifests(table).await?;
         let is_retry = prepared.is_some();
-        let delete_manifests_changed = prepared
-            .as_ref()
-            .is_some_and(|prepared| Self::delete_manifests_changed(prepared, &current_manifests));
-
-        // Replacement data was produced against the prepared delete set. Reusing it after that
-        // set changes could lose newly visible rows or resurrect newly deleted rows.
-        if delete_manifests_changed && !self.removed_data_files.is_empty() {
-            return Err(crate::Error::new(
-                crate::ErrorKind::DataInvalid,
-                "Cannot retry rewrite files after delete manifests changed",
-            ));
-        }
 
         if let Some(prepared) = prepared
             && let Some(delta) = self
@@ -869,13 +867,15 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{Overwrite, ReplaceFilesMode, ReplaceFilesOperation, Rewrite};
+    use super::{
+        Overwrite, PreparedRewriteFiles, ReplaceFilesMode, ReplaceFilesOperation, Rewrite,
+    };
     use crate::catalog::MockCatalog;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
-        ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus,
-        ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
+        MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter,
+        ManifestStatus, ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
         SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
     };
     use crate::table::Table;
@@ -924,6 +924,34 @@ mod tests {
             .record_count(10)
             .partition_spec_id(0)
             .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap()
+    }
+
+    fn retry_test_equality_delete_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .equality_ids(Some(vec![1]))
+            .build()
+            .unwrap()
+    }
+
+    fn retry_test_position_delete_file(path: &str, referenced_data_file: Option<&str>) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .referenced_data_file(referenced_data_file.map(str::to_string))
             .build()
             .unwrap()
     }
@@ -1928,7 +1956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rewrite_files_retry_rejects_new_delete_manifest_without_reusing_cache() {
+    async fn test_rewrite_files_retry_reuses_new_equality_delete_manifest() {
         // Prepare replacement data before any concurrent row-level delete exists.
         let base = retry_test_table();
         let removed = retry_test_data_file("test/delete-conflict-input.parquet");
@@ -1955,6 +1983,7 @@ mod tests {
         let action = Arc::new(
             Transaction::new(&table_v1)
                 .rewrite_files()
+                .set_new_data_file_sequence_number(1)
                 .delete_files([removed])
                 .add_data_files([retry_test_data_file(
                     "test/delete-conflict-replacement.parquet",
@@ -1962,13 +1991,21 @@ mod tests {
         );
         Arc::clone(&action).commit(&table_v1).await.unwrap();
 
-        // The refreshed table includes a delete manifest committed after planning.
+        // The refreshed table includes concurrently added data and equality-delete manifests.
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/concurrent-data.avro",
+            602,
+            2,
+            retry_test_data_file("test/concurrent-data.parquet"),
+        )
+        .await;
         let delete_manifest = write_retry_test_added_delete_manifest(
             &base,
             "memory:///test/location/metadata/concurrent-delete.avro",
             602,
             2,
-            position_delete_file(&base, "test/concurrent-position-delete.parquet"),
+            retry_test_equality_delete_file("test/concurrent-equality-delete.parquet"),
         )
         .await;
         let snapshot = write_retry_test_snapshot(
@@ -1977,24 +2014,151 @@ mod tests {
             602,
             2,
             Some(601),
-            vec![original_manifest, delete_manifest],
-            2,
+            vec![
+                original_manifest.clone(),
+                appended_manifest.clone(),
+                delete_manifest.clone(),
+            ],
+            3,
         )
         .await;
         let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
 
-        // Reusing or replaying the stale replacement could resurrect deleted rows.
-        let err = match Arc::clone(&action).commit(&table_v2).await {
-            Ok(_) => panic!("retry after a concurrent delete should fail"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(!err.retryable());
-        assert!(err.message().contains("delete manifests changed"));
+        // A newer equality delete still applies to replacement data written at sequence 1. Remove
+        // the original body as a tripwire proving the retry reads only the delta manifest.
+        table_v2
+            .file_io()
+            .delete(&original_manifest.manifest_path)
+            .await
+            .unwrap();
+        let retry_snapshot =
+            committed_snapshot(Arc::clone(&action).commit(&table_v2).await.unwrap());
+        let manifest_list = table_v2
+            .manifest_list_reader(&SnapshotRef::new(retry_snapshot))
+            .load()
+            .await
+            .unwrap();
+        assert!(manifest_list.entries().contains(&appended_manifest));
+        assert!(manifest_list.entries().contains(&delete_manifest));
     }
 
     #[tokio::test]
-    async fn test_rewrite_files_retry_rejects_removed_delete_manifest() {
+    async fn test_append_only_delta_classifies_delete_manifests() {
+        let table = retry_test_table();
+        let removed = retry_test_data_file("test/delete-delta-removed.parquet");
+        let prepared = PreparedRewriteFiles {
+            source_manifests: vec![],
+            output_manifests: vec![],
+            format_version: FormatVersion::V2,
+            last_sequence_number: 1,
+        };
+        let equality_manifest = write_retry_test_added_delete_manifest(
+            &table,
+            "memory:///test/location/metadata/delete-delta-equality.avro",
+            621,
+            2,
+            retry_test_equality_delete_file("test/delete-delta-equality.parquet"),
+        )
+        .await;
+        let referenced_position_manifest = write_retry_test_added_delete_manifest(
+            &table,
+            "memory:///test/location/metadata/delete-delta-referenced-position.avro",
+            621,
+            2,
+            retry_test_position_delete_file(
+                "test/delete-delta-referenced-position.parquet",
+                Some("test/delete-delta-unrelated.parquet"),
+            ),
+        )
+        .await;
+        let removed_position_manifest = write_retry_test_added_delete_manifest(
+            &table,
+            "memory:///test/location/metadata/delete-delta-removed-position.avro",
+            621,
+            2,
+            retry_test_position_delete_file(
+                "test/delete-delta-removed-position.parquet",
+                Some(removed.file_path()),
+            ),
+        )
+        .await;
+        let unreferenced_position_manifest = write_retry_test_added_delete_manifest(
+            &table,
+            "memory:///test/location/metadata/delete-delta-unreferenced-position.avro",
+            621,
+            2,
+            retry_test_position_delete_file(
+                "test/delete-delta-unreferenced-position.parquet",
+                None,
+            ),
+        )
+        .await;
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .set_new_data_file_sequence_number(1)
+            .delete_files([removed.clone()]);
+        assert!(
+            action
+                .append_only_delta(&table, &prepared, std::slice::from_ref(&equality_manifest))
+                .await
+                .unwrap()
+                .is_some(),
+            "a newer equality delete applies to replacement data at sequence 1"
+        );
+        assert!(
+            action
+                .append_only_delta(&table, &prepared, &[referenced_position_manifest])
+                .await
+                .unwrap()
+                .is_some(),
+            "a referenced position delete for an unrelated file is reusable"
+        );
+        assert!(
+            action
+                .append_only_delta(&table, &prepared, &[removed_position_manifest])
+                .await
+                .unwrap()
+                .is_none(),
+            "a position delete for a removed input requires full preparation"
+        );
+        assert!(
+            action
+                .append_only_delta(&table, &prepared, &[unreferenced_position_manifest])
+                .await
+                .unwrap()
+                .is_none(),
+            "an unreferenced position delete requires full preparation"
+        );
+
+        let action_without_sequence = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files([removed.clone()]);
+        assert!(
+            action_without_sequence
+                .append_only_delta(&table, &prepared, std::slice::from_ref(&equality_manifest))
+                .await
+                .unwrap()
+                .is_none(),
+            "equality-delete reuse requires an explicit replacement data sequence"
+        );
+
+        let action_at_delete_sequence = Transaction::new(&table)
+            .rewrite_files()
+            .set_new_data_file_sequence_number(2)
+            .delete_files([removed]);
+        assert!(
+            action_at_delete_sequence
+                .append_only_delta(&table, &prepared, &[equality_manifest])
+                .await
+                .unwrap()
+                .is_none(),
+            "an equality delete must be strictly newer than replacement data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_retry_reprepares_after_removed_delete_manifest() {
         let base = retry_test_table();
         let removed = retry_test_data_file("test/removed-delete-conflict-input.parquet");
         let retained = retry_test_data_file("test/removed-delete-conflict-retained.parquet");
@@ -2068,19 +2232,37 @@ mod tests {
             613,
             3,
             Some(612),
-            vec![data_manifest, appended_manifest],
+            vec![data_manifest.clone(), appended_manifest.clone()],
             3,
         )
         .await;
         let table_v3 = retry_test_table_at_snapshot(&table_v2, snapshot);
-        let err = match Arc::clone(&action).commit(&table_v3).await {
-            Ok(_) => panic!("retry after a delete manifest was removed should fail"),
-            Err(err) => err,
+        let previous_output_paths = {
+            let state = action.state.lock().unwrap();
+            state
+                .prepared
+                .as_ref()
+                .unwrap()
+                .output_manifests
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone())
+                .collect::<HashSet<_>>()
         };
+        Arc::clone(&action).commit(&table_v3).await.unwrap();
 
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(!err.retryable());
-        assert!(err.message().contains("delete manifests changed"));
+        let state = action.state.lock().unwrap();
+        let prepared = state.prepared.as_ref().unwrap();
+        assert_eq!(prepared.source_manifests, vec![
+            data_manifest,
+            appended_manifest
+        ]);
+        assert!(
+            prepared
+                .output_manifests
+                .iter()
+                .any(|manifest| !previous_output_paths.contains(&manifest.manifest_path)),
+            "a removed source delete manifest should force full preparation"
+        );
     }
 
     #[tokio::test]
