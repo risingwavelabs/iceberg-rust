@@ -24,8 +24,7 @@ use uuid::Uuid;
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::error::Result;
 use crate::spec::{
-    DataFile, MIN_FORMAT_VERSION_ROW_LINEAGE, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestWriter, Operation,
+    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
 };
 use crate::table::Table;
 use crate::transaction::{
@@ -402,23 +401,12 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
 #[async_trait::async_trait]
 impl TransactionAction for RewriteManifestsAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        // Reject rewrite_manifests for tables with row lineage (V3+).
-        // Rewriting manifests creates new ManifestFiles with first_row_id unset,
-        // causing ManifestListWriter to assign fresh row IDs and advance
-        // next_row_id even though no new rows were added. This breaks row lineage
-        // semantics. Until a strategy to preserve row IDs through manifest rewrites
-        // is implemented, this operation is unsupported for V3 tables.
-        if table.metadata().format_version() >= MIN_FORMAT_VERSION_ROW_LINEAGE {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "rewrite_manifests is not supported for tables with row lineage \
-                     (format version >= {MIN_FORMAT_VERSION_ROW_LINEAGE}). Rewriting \
-                     manifests would incorrectly advance next_row_id without adding \
-                     new rows.",
-                ),
-            ));
-        }
+        // V3 tables with row lineage are supported. New manifest files produced
+        // by the rewrite have first_row_id unset; ManifestListWriter::v3 assigns
+        // fresh IDs and advances next_row_id by existing_rows + added_rows. This
+        // "wastes" ID space (no new data rows were added), but maintains
+        // uniqueness and matches the Java and Go implementations. Kept manifests
+        // retain their original first_row_id and do not advance next_row_id.
 
         // Resolve the identity of the *new* snapshot we are proposing to
         // commit. See the doc-comment on `RewriteManifestsState::commit_uuid`
@@ -844,27 +832,165 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_rewrite_manifests_rejects_v3_table() {
-        let table = make_v3_minimal_table();
-        // Even a no-op rewrite should be rejected for V3 tables.
-        let action = RewriteManifestsAction::new();
-        assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
+    /// Build a V3 memory-backed table for rewrite-manifests tests.
+    fn make_v3_memory_table() -> Table {
+        let base = make_v3_minimal_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
+            .set_location("memory:///test/location".to_string())
+            .build()
+            .unwrap()
+            .metadata;
+        base.with_metadata(Arc::new(metadata))
+    }
+
+    /// Write a V3 data manifest with existing entries. Returns a manifest
+    /// whose first_row_id is None (the manifest-list writer assigns it).
+    async fn write_v3_data_manifest(
+        table: &Table,
+        path: &str,
+        added_snapshot_id: i64,
+        sequence_number: i64,
+        files: Vec<DataFile>,
+    ) -> ManifestFile {
+        let file_io = table.file_io().clone();
+        let mut writer = ManifestWriterBuilder::new(
+            file_io.new_output(path).unwrap(),
+            Some(added_snapshot_id),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v3_data();
+
+        for file in files {
+            writer
+                .add_existing_file(
+                    file,
+                    added_snapshot_id,
+                    sequence_number,
+                    Some(sequence_number),
+                )
+                .unwrap();
+        }
+        let mut manifest = writer.write_manifest_file().await.unwrap();
+        manifest.sequence_number = sequence_number;
+        manifest.min_sequence_number = sequence_number;
+        manifest
+    }
+
+    /// Write a V3 manifest list and return a snapshot referencing it.
+    async fn write_v3_manifest_list_snapshot(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        manifests: Vec<ManifestFile>,
+    ) -> Snapshot {
+        let file_io = table.file_io().clone();
+        let next_row_id = table.metadata().next_row_id();
+        let mut writer = ManifestListWriter::v3(
+            file_io.new_output(path).unwrap().writer().await.unwrap(),
+            snapshot_id,
+            None,
+            sequence_number,
+            Some(next_row_id),
+        );
+        writer.add_manifests(manifests.into_iter()).unwrap();
+        let writer_next_row_id = writer.next_row_id();
+        writer.close().await.unwrap();
+
+        let (first, assigned) = writer_next_row_id
+            .map(|wnri| (next_row_id, wnri - next_row_id))
+            .unwrap_or((0, 0));
+
+        Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_timestamp_ms(table.metadata().last_updated_ms() + snapshot_id)
+            .with_sequence_number(sequence_number)
+            .with_schema_id(0)
+            .with_manifest_list(path)
+            .with_row_range(first, assigned)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build()
     }
 
     #[tokio::test]
-    async fn test_rewrite_manifests_rejects_v3_table_with_cluster_by() {
-        let table = make_v3_minimal_table();
-        let action = RewriteManifestsAction::new().cluster_by(Box::new(|_| "default".to_string()));
-        assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
-    }
+    async fn test_rewrite_manifests_v3_table_assigns_row_ids() {
+        // A V3 table with two small manifests. After rewrite-manifests merges
+        // them into one, the new manifest must receive a first_row_id from the
+        // manifest-list writer, and next_row_id must advance by the total row
+        // count. This matches the Java and Go implementations.
+        let base = make_v3_memory_table();
 
-    #[tokio::test]
-    async fn test_rewrite_manifests_rejects_v3_table_with_add_manifest() {
-        let table = make_v3_minimal_table();
-        let manifest = test_manifest("s3://bucket/manifest-ok.avro", Some(0), Some(5), Some(0));
-        let action = RewriteManifestsAction::new().add_manifest(manifest);
-        assert_commit_err(action, &table, "rewrite_manifests is not supported").await;
+        let f1 = data_file("memory:///test/location/data/a.parquet", 1, 10);
+        let f2 = data_file("memory:///test/location/data/b.parquet", 1, 20);
+
+        let m1 = write_v3_data_manifest(
+            &base,
+            "memory:///test/location/metadata/m1.avro",
+            1,
+            1,
+            vec![f1],
+        )
+        .await;
+        let m2 = write_v3_data_manifest(
+            &base,
+            "memory:///test/location/metadata/m2.avro",
+            1,
+            1,
+            vec![f2],
+        )
+        .await;
+
+        let snap = write_v3_manifest_list_snapshot(
+            &base,
+            "memory:///test/location/metadata/snap-1.avro",
+            1,
+            1,
+            vec![m1, m2],
+        )
+        .await;
+        let table = table_at_snapshot(&base, snap);
+        let next_row_id_before = table.metadata().next_row_id();
+
+        // cluster_by triggers the rewrite pass that repacks entries into new manifests.
+        let action =
+            Arc::new(RewriteManifestsAction::new().cluster_by(Box::new(|_| "all".to_string())));
+        let mut commit = action
+            .commit(&table)
+            .await
+            .expect("V3 rewrite must succeed");
+
+        // The commit must include an AddSnapshot with a row range.
+        let updates = commit.take_updates();
+        let add_snapshot = updates
+            .iter()
+            .find_map(|u| match u {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .expect("commit must add a snapshot");
+
+        // next_row_id must advance by at least the total rows (10 + 20 = 30).
+        // The manifest-list writer assigns IDs to the rewritten manifest.
+        assert!(
+            add_snapshot.first_row_id().is_some(),
+            "V3 rewrite snapshot must have first_row_id"
+        );
+        assert_eq!(
+            add_snapshot.first_row_id().unwrap(),
+            next_row_id_before,
+            "snapshot first_row_id must equal the table's next_row_id before the rewrite"
+        );
+        assert!(
+            add_snapshot.added_rows_count().unwrap_or(0) >= 30,
+            "added_rows must cover existing rows in rewritten manifests"
+        );
     }
 
     #[tokio::test]
