@@ -19,13 +19,15 @@ use std::collections::{HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
 
-use crate::io::FileIO;
 use crate::spec::{Manifest, ManifestFile, ManifestList, SnapshotRef, TableMetadataRef};
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
 pub(crate) const DEFAULT_LOAD_CONCURRENCY: usize = 16;
 
+// Each load is spawned as its own task so Avro decoding runs in parallel across runtime
+// workers; `buffer_unordered` alone polls every future on the caller's task, which
+// serializes decoding. `visit` stays on the caller's task, so it needs no synchronization.
 pub(crate) async fn for_each_manifest_list<F>(
     table: &Table,
     snapshots: Vec<SnapshotRef>,
@@ -37,20 +39,23 @@ where
 {
     let mut lists = stream::iter(snapshots)
         .map(|snapshot| {
-            let table = table.clone();
-            async move { table.manifest_list_reader(&snapshot).load().await }
+            let reader = table.manifest_list_reader(&snapshot);
+            table
+                .runtime()
+                .io()
+                .spawn(async move { reader.load().await })
         })
         .buffer_unordered(concurrency.max(1));
 
     while let Some(list) = lists.next().await {
-        let list = list?;
+        let list = list??;
         visit(&list);
     }
     Ok(())
 }
 
 pub(crate) async fn for_each_manifest<F>(
-    file_io: &FileIO,
+    table: &Table,
     manifest_files: Vec<ManifestFile>,
     concurrency: usize,
     mut visit: F,
@@ -60,16 +65,16 @@ where
 {
     let mut manifests = stream::iter(manifest_files)
         .map(|manifest_file| {
-            let file_io = file_io.clone();
-            async move {
+            let file_io = table.file_io().clone();
+            table.runtime().io().spawn(async move {
                 let manifest = manifest_file.load_manifest(&file_io).await?;
                 Ok::<_, Error>((manifest_file, manifest))
-            }
+            })
         })
         .buffer_unordered(concurrency.max(1));
 
     while let Some(manifest) = manifests.next().await {
-        let (manifest_file, manifest) = manifest?;
+        let (manifest_file, manifest) = manifest??;
         visit(&manifest_file, &manifest);
     }
     Ok(())
@@ -161,7 +166,7 @@ impl PhysicalFileCleanup {
         let manifests_to_delete: HashSet<String> = candidate_manifests.keys().cloned().collect();
         let mut content_to_delete = HashSet::<String>::new();
         for_each_manifest(
-            self.table.file_io(),
+            &self.table,
             candidate_manifests.into_values().collect(),
             self.load_concurrency,
             |_, manifest| {
@@ -174,7 +179,7 @@ impl PhysicalFileCleanup {
 
         if !content_to_delete.is_empty() {
             for_each_manifest(
-                self.table.file_io(),
+                &self.table,
                 surviving_manifests.into_values().collect(),
                 self.load_concurrency,
                 |_, manifest| {
@@ -459,6 +464,191 @@ mod tests {
             current_list_path,
             current_stats_path,
         ] {
+            assert!(table.file_io().exists(path).await.unwrap(), "{path}");
+        }
+    }
+
+    async fn write_data_manifest(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        added: impl IntoIterator<Item = (DataFile, i64)>,
+    ) -> ManifestFile {
+        let mut writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(path).unwrap(),
+            Some(snapshot_id),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_data();
+        for (file, sequence_number) in added {
+            writer.add_file(file, sequence_number).unwrap();
+        }
+        writer.write_manifest_file().await.unwrap()
+    }
+
+    async fn touch(table: &Table, path: &str) {
+        table
+            .file_io()
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+    }
+
+    fn metadata_with_snapshots(
+        base: &Table,
+        snapshots: impl IntoIterator<Item = Snapshot>,
+        current: i64,
+    ) -> TableMetadata {
+        let mut metadata = base.metadata().clone();
+        for snapshot in snapshots {
+            metadata
+                .snapshots
+                .insert(snapshot.snapshot_id(), Arc::new(snapshot));
+        }
+        metadata.current_snapshot_id = Some(current);
+        metadata
+            .refs
+            .insert(MAIN_BRANCH.to_string(), SnapshotReference {
+                snapshot_id: current,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            });
+        metadata
+    }
+
+    // Enough manifests and manifest lists that loads overlap across spawned tasks.
+    //
+    // Snapshots 1..=40 append d_i via m_i (list i = m_1..m_i). Snapshot 41 replaces them
+    // with one manifest that keeps d_21..d_40 and tombstones d_1..d_20. Snapshots 42..=50
+    // append again. Expiring 1..=41 must delete exactly d_1..d_20, m_1..m_40, lists 1..=41.
+    #[tokio::test]
+    async fn cleanup_across_many_manifests_deletes_only_unreachable_files() {
+        const APPENDS_BEFORE_REWRITE: i64 = 40;
+        const REWRITE_SNAPSHOT: i64 = 41;
+        const LAST_SNAPSHOT: i64 = 50;
+        const TOMBSTONED: i64 = 20;
+
+        let base = base_table();
+        let data_path = |i: i64| format!("memory://warehouse/table/data/d{i}.parquet");
+        let manifest_path = |i: i64| format!("memory://warehouse/table/metadata/m{i}.avro");
+        let list_path = |i: i64| format!("memory://warehouse/table/metadata/list{i}.avro");
+        let rewrite_manifest_path = "memory://warehouse/table/metadata/m-rewrite.avro";
+
+        let mut snapshots = Vec::new();
+        let mut live_manifests = Vec::new();
+        for i in 1..=LAST_SNAPSHOT {
+            if i == REWRITE_SNAPSHOT {
+                let mut writer = ManifestWriterBuilder::new(
+                    base.file_io().new_output(rewrite_manifest_path).unwrap(),
+                    Some(i),
+                    base.metadata().current_schema().clone(),
+                    base.metadata().default_partition_spec().as_ref().clone(),
+                )
+                .build_v2_data();
+                for d in 1..=APPENDS_BEFORE_REWRITE {
+                    let file = data_file(&data_path(d));
+                    if d <= TOMBSTONED {
+                        writer.add_delete_file(file, d, Some(d)).unwrap();
+                    } else {
+                        writer.add_existing_file(file, d, d, Some(d)).unwrap();
+                    }
+                }
+                live_manifests = vec![writer.write_manifest_file().await.unwrap()];
+            } else {
+                touch(&base, &data_path(i)).await;
+                let manifest = write_data_manifest(&base, &manifest_path(i), i, [(
+                    data_file(&data_path(i)),
+                    i,
+                )])
+                .await;
+                live_manifests.push(manifest);
+            }
+            let parent = (i > 1).then_some(i - 1);
+            write_manifest_list(&base, &list_path(i), i, parent, i, live_manifests.clone()).await;
+            // The list writer only assigns sequence numbers in its written copy; carried-forward
+            // manifests must hold them before a later list may reference them.
+            let newest = live_manifests.last_mut().unwrap();
+            newest.sequence_number = i;
+            newest.min_sequence_number = i;
+            snapshots.push(snapshot(i, parent, i, &list_path(i)));
+        }
+
+        let before = Arc::new(metadata_with_snapshots(
+            &base,
+            snapshots.clone(),
+            LAST_SNAPSHOT,
+        ));
+        let mut after = before.as_ref().clone();
+        for i in 1..=REWRITE_SNAPSHOT {
+            after.snapshots.remove(&i);
+        }
+        let table = base.with_metadata(Arc::new(after));
+
+        table
+            .cleanup_expired_files_with_concurrency(&before, 8)
+            .await
+            .unwrap();
+
+        let exists = |path: String| {
+            let table = table.clone();
+            async move { table.file_io().exists(&path).await.unwrap() }
+        };
+        for i in 1..=APPENDS_BEFORE_REWRITE {
+            assert_eq!(exists(data_path(i)).await, i > TOMBSTONED, "d{i}");
+            assert!(!exists(manifest_path(i)).await, "m{i}");
+        }
+        for i in 1..=REWRITE_SNAPSHOT {
+            assert!(!exists(list_path(i)).await, "list{i}");
+        }
+        assert!(exists(rewrite_manifest_path.to_string()).await);
+        for i in (REWRITE_SNAPSHOT + 1)..=LAST_SNAPSHOT {
+            assert!(exists(data_path(i)).await, "d{i}");
+            assert!(exists(manifest_path(i)).await, "m{i}");
+            assert!(exists(list_path(i)).await, "list{i}");
+        }
+    }
+
+    // A failed load inside a spawned task must surface as an error, and because deletes
+    // only start after every read succeeds, nothing is deleted.
+    #[tokio::test]
+    async fn cleanup_fails_without_deleting_when_a_manifest_is_missing() {
+        let base = base_table();
+        let removed_path = "memory://warehouse/table/data/removed.parquet";
+        let missing_manifest_path = "memory://warehouse/table/metadata/missing.avro";
+        let old_list_path = "memory://warehouse/table/metadata/old-list.avro";
+        let current_list_path = "memory://warehouse/table/metadata/current-list.avro";
+
+        touch(&base, removed_path).await;
+        let manifest = write_data_manifest(&base, missing_manifest_path, 1, [(
+            data_file(removed_path),
+            1,
+        )])
+        .await;
+        write_manifest_list(&base, old_list_path, 1, None, 1, vec![manifest]).await;
+        write_manifest_list(&base, current_list_path, 2, Some(1), 2, vec![]).await;
+        base.file_io().delete(missing_manifest_path).await.unwrap();
+
+        let before = Arc::new(metadata_with_snapshots(
+            &base,
+            [
+                snapshot(1, None, 1, old_list_path),
+                snapshot(2, Some(1), 2, current_list_path),
+            ],
+            2,
+        ));
+        let mut after = before.as_ref().clone();
+        after.snapshots.remove(&1);
+        let table = base.with_metadata(Arc::new(after));
+
+        let err = table.cleanup_expired_files(&before).await.unwrap_err();
+        assert!(err.to_string().contains(missing_manifest_path), "{err}");
+        for path in [removed_path, old_list_path, current_list_path] {
             assert!(table.file_io().exists(path).await.unwrap(), "{path}");
         }
     }
