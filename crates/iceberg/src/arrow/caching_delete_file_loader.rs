@@ -176,7 +176,7 @@ impl CachingDeleteFileLoader {
     /// ```
     pub(crate) fn load_deletes(
         &self,
-        delete_file_entries: &[FileScanTaskDeleteFile],
+        delete_file_entries: &[Arc<FileScanTaskDeleteFile>],
         schema: SchemaRef,
     ) -> Receiver<Result<DeleteFilter>> {
         let (tx, rx) = channel();
@@ -185,7 +185,7 @@ impl CachingDeleteFileLoader {
             .iter()
             .map(|t| {
                 (
-                    t.clone(),
+                    Arc::clone(t),
                     self.basic_delete_file_loader.clone(),
                     self.delete_filter.clone(),
                     schema.clone(),
@@ -1041,7 +1041,10 @@ mod tests {
 
         let first_error = tokio::time::timeout(
             Duration::from_secs(5),
-            delete_file_loader.load_deletes(&[equality_delete_task.clone()], table_schema.clone()),
+            delete_file_loader.load_deletes(
+                &[Arc::new(equality_delete_task.clone())],
+                table_schema.clone(),
+            ),
         )
         .await
         .expect("missing equality delete read hung")
@@ -1057,7 +1060,7 @@ mod tests {
                 .with_data_file_format(DataFileFormat::Parquet)
                 .with_schema(table_schema.clone())
                 .with_project_field_ids(vec![2, 3])
-                .with_deletes(vec![equality_delete_task])
+                .with_deletes(vec![equality_delete_task.into()])
                 .with_case_sensitive(false)
                 .build()
         };
@@ -1068,7 +1071,10 @@ mod tests {
         // predicate error or a doomed re-read.
         let late_filter = tokio::time::timeout(
             Duration::from_secs(5),
-            delete_file_loader.load_deletes(&[equality_delete_task.clone()], table_schema.clone()),
+            delete_file_loader.load_deletes(
+                &[Arc::new(equality_delete_task.clone())],
+                table_schema.clone(),
+            ),
         )
         .await
         .expect("second equality delete load hung")
@@ -1100,7 +1106,7 @@ mod tests {
         let delete_filter = tokio::time::timeout(
             Duration::from_secs(5),
             fresh_loader.load_deletes(
-                std::slice::from_ref(&equality_delete_task),
+                &[Arc::new(equality_delete_task.clone())],
                 table_schema.clone(),
             ),
         )
@@ -1288,6 +1294,7 @@ mod tests {
                     .with_content_offset(Some(blob.offset() as i64))
                     .with_content_size_in_bytes(Some(blob.length() as i64))
                     .build()
+                    .into()
             })
             .collect::<Vec<_>>();
 
@@ -1556,7 +1563,7 @@ mod tests {
             .with_data_file_format(DataFileFormat::Parquet)
             .with_schema(data_file_schema.clone())
             .with_project_field_ids(vec![2, 3])
-            .with_deletes(vec![pos_del, eq_del])
+            .with_deletes(vec![pos_del.into(), eq_del.into()])
             .with_case_sensitive(false)
             .build();
 

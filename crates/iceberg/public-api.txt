@@ -1454,7 +1454,7 @@ pub iceberg::scan::FileScanTask::case_sensitive: bool
 pub iceberg::scan::FileScanTask::data_file_format: iceberg::spec::DataFileFormat
 pub iceberg::scan::FileScanTask::data_file_path: alloc::string::String
 pub iceberg::scan::FileScanTask::data_sequence_number: core::option::Option<i64>
-pub iceberg::scan::FileScanTask::deletes: alloc::vec::Vec<iceberg::scan::FileScanTaskDeleteFile>
+pub iceberg::scan::FileScanTask::deletes: alloc::vec::Vec<alloc::sync::Arc<iceberg::scan::FileScanTaskDeleteFile>>
 pub iceberg::scan::FileScanTask::file_sequence_number: core::option::Option<i64>
 pub iceberg::scan::FileScanTask::file_size_in_bytes: u64
 pub iceberg::scan::FileScanTask::first_row_id: core::option::Option<i64>
