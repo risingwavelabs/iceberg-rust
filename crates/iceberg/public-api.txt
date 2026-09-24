@@ -1,9 +1,20 @@
 pub mod iceberg
 pub mod iceberg::actions
+pub struct iceberg::actions::OrphanFile
+pub iceberg::actions::OrphanFile::path: alloc::string::String
+pub iceberg::actions::OrphanFile::size_bytes: u64
+impl core::clone::Clone for iceberg::actions::OrphanFile
+pub fn iceberg::actions::OrphanFile::clone(&self) -> iceberg::actions::OrphanFile
+impl core::cmp::Eq for iceberg::actions::OrphanFile
+impl core::cmp::PartialEq for iceberg::actions::OrphanFile
+pub fn iceberg::actions::OrphanFile::eq(&self, other: &iceberg::actions::OrphanFile) -> bool
+impl core::fmt::Debug for iceberg::actions::OrphanFile
+pub fn iceberg::actions::OrphanFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::actions::OrphanFile
 pub struct iceberg::actions::RemoveOrphanFilesAction
 impl iceberg::actions::RemoveOrphanFilesAction
 pub fn iceberg::actions::RemoveOrphanFilesAction::dry_run(self, dry_run: bool) -> Self
-pub async fn iceberg::actions::RemoveOrphanFilesAction::execute(self) -> iceberg::Result<alloc::vec::Vec<alloc::string::String>>
+pub async fn iceberg::actions::RemoveOrphanFilesAction::execute(self) -> iceberg::Result<alloc::vec::Vec<iceberg::actions::OrphanFile>>
 pub fn iceberg::actions::RemoveOrphanFilesAction::load_concurrency(self, concurrency: usize) -> Self
 pub fn iceberg::actions::RemoveOrphanFilesAction::new(table: iceberg::table::Table) -> Self
 pub fn iceberg::actions::RemoveOrphanFilesAction::older_than(self, duration: core::time::Duration) -> Self

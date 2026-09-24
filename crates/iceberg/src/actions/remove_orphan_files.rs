@@ -27,7 +27,18 @@ use crate::spec::ManifestFile;
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
+/// Seven days in milliseconds. Files newer than this are retained by default.
 const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// A file under the table location that is not referenced by any snapshot
+/// or table metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanFile {
+    /// Absolute path of the orphan file.
+    pub path: String,
+    /// Size of the file in bytes, as reported by the storage listing.
+    pub size_bytes: u64,
+}
 
 /// Deletes files below a table location that are not reachable from table metadata.
 ///
@@ -76,8 +87,8 @@ impl RemoveOrphanFilesAction {
         self
     }
 
-    /// Discovers orphan files, deletes them unless this is a dry run, and returns their paths.
-    pub async fn execute(self) -> Result<Vec<String>> {
+    /// Discovers orphan files, deletes them unless this is a dry run, and returns them.
+    pub async fn execute(self) -> Result<Vec<OrphanFile>> {
         let reachable = self.collect_reachable_files().await?;
         let listed = self
             .table
@@ -86,22 +97,27 @@ impl RemoveOrphanFilesAction {
             .await?;
 
         if self.dry_run {
-            let mut orphans: Vec<String> = listed
+            let mut orphans: Vec<OrphanFile> = listed
                 .try_filter_map(|entry| {
                     let is_orphan = !entry.is_dir
                         && !reachable.contains(&entry.path)
                         && entry
                             .last_modified_ms
                             .is_some_and(|timestamp| timestamp < self.older_than_ms);
-                    async move { Ok(is_orphan.then_some(entry.path)) }
+                    async move {
+                        Ok(is_orphan.then_some(OrphanFile {
+                            path: entry.path,
+                            size_bytes: entry.size,
+                        }))
+                    }
                 })
                 .try_collect()
                 .await?;
-            orphans.sort_unstable();
+            orphans.sort_unstable_by(|left, right| left.path.cmp(&right.path));
             return Ok(orphans);
         }
 
-        let discovered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let discovered = Arc::new(Mutex::new(Vec::<OrphanFile>::new()));
         let listing_error = Arc::new(Mutex::new(None::<Error>));
         let discovered_for_stream = discovered.clone();
         let error_for_stream = listing_error.clone();
@@ -116,7 +132,10 @@ impl RemoveOrphanFilesAction {
                             .is_some_and(|timestamp| timestamp < older_than_ms) =>
                 {
                     if let Ok(mut paths) = discovered_for_stream.lock() {
-                        paths.push(entry.path.clone());
+                        paths.push(OrphanFile {
+                            path: entry.path.clone(),
+                            size_bytes: entry.size,
+                        });
                     }
                     Some(entry.path)
                 }
@@ -156,7 +175,7 @@ impl RemoveOrphanFilesAction {
                 )
             })?
             .clone();
-        orphans.sort_unstable();
+        orphans.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         Ok(orphans)
     }
 
@@ -282,7 +301,10 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        assert_eq!(dry_run, vec![orphan_file]);
+        assert_eq!(dry_run, vec![OrphanFile {
+            path: orphan_file.to_string(),
+            size_bytes: 4,
+        }]);
         assert!(table.file_io().exists(orphan_file).await.unwrap());
 
         let deleted = RemoveOrphanFilesAction::new(table.clone())
@@ -290,7 +312,10 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        assert_eq!(deleted, vec![orphan_file]);
+        assert_eq!(deleted, vec![OrphanFile {
+            path: orphan_file.to_string(),
+            size_bytes: 4,
+        }]);
         assert!(!table.file_io().exists(orphan_file).await.unwrap());
         assert!(table.file_io().exists(metadata_file).await.unwrap());
         assert!(table.file_io().exists(outside_file).await.unwrap());
