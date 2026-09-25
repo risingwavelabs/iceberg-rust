@@ -118,6 +118,7 @@ fn build_storage_for_scheme(
             let config = crate::azdls::azdls_config_parse(props.clone())?;
             Ok(OpenDalStorage::Azdls {
                 config: Arc::new(config),
+                account_sas_tokens: Arc::new(crate::azdls::azdls_account_sas_tokens_parse(props)),
             })
         }
         #[cfg(feature = "opendal-azblob")]

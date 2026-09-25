@@ -46,7 +46,7 @@ use crate::endpoint::{Endpoint, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    NamespaceResponse, RegisterTableRequest, RenameTableRequest, StorageCredential,
 };
 
 /// REST catalog URI
@@ -584,6 +584,23 @@ impl RestCatalog {
     }
 }
 
+/// Returns the config of the vended storage credential that applies to `location`.
+///
+/// Per the REST spec, clients choose the credential with the longest prefix matching
+/// the location, and prefer it over credentials in the table `config`.
+fn storage_credential_config(
+    storage_credentials: Option<Vec<StorageCredential>>,
+    location: &str,
+) -> HashMap<String, String> {
+    storage_credentials
+        .into_iter()
+        .flatten()
+        .filter(|credential| location.starts_with(&credential.prefix))
+        .max_by_key(|credential| credential.prefix.len())
+        .map(|credential| credential.config)
+        .unwrap_or_default()
+}
+
 /// All requests and expected responses are derived from the REST catalog API spec:
 /// https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml
 #[async_trait]
@@ -870,6 +887,10 @@ impl Catalog for RestCatalog {
         let config = response
             .config
             .into_iter()
+            .chain(storage_credential_config(
+                response.storage_credentials,
+                metadata_location,
+            ))
             .chain(self.user_config.props.clone())
             .collect();
 
@@ -927,9 +948,19 @@ impl Catalog for RestCatalog {
             }
         };
 
+        // Match credentials against a file path, like Java's FileIO does. The
+        // metadata location is absent only for staged tables.
+        let location = response
+            .metadata_location
+            .as_deref()
+            .unwrap_or_else(|| response.metadata.location());
         let config = response
             .config
             .into_iter()
+            .chain(storage_credential_config(
+                response.storage_credentials,
+                location,
+            ))
             .chain(self.user_config.props.clone())
             .collect();
 
@@ -2715,6 +2746,122 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_storage_credential_config_picks_longest_matching_prefix() {
+        let credential = |prefix: &str, value: &str| StorageCredential {
+            prefix: prefix.to_string(),
+            config: HashMap::from([("token".to_string(), value.to_string())]),
+        };
+        let credentials = Some(vec![
+            credential("abfss://fs@account.dfs.core.windows.net", "container"),
+            credential("abfss://fs@account.dfs.core.windows.net/ns/table/", "table"),
+            credential(
+                "abfss://fs@account.dfs.core.windows.net/ns/table2",
+                "table2",
+            ),
+            credential("abfss://fs@other.dfs.core.windows.net/ns/table/", "other"),
+        ]);
+        let token = |location: &str| {
+            storage_credential_config(credentials.clone(), location)
+                .get("token")
+                .cloned()
+        };
+
+        assert_eq!(
+            token("abfss://fs@account.dfs.core.windows.net/ns/table/metadata/v1.metadata.json")
+                .as_deref(),
+            Some("table")
+        );
+        assert_eq!(
+            token("abfss://fs@account.dfs.core.windows.net/ns/table3/metadata/v1.metadata.json")
+                .as_deref(),
+            Some("container")
+        );
+        assert_eq!(
+            token("abfss://fs@third.dfs.core.windows.net/ns/table/metadata/v1.metadata.json"),
+            None
+        );
+        assert!(storage_credential_config(None, "abfss://fs@account/ns/table").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_table_applies_vended_storage_credentials() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let mut response: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        response["config"] = serde_json::json!({
+            "region": "us-west-2",
+            "s3.session-token": "from-config",
+            "s3.access-key-id": "from-config",
+        });
+        response["storage-credentials"] = serde_json::json!([
+            {
+                "prefix": "s3://warehouse/",
+                "config": {"s3.session-token": "warehouse", "s3.access-key-id": "warehouse"},
+            },
+            {
+                "prefix": "s3://warehouse/database/table/",
+                "config": {"s3.session-token": "table", "s3.access-key-id": "table"},
+            },
+            {
+                "prefix": "s3://other/database/table/",
+                "config": {"s3.session-token": "other", "s3.access-key-id": "other"},
+            },
+        ]);
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    "s3.access-key-id".to_string(),
+                    "from-user".to_string(),
+                )]))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "test1".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let props = table.file_io().config().props();
+        assert_eq!(props.get("region").map(String::as_str), Some("us-west-2"));
+        assert_eq!(
+            props.get("s3.session-token").map(String::as_str),
+            Some("table")
+        );
+        // Properties configured on the catalog still take precedence.
+        assert_eq!(
+            props.get("s3.access-key-id").map(String::as_str),
+            Some("from-user")
+        );
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
     }
 
     #[tokio::test]
