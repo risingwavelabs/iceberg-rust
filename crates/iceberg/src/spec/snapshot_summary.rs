@@ -477,35 +477,15 @@ fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> R
     Ok(summary)
 }
 
-/// Largest value a `total-*` summary property may hold.
-///
-/// Totals are stored as decimal strings. iceberg-java, which Spark, Trino and
-/// Flink use, reads them with `Long.parseLong`, so it cannot read anything above
-/// `i64::MAX`. No real table gets near this bound. A larger value can only come
-/// from an earlier writer's arithmetic wrapping around, as this function did
-/// before it used checked arithmetic.
+/// Largest value a `total-*` summary property may hold. Totals are stored as decimal strings, and
+/// other Iceberg engines only support up to `i64::MAX` (no real table gets near this bound).
 const MAX_SUMMARY_TOTAL: u64 = i64::MAX as u64;
 
 /// Rolls `total_property` forward from the previous snapshot's summary:
-/// `previous total + added - removed`.
+/// `previous total + added - removed`. With no previous snapshot, the total starts from zero.
 ///
-/// This follows iceberg-java's `SnapshotProducer.updateTotal`. When the total
-/// cannot be known, it is left out instead of written with a made-up value.
-/// That covers three cases:
-///
-/// * The previous summary has no total, or its total cannot be parsed or is
-///   above [`MAX_SUMMARY_TOTAL`].
-/// * A delta cannot be parsed.
-/// * The result would be negative.
-///
-/// A negative result means the previous total does not include files or rows
-/// that this commit removes. It happens when an earlier writer rolled its
-/// totals forward incorrectly, for example by resetting `total-*` to its own
-/// `added-*` on every append. Plain `u64` arithmetic used to wrap that result
-/// around to a value near `u64::MAX`. The wrapped value was then committed,
-/// and later writers carried it forward from snapshot to snapshot.
-///
-/// When there is no previous snapshot at all, the total starts from zero.
+/// When the total cannot be known, it is left out of the summary to prevent invalid unsigned math,
+/// e.g. when `removed` exceeds `previous total + added` and would wrap below zero.
 fn update_totals(
     summary: &mut Summary,
     previous_summary: Option<&Summary>,
