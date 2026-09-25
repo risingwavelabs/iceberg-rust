@@ -43,7 +43,7 @@ use crate::client::{
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    NamespaceResponse, RegisterTableRequest, RenameTableRequest, StorageCredential,
 };
 
 /// REST catalog URI
@@ -480,6 +480,23 @@ impl RestCatalog {
     }
 }
 
+/// Returns the config of the vended storage credential that applies to `location`.
+///
+/// Per the REST spec, clients choose the credential with the longest prefix matching
+/// the location, and prefer it over credentials in the table `config`.
+fn storage_credential_config(
+    storage_credentials: Option<Vec<StorageCredential>>,
+    location: &str,
+) -> HashMap<String, String> {
+    storage_credentials
+        .into_iter()
+        .flatten()
+        .filter(|credential| location.starts_with(&credential.prefix))
+        .max_by_key(|credential| credential.prefix.len())
+        .map(|credential| credential.config)
+        .unwrap_or_default()
+}
+
 /// All requests and expected responses are derived from the REST catalog API spec:
 /// https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml
 #[async_trait]
@@ -769,6 +786,10 @@ impl Catalog for RestCatalog {
         let config = response
             .config
             .into_iter()
+            .chain(storage_credential_config(
+                response.storage_credentials,
+                metadata_location,
+            ))
             .chain(self.user_config.props.clone())
             .collect();
 
@@ -821,9 +842,19 @@ impl Catalog for RestCatalog {
             }
         };
 
+        // Match credentials against a file path, like Java's FileIO does. The
+        // metadata location is absent only for staged tables.
+        let location = response
+            .metadata_location
+            .as_deref()
+            .unwrap_or_else(|| response.metadata.location());
         let config = response
             .config
             .into_iter()
+            .chain(storage_credential_config(
+                response.storage_credentials,
+                location,
+            ))
             .chain(self.user_config.props.clone())
             .collect();
 
@@ -2308,6 +2339,44 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_storage_credential_config_picks_longest_matching_prefix() {
+        let credential = |prefix: &str, value: &str| StorageCredential {
+            prefix: prefix.to_string(),
+            config: HashMap::from([("token".to_string(), value.to_string())]),
+        };
+        let credentials = Some(vec![
+            credential("abfss://fs@account.dfs.core.windows.net", "container"),
+            credential("abfss://fs@account.dfs.core.windows.net/ns/table/", "table"),
+            credential(
+                "abfss://fs@account.dfs.core.windows.net/ns/table2",
+                "table2",
+            ),
+            credential("abfss://fs@other.dfs.core.windows.net/ns/table/", "other"),
+        ]);
+        let token = |location: &str| {
+            storage_credential_config(credentials.clone(), location)
+                .get("token")
+                .cloned()
+        };
+
+        assert_eq!(
+            token("abfss://fs@account.dfs.core.windows.net/ns/table/metadata/v1.metadata.json")
+                .as_deref(),
+            Some("table")
+        );
+        assert_eq!(
+            token("abfss://fs@account.dfs.core.windows.net/ns/table3/metadata/v1.metadata.json")
+                .as_deref(),
+            Some("container")
+        );
+        assert_eq!(
+            token("abfss://fs@third.dfs.core.windows.net/ns/table/metadata/v1.metadata.json"),
+            None
+        );
+        assert!(storage_credential_config(None, "abfss://fs@account/ns/table").is_empty());
     }
 
     #[tokio::test]
