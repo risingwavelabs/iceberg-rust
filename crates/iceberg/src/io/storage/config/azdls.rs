@@ -36,6 +36,12 @@ pub const ADLS_ACCOUNT_NAME: &str = "adls.account-name";
 pub const ADLS_ACCOUNT_KEY: &str = "adls.account-key";
 /// The shared access signature.
 pub const ADLS_SAS_TOKEN: &str = "adls.sas-token";
+/// Prefix of a shared access signature scoped to one storage account, followed by the
+/// account host, e.g. `adls.sas-token.myaccount.dfs.core.windows.net`.
+///
+/// This is the form in which REST catalogs vend SAS tokens (see Java's `AzureProperties`).
+/// For paths on that account it takes precedence over [`ADLS_SAS_TOKEN`].
+pub const ADLS_SAS_TOKEN_PREFIX: &str = "adls.sas-token.";
 /// The tenant-id.
 pub const ADLS_TENANT_ID: &str = "adls.tenant-id";
 /// The client-id.

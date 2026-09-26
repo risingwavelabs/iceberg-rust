@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -26,7 +27,7 @@ use url::Url;
 
 use crate::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_AUTHORITY_HOST, ADLS_CLIENT_ID, ADLS_CLIENT_SECRET,
-    ADLS_CONNECTION_STRING, ADLS_SAS_TOKEN, ADLS_TENANT_ID,
+    ADLS_CONNECTION_STRING, ADLS_SAS_TOKEN, ADLS_SAS_TOKEN_PREFIX, ADLS_TENANT_ID,
 };
 use crate::{Error, ErrorKind, Result, ensure_data_valid};
 
@@ -50,7 +51,7 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     }
 
     if let Some(sas_token) = properties.remove(ADLS_SAS_TOKEN) {
-        config.sas_token = Some(sas_token);
+        config.sas_token = Some(normalize_sas_token(&sas_token).to_string());
     }
 
     if let Some(tenant_id) = properties.remove(ADLS_TENANT_ID) {
@@ -72,6 +73,45 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     Ok(config)
 }
 
+/// Strips the leading `?` of a SAS token copied from a URL: the signer appends
+/// the token to the request query as-is.
+fn normalize_sas_token(sas_token: &str) -> &str {
+    sas_token.trim_start_matches('?')
+}
+
+/// Parses `adls.sas-token.<account host>` properties into SAS tokens keyed by account host.
+pub(crate) fn azdls_account_sas_tokens_parse(
+    properties: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    properties
+        .iter()
+        .filter_map(|(key, sas_token)| {
+            let account_host = key.strip_prefix(ADLS_SAS_TOKEN_PREFIX)?;
+            let sas_token = normalize_sas_token(sas_token);
+            (!account_host.is_empty() && !sas_token.is_empty())
+                .then(|| (account_host.to_string(), sas_token.to_string()))
+        })
+        .collect()
+}
+
+/// Returns the config for paths on the storage account `account_host`, e.g.
+/// `myaccount.dfs.core.windows.net`: a SAS token scoped to that account takes
+/// precedence over the credentials in `config`.
+pub(crate) fn azdls_config_for_account<'a>(
+    config: &'a AzdlsConfig,
+    account_sas_tokens: &HashMap<String, String>,
+    account_host: &str,
+) -> Cow<'a, AzdlsConfig> {
+    match account_sas_tokens.get(account_host) {
+        Some(sas_token) if config.sas_token.as_ref() != Some(sas_token) => {
+            let mut config = config.clone();
+            config.sas_token = Some(sas_token.clone());
+            Cow::Owned(config)
+        }
+        _ => Cow::Borrowed(config),
+    }
+}
+
 /// Builds an OpenDAL operator from the AzdlsConfig and path.
 ///
 /// The path is expected to include the scheme in a format like:
@@ -79,12 +119,14 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
 pub(crate) fn azdls_create_operator<'a>(
     absolute_path: &'a str,
     config: &AzdlsConfig,
+    account_sas_tokens: &HashMap<String, String>,
     configured_scheme: &AzureStorageScheme,
 ) -> Result<(opendal::Operator, &'a str)> {
     let path = absolute_path.parse::<AzureStoragePath>()?;
     match_path_with_config(&path, config, configured_scheme)?;
 
-    let op = azdls_config_build(config, &path)?;
+    let config = azdls_config_for_account(config, account_sas_tokens, &path.host());
+    let op = azdls_config_build(&config, &path)?;
 
     // Paths to files in ADLS tend to be written in fully qualified form,
     // including their filesystem and account name.
@@ -226,6 +268,18 @@ struct AzureStoragePath {
 }
 
 impl AzureStoragePath {
+    /// Returns the host of the storage account, e.g. `myaccount.dfs.core.windows.net`.
+    fn host(&self) -> String {
+        let storage_service = match self.scheme {
+            AzureStorageScheme::Abfs | AzureStorageScheme::Abfss => "dfs",
+            AzureStorageScheme::Wasb | AzureStorageScheme::Wasbs => "blob",
+        };
+        format!(
+            "{}.{}.{}",
+            self.account_name, storage_service, self.endpoint_suffix
+        )
+    }
+
     /// Converts the AzureStoragePath into a full endpoint URL.
     ///
     /// This is possible because the path is fully qualified.
@@ -321,7 +375,10 @@ mod tests {
 
     use opendal::services::AzdlsConfig;
 
-    use super::{AzureStoragePath, AzureStorageScheme, azdls_config_parse, azdls_create_operator};
+    use super::{
+        AzureStoragePath, AzureStorageScheme, azdls_account_sas_tokens_parse,
+        azdls_config_for_account, azdls_config_parse, azdls_create_operator,
+    };
 
     #[test]
     fn test_azdls_config_parse() {
@@ -347,6 +404,14 @@ mod tests {
                 Some(AzdlsConfig {
                     account_name: Some("test".to_string()),
                     sas_token: Some("token".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "SAS token copied with its leading question mark",
+                HashMap::from([(super::ADLS_SAS_TOKEN.to_string(), "?sv=1&sig=x".to_string())]),
+                Some(AzdlsConfig {
+                    sas_token: Some("sv=1&sig=x".to_string()),
                     ..Default::default()
                 }),
             ),
@@ -379,6 +444,89 @@ mod tests {
                     assert!(config.is_err(), "Test case {name} expected error.");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_azdls_account_sas_tokens_parse() {
+        let properties = HashMap::from([
+            (super::ADLS_SAS_TOKEN.to_string(), "shared".to_string()),
+            (
+                "adls.sas-token.myaccount.dfs.core.windows.net".to_string(),
+                "sv=1&sig=mine".to_string(),
+            ),
+            (
+                "adls.sas-token.otheraccount.dfs.core.windows.net".to_string(),
+                "?sv=2&sig=other".to_string(),
+            ),
+            (
+                "adls.sas-token-expires-at-ms.myaccount.dfs.core.windows.net".to_string(),
+                "1790000000000".to_string(),
+            ),
+            (
+                "adls.sas-token.emptyaccount.dfs.core.windows.net".to_string(),
+                String::new(),
+            ),
+            ("adls.sas-token.".to_string(), "no-account".to_string()),
+        ]);
+
+        assert_eq!(
+            azdls_account_sas_tokens_parse(&properties),
+            HashMap::from([
+                (
+                    "myaccount.dfs.core.windows.net".to_string(),
+                    "sv=1&sig=mine".to_string()
+                ),
+                (
+                    "otheraccount.dfs.core.windows.net".to_string(),
+                    "sv=2&sig=other".to_string()
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_azdls_config_for_account() {
+        let config = AzdlsConfig {
+            account_key: Some("secret".to_string()),
+            sas_token: Some("shared".to_string()),
+            ..Default::default()
+        };
+        let account_sas_tokens = HashMap::from([(
+            "myaccount.dfs.core.windows.net".to_string(),
+            "sv=1&sig=mine".to_string(),
+        )]);
+
+        let resolved = azdls_config_for_account(
+            &config,
+            &account_sas_tokens,
+            "myaccount.dfs.core.windows.net",
+        );
+        assert_eq!(resolved.sas_token.as_deref(), Some("sv=1&sig=mine"));
+        assert_eq!(resolved.account_key.as_deref(), Some("secret"));
+
+        let unscoped = azdls_config_for_account(
+            &config,
+            &account_sas_tokens,
+            "otheraccount.dfs.core.windows.net",
+        );
+        assert!(matches!(unscoped, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(unscoped.sas_token.as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn test_azure_storage_path_host() {
+        for (path, host) in [
+            (
+                "abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet",
+                "myaccount.dfs.core.windows.net",
+            ),
+            (
+                "wasb://myfs@myaccount.blob.core.chinacloudapi.cn/path/to/file.parquet",
+                "myaccount.blob.core.chinacloudapi.cn",
+            ),
+        ] {
+            assert_eq!(path.parse::<AzureStoragePath>().unwrap().host(), host);
         }
     }
 
@@ -467,7 +615,7 @@ mod tests {
         ];
 
         for (name, input, expected) in test_cases {
-            let result = azdls_create_operator(input.0, &input.1, &input.2);
+            let result = azdls_create_operator(input.0, &input.1, &HashMap::new(), &input.2);
             match expected {
                 Some((expected_filesystem, expected_path)) => {
                     assert!(result.is_ok(), "Test case {name} failed: {result:?}");

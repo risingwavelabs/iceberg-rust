@@ -154,6 +154,7 @@ impl StorageFactory for OpenDalStorageFactory {
                 Ok(Arc::new(OpenDalStorage::Azdls {
                     configured_scheme: configured_scheme.clone(),
                     config: azdls_config_parse(config.props().clone())?.into(),
+                    account_sas_tokens: azdls_account_sas_tokens_parse(config.props()).into(),
                 }))
             }
             #[cfg(all(
@@ -282,6 +283,11 @@ pub enum OpenDalStorage {
         configured_scheme: AzureStorageScheme,
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
+        /// SAS tokens scoped to one storage account, keyed by account host
+        /// (`<account>.dfs.<endpoint-suffix>`), as vended by REST catalogs.
+        /// For paths on that account they take precedence over `config`.
+        #[serde(default)]
+        account_sas_tokens: Arc<HashMap<String, String>>,
     },
 }
 
@@ -325,6 +331,7 @@ impl OpenDalStorage {
             Scheme::Azdls => {
                 let scheme = scheme_str.parse::<AzureStorageScheme>()?;
                 Ok(Self::Azdls {
+                    account_sas_tokens: azdls_account_sas_tokens_parse(&props).into(),
                     config: azdls_config_parse(props)?.into(),
                     configured_scheme: scheme,
                 })
@@ -469,7 +476,8 @@ impl OpenDalStorage {
             OpenDalStorage::Azdls {
                 configured_scheme,
                 config,
-            } => azdls_create_operator(path, config, configured_scheme)?,
+                account_sas_tokens,
+            } => azdls_create_operator(path, config, account_sas_tokens, configured_scheme)?,
             #[cfg(all(
                 not(feature = "storage-s3"),
                 not(feature = "storage-fs"),
