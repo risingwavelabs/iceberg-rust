@@ -164,6 +164,10 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
             let mut deleted_entries = Vec::new();
 
             for manifest_file in self.current_manifests(snapshot_produce).await? {
+                if !snapshot_produce.has_removed_files_for_manifest_type(manifest_file.content) {
+                    continue;
+                }
+
                 let manifest = manifest_file
                     .load_manifest(snapshot_produce.table.file_io())
                     .await?;
@@ -228,10 +232,12 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
             }))
             .map(|manifest_file| {
                 let file_io = file_io.clone();
-                let should_load = self
-                    .affected_manifest_paths
-                    .as_ref()
-                    .is_none_or(|paths| paths.contains(&manifest_file.manifest_path));
+                let should_load = snapshot_produce
+                    .has_removed_files_for_manifest_type(manifest_file.content)
+                    && self
+                        .affected_manifest_paths
+                        .as_ref()
+                        .is_none_or(|paths| paths.contains(&manifest_file.manifest_path));
                 async move {
                     let manifest = if should_load {
                         Some(manifest_file.load_manifest(&file_io).await?)
