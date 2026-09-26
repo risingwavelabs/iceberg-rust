@@ -5,7 +5,7 @@ pub enum iceberg_storage_opendal::OpenDalStorage
 pub iceberg_storage_opendal::OpenDalStorage::Azblob
 pub iceberg_storage_opendal::OpenDalStorage::Azblob::config: alloc::sync::Arc<opendal_service_azblob::config::AzblobConfig>
 pub iceberg_storage_opendal::OpenDalStorage::Azdls
-pub iceberg_storage_opendal::OpenDalStorage::Azdls::account_sas_tokens: alloc::sync::Arc<std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>>
+pub iceberg_storage_opendal::OpenDalStorage::Azdls::account_configs: alloc::sync::Arc<std::collections::hash::map::HashMap<alloc::string::String, alloc::sync::Arc<opendal_service_azdls::config::AzdlsConfig>>>
 pub iceberg_storage_opendal::OpenDalStorage::Azdls::config: alloc::sync::Arc<opendal_service_azdls::config::AzdlsConfig>
 pub iceberg_storage_opendal::OpenDalStorage::Gcs
 pub iceberg_storage_opendal::OpenDalStorage::Gcs::config: alloc::sync::Arc<opendal_service_gcs::config::GcsConfig>

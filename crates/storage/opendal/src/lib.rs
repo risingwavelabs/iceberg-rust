@@ -475,10 +475,14 @@ impl OpenDalStorageFactory {
                 config: oss_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageBackend::Azdls => OpenDalStorage::Azdls {
-                config: azdls_config_parse(config.props().clone())?.into(),
-                account_sas_tokens: azdls_account_sas_tokens_parse(config.props()).into(),
-            },
+            OpenDalStorageBackend::Azdls => {
+                let azdls_config = azdls_config_parse(config.props().clone())?;
+                OpenDalStorage::Azdls {
+                    account_configs: azdls_account_configs_parse(&azdls_config, config.props())
+                        .into(),
+                    config: azdls_config.into(),
+                }
+            }
             #[cfg(feature = "opendal-azblob")]
             OpenDalStorageBackend::Azblob => OpenDalStorage::Azblob {
                 config: azblob_config_parse(config.props().clone()).into(),
@@ -564,11 +568,11 @@ pub enum OpenDalStorage {
     Azdls {
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
-        /// SAS tokens scoped to one storage account, keyed by account host
-        /// (`<account>.dfs.<endpoint-suffix>`), as vended by REST catalogs.
-        /// For paths on that account they take precedence over `config`.
+        /// Configs for storage accounts with a SAS token scoped to them, as vended
+        /// by REST catalogs, keyed by account host (`<account>.dfs.<endpoint-suffix>`).
+        /// For paths on that account they are used instead of `config`.
         #[serde(default)]
-        account_sas_tokens: Arc<HashMap<String, String>>,
+        account_configs: Arc<HashMap<String, Arc<AzdlsConfig>>>,
     },
     /// Azure Blob Storage variant.
     #[cfg(feature = "opendal-azblob")]
@@ -635,10 +639,10 @@ impl OpenDalStorage {
         let backend_config = match self {
             OpenDalStorage::Azdls {
                 config,
-                account_sas_tokens,
+                account_configs,
             } => OperatorBackendConfig::Azdls(azdls_config_for_account(
                 config,
-                account_sas_tokens,
+                account_configs,
                 host,
             )),
             _ => backend_config,
@@ -765,8 +769,8 @@ impl OpenDalStorage {
             #[cfg(feature = "opendal-azdls")]
             OpenDalStorage::Azdls {
                 config,
-                account_sas_tokens,
-            } => azdls_create_operator(path, config, account_sas_tokens)?,
+                account_configs,
+            } => azdls_create_operator(path, config, account_configs)?,
             #[cfg(feature = "opendal-azblob")]
             OpenDalStorage::Azblob { config } => {
                 let operator = azblob_config_build(config, path)?;
@@ -1417,7 +1421,7 @@ mod tests {
                 endpoint: endpoint.map(str::to_string),
                 ..Default::default()
             }),
-            account_sas_tokens: Default::default(),
+            account_configs: Default::default(),
         };
         ConfiguredOpenDalStorage::new(storage, &StorageConfig::new(), default_operator_cache())
             .unwrap()
@@ -1905,7 +1909,7 @@ mod tests {
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                 ..Default::default()
             }),
-            account_sas_tokens: Default::default(),
+            account_configs: Default::default(),
         };
 
         assert_eq!(
