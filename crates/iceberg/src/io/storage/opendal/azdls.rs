@@ -51,7 +51,7 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     }
 
     if let Some(sas_token) = properties.remove(ADLS_SAS_TOKEN) {
-        config.sas_token = Some(sas_token);
+        config.sas_token = Some(normalize_sas_token(&sas_token).to_string());
     }
 
     if let Some(tenant_id) = properties.remove(ADLS_TENANT_ID) {
@@ -73,6 +73,12 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     Ok(config)
 }
 
+/// Strips the leading `?` of a SAS token copied from a URL: the signer appends
+/// the token to the request query as-is.
+fn normalize_sas_token(sas_token: &str) -> &str {
+    sas_token.trim_start_matches('?')
+}
+
 /// Parses `adls.sas-token.<account host>` properties into SAS tokens keyed by account host.
 pub(crate) fn azdls_account_sas_tokens_parse(
     properties: &HashMap<String, String>,
@@ -81,9 +87,7 @@ pub(crate) fn azdls_account_sas_tokens_parse(
         .iter()
         .filter_map(|(key, sas_token)| {
             let account_host = key.strip_prefix(ADLS_SAS_TOKEN_PREFIX)?;
-            // Tolerate the leading `?` of a SAS token copied from a URL; the
-            // signer appends the token to the request query as-is.
-            let sas_token = sas_token.trim_start_matches('?');
+            let sas_token = normalize_sas_token(sas_token);
             (!account_host.is_empty() && !sas_token.is_empty())
                 .then(|| (account_host.to_string(), sas_token.to_string()))
         })
@@ -400,6 +404,14 @@ mod tests {
                 Some(AzdlsConfig {
                     account_name: Some("test".to_string()),
                     sas_token: Some("token".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "SAS token copied with its leading question mark",
+                HashMap::from([(super::ADLS_SAS_TOKEN.to_string(), "?sv=1&sig=x".to_string())]),
+                Some(AzdlsConfig {
+                    sas_token: Some("sv=1&sig=x".to_string()),
                     ..Default::default()
                 }),
             ),

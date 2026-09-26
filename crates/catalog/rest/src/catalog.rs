@@ -483,7 +483,9 @@ impl RestCatalog {
 /// Returns the config of the vended storage credential that applies to `location`.
 ///
 /// Per the REST spec, clients choose the credential with the longest prefix matching
-/// the location, and prefer it over credentials in the table `config`.
+/// the location, and prefer it over credentials in the table `config`. Like Java, it
+/// is also applied on top of the catalog properties, so that a static credential on
+/// the catalog cannot replace part of a vended one.
 fn storage_credential_config(
     storage_credentials: Option<Vec<StorageCredential>>,
     location: &str,
@@ -495,6 +497,17 @@ fn storage_credential_config(
         .max_by_key(|credential| credential.prefix.len())
         .map(|credential| credential.config)
         .unwrap_or_default()
+}
+
+/// Returns the location to match vended storage credentials against: a file path,
+/// like Java's FileIO does. The metadata location is absent only for staged tables;
+/// the table location then stands for its directory, so that the usual
+/// `<table location>/` prefix matches it.
+fn storage_credential_location(metadata_location: Option<&str>, table_location: &str) -> String {
+    match metadata_location {
+        Some(metadata_location) => metadata_location.to_string(),
+        None => format!("{}/", table_location.trim_end_matches('/')),
+    }
 }
 
 /// All requests and expected responses are derived from the REST catalog API spec:
@@ -786,11 +799,11 @@ impl Catalog for RestCatalog {
         let config = response
             .config
             .into_iter()
+            .chain(self.user_config.props.clone())
             .chain(storage_credential_config(
                 response.storage_credentials,
                 metadata_location,
             ))
-            .chain(self.user_config.props.clone())
             .collect();
 
         let file_io = self
@@ -842,20 +855,18 @@ impl Catalog for RestCatalog {
             }
         };
 
-        // Match credentials against a file path, like Java's FileIO does. The
-        // metadata location is absent only for staged tables.
-        let location = response
-            .metadata_location
-            .as_deref()
-            .unwrap_or_else(|| response.metadata.location());
+        let location = storage_credential_location(
+            response.metadata_location.as_deref(),
+            response.metadata.location(),
+        );
         let config = response
             .config
             .into_iter()
+            .chain(self.user_config.props.clone())
             .chain(storage_credential_config(
                 response.storage_credentials,
-                location,
+                &location,
             ))
-            .chain(self.user_config.props.clone())
             .collect();
 
         let file_io = self
@@ -2377,6 +2388,100 @@ mod tests {
             None
         );
         assert!(storage_credential_config(None, "abfss://fs@account/ns/table").is_empty());
+
+        // Without a metadata location, the table directory matches its `<location>/`
+        // credential, whether or not the table location ends with a slash.
+        for table_location in [
+            "abfss://fs@account.dfs.core.windows.net/ns/table",
+            "abfss://fs@account.dfs.core.windows.net/ns/table/",
+        ] {
+            let location = storage_credential_location(None, table_location);
+            assert_eq!(token(&location).as_deref(), Some("table"));
+        }
+        assert_eq!(
+            storage_credential_location(Some("s3://b/t/metadata/v1.metadata.json"), "s3://b/t"),
+            "s3://b/t/metadata/v1.metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_table_applies_vended_storage_credentials() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let mut response: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        response["config"] = serde_json::json!({
+            "region": "us-west-2",
+            "s3.session-token": "from-config",
+            "s3.access-key-id": "from-config",
+        });
+        response["storage-credentials"] = serde_json::json!([
+            {
+                "prefix": "s3://warehouse/",
+                "config": {"s3.session-token": "warehouse", "s3.access-key-id": "warehouse"},
+            },
+            {
+                "prefix": "s3://warehouse/database/table/",
+                "config": {"s3.session-token": "table", "s3.access-key-id": "table"},
+            },
+            {
+                "prefix": "s3://other/database/table/",
+                "config": {"s3.session-token": "other", "s3.access-key-id": "other"},
+            },
+        ]);
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([
+                    ("s3.access-key-id".to_string(), "from-user".to_string()),
+                    ("s3.endpoint".to_string(), "http://from-user".to_string()),
+                ]))
+                .build(),
+        );
+
+        let table = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "test1".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let (_, props, _) = table.file_io().clone().into_builder().into_parts();
+        assert_eq!(props.get("region").map(String::as_str), Some("us-west-2"));
+        assert_eq!(
+            props.get("s3.session-token").map(String::as_str),
+            Some("table")
+        );
+        // The vended credential is applied as a whole, on top of the catalog
+        // properties, so a static key on the catalog cannot mix into it.
+        assert_eq!(
+            props.get("s3.access-key-id").map(String::as_str),
+            Some("table")
+        );
+        assert_eq!(
+            props.get("s3.endpoint").map(String::as_str),
+            Some("http://from-user")
+        );
+
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
     }
 
     #[tokio::test]
