@@ -26,6 +26,7 @@ mod utils;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -237,17 +238,35 @@ struct OperatorCacheKey {
     layer_options: OperatorLayerOptions,
 }
 
+/// The maximum number of operators one factory keeps.
+///
+/// Credentials are part of the cache key, so every refresh of vended credentials
+/// (e.g. a table reloaded before each commit) yields a new entry. Bounding the cache
+/// evicts the operators of expired credentials; the static credentials that make
+/// operators expensive to rebuild stay recently used.
+const OPERATOR_CACHE_CAPACITY: usize = 64;
+
 struct OperatorCacheEntry {
     key: OperatorCacheKey,
     operator: Arc<OnceCell<Operator>>,
+    /// Value of [`OperatorCache::clock`] at the latest lookup of this entry.
+    last_used: AtomicU64,
 }
 
-#[derive(Default)]
+/// A least-recently-used cache of operators.
 struct OperatorCache {
     // OpenDAL config types intentionally do not implement `Hash`. The number of
     // distinct bucket/config pairs owned by one catalog factory is expected to
     // be small, so a vector keeps equality exact without hashing credentials.
     entries: RwLock<Vec<OperatorCacheEntry>>,
+    capacity: usize,
+    clock: AtomicU64,
+}
+
+impl Default for OperatorCache {
+    fn default() -> Self {
+        Self::with_capacity(OPERATOR_CACHE_CAPACITY)
+    }
 }
 
 impl std::fmt::Debug for OperatorCache {
@@ -261,6 +280,28 @@ impl std::fmt::Debug for OperatorCache {
 }
 
 impl OperatorCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: RwLock::default(),
+            capacity: capacity.max(1),
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns the operator cell of the entry for `key`, marking it as used.
+    fn lookup(
+        &self,
+        entries: &[OperatorCacheEntry],
+        key: &OperatorCacheKey,
+    ) -> Option<Arc<OnceCell<Operator>>> {
+        let entry = entries.iter().find(|entry| entry.key == *key)?;
+        entry.last_used.store(
+            self.clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        Some(entry.operator.clone())
+    }
+
     fn get_or_create(
         &self,
         key: OperatorCacheKey,
@@ -273,10 +314,7 @@ impl OperatorCache {
                     format!("Operator cache lock poisoned: {error}"),
                 )
             })?;
-            entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .map(|entry| entry.operator.clone())
+            self.lookup(&entries, &key)
         };
 
         let operator = match operator {
@@ -288,13 +326,25 @@ impl OperatorCache {
                         format!("Operator cache lock poisoned: {error}"),
                     )
                 })?;
-                if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
-                    entry.operator.clone()
+                if let Some(operator) = self.lookup(&entries, &key) {
+                    operator
                 } else {
+                    if entries.len() >= self.capacity
+                        && let Some(lru) = entries
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+                            .map(|(index, _)| index)
+                    {
+                        // Operators handed out earlier stay valid; only the cache
+                        // forgets them.
+                        entries.swap_remove(lru);
+                    }
                     let operator = Arc::new(OnceCell::new());
                     entries.push(OperatorCacheEntry {
                         key,
                         operator: operator.clone(),
+                        last_used: AtomicU64::new(self.clock.fetch_add(1, Ordering::Relaxed)),
                     });
                     operator
                 }
@@ -1361,7 +1411,7 @@ mod tests {
     #[cfg(feature = "opendal-s3")]
     use iceberg::io::{
         CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
-        S3_SECRET_ACCESS_KEY,
+        S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
     };
 
     use super::*;
@@ -1511,6 +1561,53 @@ mod tests {
 
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_evicts_least_recently_used() {
+        let cache = OperatorCache::with_capacity(2);
+        let build_count = AtomicUsize::new(0);
+        let get = |bucket: &str| {
+            cache
+                .get_or_create(test_s3_cache_key(bucket), || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    let mut config = S3Config::default();
+                    config.region = Some("us-east-1".to_string());
+                    s3_config_build(&config, &None, &format!("s3://{bucket}/path/to/file"))
+                })
+                .unwrap()
+        };
+
+        get("a");
+        get("b");
+        get("a");
+        assert_eq!(build_count.load(Ordering::SeqCst), 2);
+
+        // `b` is the least recently used entry, so `c` replaces it.
+        get("c");
+        assert_eq!(cache.len(), 2);
+        get("a");
+        assert_eq!(build_count.load(Ordering::SeqCst), 3);
+        get("b");
+        assert_eq!(build_count.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_is_bounded_under_credential_refresh() {
+        let factory = OpenDalStorageFactory::s3();
+        for refresh in 0..OPERATOR_CACHE_CAPACITY + 16 {
+            let config = StorageConfig::new()
+                .with_prop(S3_REGION, "us-east-1")
+                .with_prop(S3_ACCESS_KEY_ID, "vended-access-key")
+                .with_prop(S3_SECRET_ACCESS_KEY, "vended-secret-key")
+                .with_prop(S3_SESSION_TOKEN, format!("vended-session-token-{refresh}"));
+            let storage = factory.build_configured(&config).unwrap();
+            create_cached_operator(&storage, "s3://test-bucket/path/to/file");
+        }
+        assert_eq!(factory.operator_cache.len(), OPERATOR_CACHE_CAPACITY);
     }
 
     #[cfg(feature = "opendal-s3")]
