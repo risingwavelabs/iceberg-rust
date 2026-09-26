@@ -842,6 +842,8 @@ impl Catalog for RestCatalog {
     /// are present in both the response from the REST server and the
     /// config provided when creating this `RestCatalog` instance then
     /// the value provided locally to the `RestCatalog` will take precedence.
+    /// A credential vended in `storage-credentials` for the table location
+    /// takes precedence over both, as a whole.
     async fn create_table(
         &self,
         namespace: &NamespaceIdent,
@@ -931,7 +933,8 @@ impl Catalog for RestCatalog {
     ///
     /// If there are any config properties that are present in both the response from the REST
     /// server and the config provided when creating this `RestCatalog` instance, then the value
-    /// provided locally to the `RestCatalog` will take precedence.
+    /// provided locally to the `RestCatalog` will take precedence. A credential vended in
+    /// `storage-credentials` for the table location takes precedence over both, as a whole.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let context = self.context().await?;
 
