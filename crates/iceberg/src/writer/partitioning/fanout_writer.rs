@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 
 use crate::spec::{PartitionKey, Struct};
 use crate::writer::partitioning::PartitioningWriter;
@@ -128,22 +129,32 @@ where
         // writer per active partition, so bounding the concurrency caps the
         // number of simultaneous uploads.
         //
-        // The drain loop uses a plain `buffer_unordered` stream: on the first
-        // failing close the remaining in-flight closes are not cancelled, and
-        // every started close runs to completion before the first error is
-        // surfaced.
-        let writers: Vec<B::R> = self.partition_writers.into_values().collect();
-        let mut close_stream = stream::iter(writers)
-            .map(|mut writer| async move { writer.close().await })
-            .buffer_unordered(DEFAULT_CLOSE_CONCURRENCY_LIMIT);
+        // Scheduling is explicit so that the first failing close stops new
+        // closes from being started: the closes already in flight are drained
+        // to completion (never cancelled mid-upload), and the remaining writers
+        // are dropped without being closed, since their output would be
+        // discarded with the error anyway.
+        let mut pending = self.partition_writers.into_values();
+        let mut in_flight = FuturesUnordered::new();
+        in_flight.extend(
+            pending
+                .by_ref()
+                .take(DEFAULT_CLOSE_CONCURRENCY_LIMIT)
+                .map(close_writer),
+        );
 
         let mut first_error = None;
-        while let Some(result) = close_stream.next().await {
+        while let Some(result) = in_flight.next().await {
             match result {
                 Ok(output) => self.output.extend(output),
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
+            }
+            if first_error.is_none()
+                && let Some(writer) = pending.next()
+            {
+                in_flight.push(close_writer(writer));
             }
         }
 
@@ -152,6 +163,15 @@ where
         }
         Ok(O::from_iter(self.output))
     }
+}
+
+/// Closes a single partition writer, taking ownership so the close future is `'static`.
+async fn close_writer<W, I, O>(mut writer: W) -> Result<O>
+where
+    W: IcebergWriter<I, O>,
+    I: Send + 'static,
+{
+    writer.close().await
 }
 
 #[cfg(test)]
@@ -561,21 +581,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_close_drains_remaining_closes_on_error() -> Result<()> {
+    async fn test_close_stops_scheduling_after_error_and_drains_in_flight() -> Result<()> {
         let (schema, spec) = build_schema_and_spec();
         let state = Arc::new(MockCloseState::default());
-        // Fail the first-built writer. Partition-writer close order follows an
-        // arbitrary HashMap iteration order, so we assert only that the error
-        // propagates and that every started close still completes — not which
-        // partition errored.
+        let num_partitions = DEFAULT_CLOSE_CONCURRENCY_LIMIT * 2;
+        // Every writer fails, so whichever writers land in the first
+        // concurrency window (HashMap iteration order is arbitrary) are
+        // guaranteed to fail. The barrier holds them until the whole window
+        // has started, so all of them are in flight when the first error
+        // surfaces.
         let builder = MockWriterBuilder {
             state: state.clone(),
             barrier: Arc::new(Barrier::new(DEFAULT_CLOSE_CONCURRENCY_LIMIT)),
-            fail_indices: vec![0],
+            fail_indices: (0..num_partitions).collect(),
         };
         let mut writer = FanoutWriter::<MockWriterBuilder, (), Vec<u32>>::new(builder);
 
-        let num_partitions = DEFAULT_CLOSE_CONCURRENCY_LIMIT * 2;
         for i in 0..num_partitions {
             writer
                 .write(partition_key_for(&schema, &spec, &format!("p{i}")), ())
@@ -588,17 +609,17 @@ mod tests {
             "close() should surface the failing writer's error"
         );
 
-        // Plain `buffer_unordered` must drain every started close instead of
-        // cancelling the rest on the first error.
+        // No close beyond the first window is started once an error is seen.
         assert_eq!(
             state.started.load(Ordering::SeqCst),
-            num_partitions,
-            "all partition writers should have started closing"
+            DEFAULT_CLOSE_CONCURRENCY_LIMIT,
+            "no new closes should be scheduled after the first error"
         );
+        // Closes already in flight are drained, not cancelled.
         assert_eq!(
             state.finished.load(Ordering::SeqCst),
-            num_partitions,
-            "all started closes should drain to completion (no cancellation)"
+            DEFAULT_CLOSE_CONCURRENCY_LIMIT,
+            "in-flight closes should drain to completion (no cancellation)"
         );
         Ok(())
     }
