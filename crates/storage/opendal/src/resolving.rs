@@ -117,6 +117,9 @@ fn build_storage_for_scheme(
         "azdls" => {
             let config = crate::azdls::azdls_config_parse(props.clone())?;
             Ok(OpenDalStorage::Azdls {
+                account_configs: Arc::new(crate::azdls::azdls_account_configs_parse(
+                    &config, props,
+                )),
                 config: Arc::new(config),
             })
         }

@@ -475,9 +475,14 @@ impl OpenDalStorageFactory {
                 config: oss_config_parse(config.props().clone())?.into(),
             },
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageBackend::Azdls => OpenDalStorage::Azdls {
-                config: azdls_config_parse(config.props().clone())?.into(),
-            },
+            OpenDalStorageBackend::Azdls => {
+                let azdls_config = azdls_config_parse(config.props().clone())?;
+                OpenDalStorage::Azdls {
+                    account_configs: azdls_account_configs_parse(&azdls_config, config.props())
+                        .into(),
+                    config: azdls_config.into(),
+                }
+            }
             #[cfg(feature = "opendal-azblob")]
             OpenDalStorageBackend::Azblob => OpenDalStorage::Azblob {
                 config: azblob_config_parse(config.props().clone()).into(),
@@ -563,6 +568,11 @@ pub enum OpenDalStorage {
     Azdls {
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
+        /// Configs for storage accounts with a SAS token scoped to them, as vended
+        /// by REST catalogs, keyed by account host (`<account>.dfs.<endpoint-suffix>`).
+        /// For paths on that account they are used instead of `config`.
+        #[serde(default)]
+        account_configs: Arc<HashMap<String, Arc<AzdlsConfig>>>,
     },
     /// Azure Blob Storage variant.
     #[cfg(feature = "opendal-azblob")]
@@ -595,7 +605,7 @@ impl OpenDalStorage {
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorage::Gcs { config } => OperatorBackendConfig::Gcs(config.clone()),
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => OperatorBackendConfig::Azdls(config.clone()),
+            OpenDalStorage::Azdls { config, .. } => OperatorBackendConfig::Azdls(config.clone()),
             _ => return Ok(None),
         };
 
@@ -622,6 +632,20 @@ impl OpenDalStorage {
                 format!("{}://{filesystem}@{host}", url.scheme())
             }
             _ => host.to_string(),
+        };
+        // A SAS token scoped to the path's storage account replaces the configured
+        // credentials, so it has to scope the operator as well.
+        #[cfg(feature = "opendal-azdls")]
+        let backend_config = match self {
+            OpenDalStorage::Azdls {
+                config,
+                account_configs,
+            } => OperatorBackendConfig::Azdls(azdls_config_for_account(
+                config,
+                account_configs,
+                host,
+            )),
+            _ => backend_config,
         };
         Ok(Some(OperatorCacheKey {
             backend_config,
@@ -743,7 +767,10 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config)?,
+            OpenDalStorage::Azdls {
+                config,
+                account_configs,
+            } => azdls_create_operator(path, config, account_configs)?,
             #[cfg(feature = "opendal-azblob")]
             OpenDalStorage::Azblob { config } => {
                 let operator = azblob_config_build(config, path)?;
@@ -932,7 +959,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => {
+            OpenDalStorage::Azdls { config, .. } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
                 match_path_with_config(&azure_path, config)?;
                 let relative_path_len = azure_path.path.len();
@@ -1394,6 +1421,7 @@ mod tests {
                 endpoint: endpoint.map(str::to_string),
                 ..Default::default()
             }),
+            account_configs: Default::default(),
         };
         ConfiguredOpenDalStorage::new(storage, &StorageConfig::new(), default_operator_cache())
             .unwrap()
@@ -1449,6 +1477,67 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_account_sas_token_scopes_operator() {
+        let factory = OpenDalStorageFactory::azdls();
+        let storage = |sas_token: &str| {
+            let config = StorageConfig::new()
+                .with_prop(
+                    "adls.sas-token.myaccount.dfs.core.windows.net",
+                    sas_token.to_string(),
+                )
+                .with_prop(
+                    "adls.sas-token.otheraccount.dfs.core.windows.net",
+                    "sv=2&sig=other".to_string(),
+                );
+            factory.build_configured(&config).unwrap()
+        };
+        let sas_token_for = |storage: &ConfiguredOpenDalStorage, path: &str| {
+            let key = storage
+                .storage
+                .operator_cache_key(path, &storage.options)
+                .unwrap()
+                .expect("azdls operators are cached");
+            match key.backend_config {
+                OperatorBackendConfig::Azdls(config) => config.sas_token.clone(),
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("azdls storage yields an azdls cache key"),
+            }
+        };
+
+        let first = storage("sv=1&sig=mine");
+        let path = "abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet";
+        assert_eq!(
+            sas_token_for(&first, path).as_deref(),
+            Some("sv=1&sig=mine")
+        );
+        assert_eq!(
+            sas_token_for(
+                &first,
+                "abfss://myfs@otheraccount.dfs.core.windows.net/path/to/one.parquet"
+            )
+            .as_deref(),
+            Some("sv=2&sig=other")
+        );
+        assert_eq!(
+            sas_token_for(
+                &first,
+                "abfss://myfs@thirdaccount.dfs.core.windows.net/path/to/one.parquet"
+            ),
+            None
+        );
+
+        // A FileIO built from a later catalog response carries a refreshed token and
+        // must not reuse the operator signed with the previous one.
+        let refreshed = storage("sv=1&sig=refreshed");
+        create_cached_operator(&first, path);
+        create_cached_operator(&refreshed, path);
+        assert_eq!(first.operator_cache.len(), 2);
+        create_cached_operator(&refreshed, path);
+        assert_eq!(first.operator_cache.len(), 2);
     }
 
     #[cfg(feature = "opendal-azdls")]
@@ -1820,6 +1909,7 @@ mod tests {
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                 ..Default::default()
             }),
+            account_configs: Default::default(),
         };
 
         assert_eq!(

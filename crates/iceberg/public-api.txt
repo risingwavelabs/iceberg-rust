@@ -1167,6 +1167,7 @@ pub const iceberg::io::ADLS_CLIENT_ID: &str
 pub const iceberg::io::ADLS_CLIENT_SECRET: &str
 pub const iceberg::io::ADLS_CONNECTION_STRING: &str
 pub const iceberg::io::ADLS_SAS_TOKEN: &str
+pub const iceberg::io::ADLS_SAS_TOKEN_PREFIX: &str
 pub const iceberg::io::ADLS_TENANT_ID: &str
 pub const iceberg::io::AZBLOB_ACCOUNT_KEY: &str
 pub const iceberg::io::AZBLOB_ACCOUNT_NAME: &str
