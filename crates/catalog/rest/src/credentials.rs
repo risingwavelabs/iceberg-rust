@@ -1,0 +1,1125 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Table-scoped credential vending. Metadata snapshots are never refreshed here.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use iceberg::io::{ADLS_SAS_TOKEN, FileIOCredential, FileIOCredentialProvider};
+use iceberg::{Error, ErrorKind, Result};
+use reqwest::{Method, StatusCode, Url};
+use serde::Deserialize;
+use tokio::sync::Mutex;
+
+use crate::client::HttpClient;
+use crate::types::{LoadTableResult, StorageCredential};
+
+const LEASE: Duration = Duration::from_secs(300);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn invalid(message: &'static str) -> Error {
+    Error::new(ErrorKind::DataInvalid, message)
+}
+
+/// Reject URL aliasing and compare directory boundaries, not host suffixes.
+fn matches_prefix(prefix: &Url, location: &Url) -> bool {
+    prefix.scheme() == location.scheme()
+        && prefix.host_str() == location.host_str()
+        && prefix.port() == location.port()
+        && prefix.username() == location.username()
+        && prefix.password().is_none()
+        && prefix.query().is_none()
+        && prefix.fragment().is_none()
+        && (prefix.path() == location.path()
+            || location
+                .path()
+                .strip_prefix(prefix.path())
+                .is_some_and(|suffix| prefix.path().ends_with('/') || suffix.starts_with('/')))
+}
+
+// These types deliberately have no Debug implementation: they contain secrets.
+struct ParsedCredential {
+    properties: HashMap<String, String>,
+    expiry: Option<SystemTime>,
+}
+
+type ParsedResult = std::result::Result<ParsedCredential, &'static str>;
+
+struct ParsedProperties {
+    adls: HashMap<String, ParsedResult>,
+    adls_default: ParsedResult,
+    s3: ParsedResult,
+}
+
+fn parse_expiry(
+    value: &str,
+    message: &'static str,
+) -> std::result::Result<SystemTime, &'static str> {
+    let millis = value.parse::<u64>().map_err(|_| message)?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(millis))
+        .ok_or(message)
+}
+
+impl ParsedProperties {
+    fn new(properties: HashMap<String, String>) -> Self {
+        let mut adls = HashMap::new();
+        for host in properties.keys().filter_map(|key| {
+            key.strip_prefix("adls.sas-token.")
+                .or_else(|| key.strip_prefix("adls.sas-token-expires-at-ms."))
+        }) {
+            adls.entry(host.to_string())
+                .or_insert_with(|| Self::adls(&properties, Some(host)));
+        }
+        Self {
+            adls,
+            adls_default: Self::adls(&properties, None),
+            s3: Self::s3(&properties),
+        }
+    }
+
+    fn adls(properties: &HashMap<String, String>, host: Option<&str>) -> ParsedResult {
+        let token = host
+            .and_then(|host| properties.get(&format!("{ADLS_SAS_TOKEN}.{host}")))
+            .or_else(|| properties.get(ADLS_SAS_TOKEN))
+            .filter(|value| !value.trim_start_matches('?').is_empty())
+            .ok_or("No ADLS SAS credential matches the file account and prefix")?
+            .trim_start_matches('?')
+            .to_string();
+        let parameters: HashMap<_, _> = url::form_urlencoded::parse(token.as_bytes()).collect();
+        let mut expiry = parameters
+            .get("se")
+            .map(|se| {
+                chrono::DateTime::parse_from_rfc3339(se)
+                    .map(SystemTime::from)
+                    .map_err(|_| "Invalid ADLS SAS expiry")
+            })
+            .transpose()?;
+        let explicit = host
+            .and_then(|host| properties.get(&format!("adls.sas-token-expires-at-ms.{host}")))
+            .or_else(|| properties.get("adls.sas-token-expires-at-ms"));
+        if let Some(value) = explicit {
+            let time = parse_expiry(value, "Invalid ADLS credential expiry")?;
+            expiry = Some(expiry.map_or(time, |old| old.min(time)));
+        }
+        Ok(ParsedCredential {
+            properties: HashMap::from([(ADLS_SAS_TOKEN.to_string(), token)]),
+            expiry,
+        })
+    }
+
+    fn s3(properties: &HashMap<String, String>) -> ParsedResult {
+        for key in ["s3.access-key-id", "s3.secret-access-key"] {
+            if properties.get(key).is_none_or(|value| value.is_empty()) {
+                return Err("Incomplete vended S3 credential");
+            }
+        }
+        let expiry = properties
+            .get("s3.session-token-expires-at-ms")
+            .map(|value| parse_expiry(value, "Invalid S3 credential expiry"))
+            .transpose()?;
+        // Only authentication fields are needed by the signer.
+        let properties = [
+            "s3.access-key-id",
+            "s3.secret-access-key",
+            "s3.session-token",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            properties
+                .get(key)
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect();
+        Ok(ParsedCredential { properties, expiry })
+    }
+
+    fn select(&self, location: &Url) -> Result<&ParsedCredential> {
+        let credential = match location.scheme() {
+            "abfs" | "abfss" | "wasb" | "wasbs" => {
+                let host = location
+                    .host_str()
+                    .ok_or_else(|| invalid("ADLS location has no account"))?;
+                self.adls.get(host).unwrap_or(&self.adls_default)
+            }
+            "s3" | "s3a" | "s3n" => &self.s3,
+            _ => return Err(invalid("Unsupported vended credential backend")),
+        };
+        credential.as_ref().map_err(|message| invalid(message))
+    }
+}
+
+struct ScopedCredential {
+    prefix: Url,
+    prefix_len: usize,
+    properties: ParsedProperties,
+}
+
+pub(crate) struct CredentialSet {
+    config: ParsedProperties,
+    entries: Vec<ScopedCredential>,
+    issued_at: SystemTime,
+}
+
+impl CredentialSet {
+    pub(crate) fn new(
+        config: HashMap<String, String>,
+        entries: Option<Vec<StorageCredential>>,
+    ) -> Self {
+        Self {
+            issued_at: SystemTime::now(),
+            config: ParsedProperties::new(config),
+            entries: entries
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    Some(ScopedCredential {
+                        prefix: Url::parse(&entry.prefix).ok()?,
+                        prefix_len: entry.prefix.len(),
+                        properties: ParsedProperties::new(entry.config),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn select(&self, location: &Url) -> Result<&ParsedCredential> {
+        self.entries
+            .iter()
+            .filter(|entry| matches_prefix(&entry.prefix, location))
+            .max_by_key(|entry| entry.prefix_len)
+            .map(|entry| &entry.properties)
+            .unwrap_or(&self.config)
+            .select(location)
+    }
+
+    fn credential(&self, location: &Url, now: SystemTime, fresh: bool) -> Result<FileIOCredential> {
+        let credential = self.select(location)?;
+        let deadline = credential.expiry.unwrap_or(self.issued_at + LEASE);
+        let lifetime = deadline.duration_since(self.issued_at).unwrap_or_default();
+        let margin = (lifetime / 5).min(Duration::from_secs(30));
+        if now >= deadline || (fresh && now + margin >= deadline) {
+            return Err(invalid("Vended storage credential requires refresh"));
+        }
+        // Keep leases below reqsign's cache freshness windows (ADLS: 20s,
+        // AWS: 120s), but above AWS's 10s signing-operation headroom.
+        // Every request consults this manager, even on an already-open handle.
+        let lease = if matches!(location.scheme(), "s3" | "s3a" | "s3n") {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        Ok(FileIOCredential {
+            properties: credential.properties.clone(),
+            expires_at: deadline.min(now + lease),
+        })
+    }
+}
+
+struct State {
+    set: CredentialSet,
+    retry_after: SystemTime,
+    endpoint: Option<bool>,
+    revoked: bool,
+}
+
+pub(crate) struct RestCredentials {
+    client: Arc<HttpClient>,
+    table_url: String,
+    state: Mutex<State>,
+}
+
+impl std::fmt::Debug for RestCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestCredentials").finish_non_exhaustive()
+    }
+}
+
+impl RestCredentials {
+    /// Feed newer load/commit credentials to all existing handles.
+    pub(crate) async fn update(&self, set: CredentialSet) {
+        let mut state = self.state.lock().await;
+        state.set = set;
+        state.retry_after = UNIX_EPOCH;
+        state.revoked = false;
+    }
+
+    pub(crate) fn new(
+        client: Arc<HttpClient>,
+        table_url: String,
+        set: CredentialSet,
+        endpoint: Option<bool>,
+    ) -> Self {
+        Self {
+            client,
+            table_url,
+            state: Mutex::new(State {
+                set,
+                endpoint,
+                retry_after: UNIX_EPOCH,
+                revoked: false,
+            }),
+        }
+    }
+
+    async fn fetch(&self, state: &mut State) -> Result<CredentialSet> {
+        if state.endpoint != Some(false) {
+            let response = self
+                .request(format!("{}/credentials", self.table_url), state)
+                .await?;
+            match response.status() {
+                StatusCode::OK => {
+                    #[derive(Deserialize)]
+                    struct Response {
+                        #[serde(rename = "storage-credentials")]
+                        credentials: Vec<StorageCredential>,
+                    }
+                    let response: Response = response
+                        .json()
+                        .await
+                        .map_err(|_| invalid("Invalid REST storage credential response"))?;
+                    state.endpoint = Some(true);
+                    return Ok(CredentialSet::new(
+                        HashMap::new(),
+                        Some(response.credentials),
+                    ));
+                }
+                StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::NOT_IMPLEMENTED
+                    if state.endpoint.is_none() =>
+                {
+                    // Legacy server: confirm access with loadTable. Never fall
+                    // back to local credentials based on a 404 alone.
+                    // Persist the pending confirmation before awaiting loadTable,
+                    // including if that request fails, times out, or is cancelled.
+                    state.revoked |= response.status() == StatusCode::NOT_FOUND;
+                    state.endpoint = Some(false);
+                }
+                status => return Err(Self::response_error(state, status)),
+            }
+        }
+        let response = self.request(self.table_url.clone(), state).await?;
+        if response.status() != StatusCode::OK {
+            return Err(Self::response_error(state, response.status()));
+        }
+        let response: LoadTableResult = response
+            .json()
+            .await
+            .map_err(|_| invalid("Invalid REST table credential response"))?;
+        Ok(CredentialSet::new(
+            response.config,
+            response.storage_credentials,
+        ))
+    }
+
+    async fn request(&self, url: String, state: &mut State) -> Result<reqwest::Response> {
+        let request = self
+            .client
+            .request(Method::GET, url)
+            .header("X-Iceberg-Access-Delegation", "vended-credentials")
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| invalid("Unable to build credential refresh request"))?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.client.query_credentials(request, &mut state.revoked),
+        )
+        .await
+        .map_err(|_| Error::new(ErrorKind::Unexpected, "REST credential refresh timed out"))?
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "REST storage credential refresh failed",
+            )
+        })
+    }
+
+    fn response_error(state: &mut State, status: StatusCode) -> Error {
+        // Don't expose response bodies, which may contain credential material.
+        if matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            state.revoked = true;
+        }
+        Error::new(
+            ErrorKind::Unexpected,
+            "REST storage credential refresh rejected",
+        )
+        .with_context("status", status.as_u16().to_string())
+    }
+}
+
+#[async_trait]
+impl FileIOCredentialProvider for RestCredentials {
+    async fn credential(&self, location: &str) -> Result<FileIOCredential> {
+        let location = Url::parse(location).map_err(|_| invalid("Invalid credential location"))?;
+        if location.query().is_some()
+            || location.fragment().is_some()
+            || location.password().is_some()
+        {
+            return Err(invalid(
+                "Credential location must not contain a query, fragment or password",
+            ));
+        }
+
+        // Holding this lock across refresh provides single-flight and cancellation
+        // safety; a dropped future releases the lock without publishing partial data.
+        let mut state = self.state.lock().await;
+        let now = SystemTime::now();
+        if !state.revoked
+            && let Ok(credential) = state.set.credential(&location, now, true)
+        {
+            return Ok(credential);
+        }
+        if now < state.retry_after {
+            return if state.revoked {
+                Err(invalid("Vended storage access was revoked"))
+            } else {
+                state.set.credential(&location, now, false)
+            };
+        }
+        state.retry_after = now + RETRY_DELAY;
+        let refreshed = self.fetch(&mut state).await;
+        state.retry_after = SystemTime::now() + RETRY_DELAY;
+        match refreshed {
+            Ok(set) => {
+                // Even an empty/narrower successful response replaces the old
+                // authorization. Never resurrect an old prefix during backoff.
+                state.set = set;
+                state.revoked = false;
+                state.set.credential(&location, SystemTime::now(), false)
+            }
+            Err(error) => {
+                if !state.revoked
+                    && let Ok(credential) =
+                        state.set.credential(&location, SystemTime::now(), false)
+                {
+                    return Ok(credential);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::io::{
+        ADLS_ACCOUNT_KEY, ADLS_ENDPOINT, CredentialProvider, FileIO, FileIOBuilder, StorageFactory,
+    };
+    use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
+    use mockito::{Matcher, Server};
+    use serde_json::json;
+
+    use super::*;
+    use crate::catalog::RestCatalogConfig;
+
+    const LOCATION: &str = "abfss://fs@acct.dfs.core.windows.net/table/data/file";
+    const ROOT: &str = "abfss://fs@acct.dfs.core.windows.net/table/";
+    const KEY: &str = "adls.sas-token.acct.dfs.core.windows.net";
+
+    fn config(token: &str) -> HashMap<String, String> {
+        HashMap::from([(KEY.to_string(), token.to_string())])
+    }
+
+    fn provider(
+        server: &mockito::ServerGuard,
+        set: CredentialSet,
+        endpoint: Option<bool>,
+    ) -> Arc<RestCredentials> {
+        let cfg = RestCatalogConfig::builder().uri(server.url()).build();
+        Arc::new(RestCredentials::new(
+            Arc::new(HttpClient::new(&cfg).unwrap()),
+            format!("{}/table", server.url()),
+            set,
+            endpoint,
+        ))
+    }
+
+    fn adls_factories() -> [Arc<dyn StorageFactory>; 2] {
+        [
+            Arc::new(OpenDalStorageFactory::azdls()),
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ]
+    }
+
+    fn adls_file_io(
+        factory: Arc<dyn StorageFactory>,
+        server: &mockito::ServerGuard,
+        provider: Arc<RestCredentials>,
+    ) -> FileIO {
+        FileIOBuilder::new(factory)
+            // Keep endpoint-suffix validation while routing directly to loopback.
+            .with_prop(ADLS_ENDPOINT, format!("{}/core.windows.net", server.url()))
+            // Neither static authentication mode may override the REST provider.
+            .with_prop(ADLS_SAS_TOKEN, "sig=static")
+            .with_prop(ADLS_ACCOUNT_KEY, "ZHVtbXktc3RhdGljLWtleQ==")
+            .with_prop("io.max-retries", "0")
+            .with_prop("io.timeout", "3")
+            .with_prop("io.write.chunk-size", "4")
+            .with_credentials(CredentialProvider(provider))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn adls_open_handles_use_refreshed_rest_credentials_on_http_requests() {
+        for factory in adls_factories() {
+            let mut catalog = Server::new_async().await;
+            let mut storage = Server::new_async().await;
+            let root = ROOT.replace("abfss:", "abfs:");
+            let provider = provider(
+                &catalog,
+                CredentialSet::new(
+                    HashMap::from([(ADLS_SAS_TOKEN.into(), "sig=0".into())]),
+                    None,
+                ),
+                Some(true),
+            );
+            let io = adls_file_io(factory, &storage, provider.clone());
+            let reader = io
+                .new_input(format!("{root}data/file"))
+                .unwrap()
+                .reader()
+                .await
+                .unwrap();
+            let mut writer = io
+                .new_output(format!("{root}data/output"))
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
+            let head = storage
+                .mock("HEAD", "/core.windows.net/fs/table/data/output")
+                .match_query(Matcher::UrlEncoded("sig".into(), "0".into()))
+                .match_header("authorization", Matcher::Missing)
+                .with_header("content-length", "0")
+                .expect(1)
+                .create_async()
+                .await;
+            let create = storage
+                .mock("PUT", "/core.windows.net/fs/table/data/output")
+                .match_query(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("resource".into(), "file".into()),
+                    Matcher::UrlEncoded("sig".into(), "0".into()),
+                ]))
+                .match_header("authorization", Matcher::Missing)
+                .with_status(201)
+                .expect(1)
+                .create_async()
+                .await;
+
+            for generation in 0..3 {
+                let refresh = if generation > 0 {
+                    // Expire the manager's lease deterministically, without sleeps.
+                    let mut state = provider.state.lock().await;
+                    state.set.issued_at = SystemTime::now() - LEASE - Duration::from_secs(1);
+                    state.retry_after = UNIX_EPOCH;
+                    drop(state);
+                    Some(catalog.mock("GET", "/table/credentials")
+                        .match_header("X-Iceberg-Access-Delegation", "vended-credentials")
+                        .with_body(json!({"storage-credentials": [
+                            {"prefix": format!("{root}metadata/"), "config": config("sig=metadata")},
+                            {"prefix": format!("{root}data/"), "config": config(&format!("?sig={generation}"))}
+                        ]}).to_string())
+                        .expect(1).create_async().await)
+                } else {
+                    None
+                };
+                let read = storage
+                    .mock("GET", "/core.windows.net/fs/table/data/file")
+                    .match_query(Matcher::UrlEncoded("sig".into(), generation.to_string()))
+                    .match_header("authorization", Matcher::Missing)
+                    .match_header("range", "bytes=0-3")
+                    .with_status(206)
+                    .with_header("content-range", "bytes 0-3/4")
+                    .with_body("data")
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let append = storage
+                    .mock("PATCH", "/core.windows.net/fs/table/data/output")
+                    .match_query(Matcher::AllOf(vec![
+                        Matcher::UrlEncoded("action".into(), "append".into()),
+                        Matcher::UrlEncoded("position".into(), (generation * 4).to_string()),
+                        Matcher::UrlEncoded("flush".into(), "true".into()),
+                        Matcher::UrlEncoded("sig".into(), generation.to_string()),
+                    ]))
+                    .match_header("authorization", Matcher::Missing)
+                    .match_body("data")
+                    .with_status(202)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                // Let the writer trigger one refresh, and the reader the next.
+                // Keep one byte buffered so each call sends a complete chunk.
+                let bytes = if generation == 0 {
+                    b"datad".as_slice()
+                } else {
+                    b"atad".as_slice()
+                };
+                if generation == 1 {
+                    writer.write(bytes.into()).await.unwrap();
+                }
+                assert_eq!(reader.read(0..4).await.unwrap().as_ref(), b"data");
+                if generation != 1 {
+                    writer.write(bytes.into()).await.unwrap();
+                }
+                read.assert_async().await;
+                append.assert_async().await;
+                if let Some(refresh) = refresh {
+                    refresh.assert_async().await;
+                    refresh.remove_async().await;
+                }
+            }
+            let tail = storage
+                .mock("PATCH", "/core.windows.net/fs/table/data/output")
+                .match_query(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("action".into(), "append".into()),
+                    Matcher::UrlEncoded("position".into(), "12".into()),
+                    Matcher::UrlEncoded("flush".into(), "true".into()),
+                    Matcher::UrlEncoded("sig".into(), "2".into()),
+                ]))
+                .match_header("authorization", Matcher::Missing)
+                .match_body("d")
+                .with_status(202)
+                .expect(1)
+                .create_async()
+                .await;
+            writer.close().await.unwrap();
+            tail.assert_async().await;
+            head.assert_async().await;
+            create.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn adls_rest_refresh_failures_never_send_static_or_unsigned_requests() {
+        for factory in adls_factories() {
+            for status in [200, 403, 503] {
+                let mut catalog = Server::new_async().await;
+                let mut storage = Server::new_async().await;
+                let refresh = catalog
+                    .mock("GET", "/table/credentials")
+                    .with_status(status)
+                    .with_body(r#"{"storage-credentials":[]}"#)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let provider = provider(
+                    &catalog,
+                    CredentialSet::new(config("sig=expired&se=2000-01-01T00:00:00Z"), None),
+                    Some(true),
+                );
+                let io = adls_file_io(factory.clone(), &storage, provider);
+                let mut requests = Vec::new();
+                for method in ["GET", "HEAD", "PUT", "PATCH"] {
+                    requests.push(
+                        storage
+                            .mock(method, Matcher::Any)
+                            .with_body("must not be reached")
+                            .expect(0)
+                            .create_async()
+                            .await,
+                    );
+                }
+                let location = LOCATION.replace("abfss:", "abfs:");
+                let reader = io.new_input(&location).unwrap().reader().await.unwrap();
+                let mut writer = io.new_output(&location).unwrap().writer().await.unwrap();
+                assert!(reader.read(0..4).await.is_err());
+                assert!(writer.write(b"datad".as_slice().into()).await.is_err());
+                refresh.assert_async().await;
+                for request in requests {
+                    request.assert_async().await;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn account_and_prefix_selection_is_exact() {
+        let entries = vec![
+            StorageCredential {
+                prefix: ROOT.to_string(),
+                config: config("?sig=root"),
+            },
+            StorageCredential {
+                prefix: format!("{ROOT}data/"),
+                config: config("?sig=data"),
+            },
+        ];
+        let set = CredentialSet::new(config("sig=fallback"), Some(entries));
+        let selected = set
+            .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .unwrap();
+        assert_eq!(selected.properties[ADLS_SAS_TOKEN], "sig=data");
+        assert!(!matches_prefix(
+            &Url::parse(ROOT).unwrap(),
+            &Url::parse(&LOCATION.replace("/table/", "/table2/")).unwrap()
+        ));
+        assert!(!matches_prefix(
+            &Url::parse(ROOT).unwrap(),
+            &Url::parse(&LOCATION.replace("acct.", "otheracct.")).unwrap()
+        ));
+        assert!(!matches_prefix(
+            &Url::parse(ROOT).unwrap(),
+            &Url::parse(&LOCATION.replace("fs@", "otherfs@")).unwrap()
+        ));
+        assert!(!matches_prefix(
+            &Url::parse(ROOT).unwrap(),
+            &Url::parse(&LOCATION.replace("abfss:", "abfs:")).unwrap()
+        ));
+        assert!(
+            set.select(&Url::parse(&LOCATION.replace("acct.", "otheracct.")).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expiry_and_debug_do_not_expose_tokens() {
+        let set = CredentialSet::new(config("sig=secret&se=2000-01-01T00%3A00%3A00Z"), None);
+        assert!(
+            set.credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+                .is_err()
+        );
+        let set = CredentialSet::new(config("sig=secret&se=not-a-date"), None);
+        let error = set.select(&Url::parse(LOCATION).unwrap()).err().unwrap();
+        assert!(!format!("{error:?}").contains("secret"));
+        assert!(!format!("{error:?}").contains("not-a-date"));
+        let set = CredentialSet::new(config("sig=secret"), None);
+        let credential = set
+            .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .unwrap();
+        assert!(!format!("{credential:?}").contains("secret"));
+    }
+
+    #[test]
+    fn s3_credentials_are_not_merged_field_by_field() {
+        let set = CredentialSet::new(
+            HashMap::from([
+                ("s3.access-key-id".into(), "static".into()),
+                ("s3.secret-access-key".into(), "static-secret".into()),
+            ]),
+            Some(vec![StorageCredential {
+                prefix: "s3://bucket/table/".into(),
+                config: HashMap::from([("s3.access-key-id".into(), "vended".into())]),
+            }]),
+        );
+        assert!(
+            set.select(&Url::parse("s3://bucket/table/data").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn preparsing_preserves_account_precedence_and_both_expiry_limits() {
+        let now = SystemTime::now();
+        let sas_expiry = now + Duration::from_secs(120);
+        let explicit_expiry = now + Duration::from_secs(60);
+        let expiry = chrono::DateTime::<chrono::Utc>::from(sas_expiry)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut properties = config(&format!("?sig=account&se={expiry}"));
+        properties.insert(ADLS_SAS_TOKEN.into(), "sig=flat".into());
+        properties.insert("adls.sas-token-expires-at-ms".into(), "invalid-flat".into());
+        properties.insert(
+            "adls.sas-token-expires-at-ms.acct.dfs.core.windows.net".into(),
+            explicit_expiry
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .to_string(),
+        );
+        let set = CredentialSet::new(properties, None);
+        let selected = set.select(&Url::parse(LOCATION).unwrap()).ok().unwrap();
+        assert!(selected.properties[ADLS_SAS_TOKEN].starts_with("sig=account&"));
+        assert_eq!(
+            selected
+                .expiry
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            explicit_expiry
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        assert!(
+            set.select(&Url::parse(&LOCATION.replace("acct.", "other.")).unwrap())
+                .is_err()
+        );
+
+        // An account-specific expiry also applies when the token itself is flat.
+        let set = CredentialSet::new(
+            HashMap::from([
+                (ADLS_SAS_TOKEN.into(), format!("sig=flat&se={expiry}")),
+                (
+                    "adls.sas-token-expires-at-ms.acct.dfs.core.windows.net".into(),
+                    "0".into(),
+                ),
+            ]),
+            None,
+        );
+        assert!(
+            set.credential(&Url::parse(LOCATION).unwrap(), now, false)
+                .is_err()
+        );
+        assert!(
+            set.credential(
+                &Url::parse(&LOCATION.replace("acct.", "other.")).unwrap(),
+                now,
+                false
+            )
+            .is_ok()
+        );
+
+        // A longer explicit lifetime must not extend the signed SAS expiry.
+        let set = CredentialSet::new(
+            HashMap::from([
+                (
+                    ADLS_SAS_TOKEN.into(),
+                    "sig=expired&se=2000-01-01T00:00:00Z".into(),
+                ),
+                (
+                    "adls.sas-token-expires-at-ms".into(),
+                    explicit_expiry
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                        .to_string(),
+                ),
+            ]),
+            None,
+        );
+        assert!(
+            set.credential(&Url::parse(LOCATION).unwrap(), now, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_unselected_credentials_do_not_poison_other_scopes() {
+        let set = CredentialSet::new(
+            config("sig=fallback"),
+            Some(vec![
+                StorageCredential {
+                    prefix: "not-a-url".into(),
+                    config: config("sig=invalid&se=bad"),
+                },
+                StorageCredential {
+                    prefix: ROOT.into(),
+                    config: config("sig=root"),
+                },
+                StorageCredential {
+                    prefix: format!("{ROOT}data/"),
+                    config: config("sig=bad&se=bad"),
+                },
+            ]),
+        );
+        let metadata = Url::parse(&format!("{ROOT}metadata/file")).unwrap();
+        assert_eq!(
+            set.credential(&metadata, SystemTime::now(), true)
+                .unwrap()
+                .properties[ADLS_SAS_TOKEN],
+            "sig=root"
+        );
+        // A selected invalid child must not fall back to a valid parent grant.
+        assert!(
+            set.credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+                .is_err()
+        );
+
+        let set = CredentialSet::new(
+            HashMap::from([
+                (ADLS_SAS_TOKEN.into(), "sig=flat".into()),
+                (KEY.into(), "?".into()),
+            ]),
+            None,
+        );
+        assert!(set.select(&Url::parse(LOCATION).unwrap()).is_err());
+        assert!(
+            set.select(&Url::parse(&LOCATION.replace("acct.", "other.")).unwrap())
+                .is_ok()
+        );
+    }
+
+    fn expiring_set() -> CredentialSet {
+        let now = SystemTime::now();
+        let expiry = chrono::DateTime::<chrono::Utc>::from(now + Duration::from_secs(25))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut set = CredentialSet::new(config(&format!("sig=old&se={expiry}")), None);
+        set.issued_at = now - Duration::from_secs(300);
+        set
+    }
+
+    #[tokio::test]
+    async fn unknown_endpoint_404_requires_successful_legacy_confirmation() {
+        let mut server = Server::new_async().await;
+        let missing = server
+            .mock("GET", "/table/credentials")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let failure = server
+            .mock("GET", "/table")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(&server, expiring_set(), None);
+        for _ in 0..3 {
+            assert!(provider.credential(LOCATION).await.is_err());
+        }
+        failure.assert_async().await;
+        failure.remove_async().await;
+
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/load_table_response.json")).unwrap();
+        response["config"] = json!(config("sig=confirmed"));
+        let confirmed = server
+            .mock("GET", "/table")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        provider.state.lock().await.retry_after = UNIX_EPOCH;
+        assert_eq!(
+            provider.credential(LOCATION).await.unwrap().properties[ADLS_SAS_TOKEN],
+            "sig=confirmed"
+        );
+        missing.assert_async().await;
+        confirmed.assert_async().await;
+    }
+
+    async fn interrupted_legacy_confirmation(cancel: bool) {
+        let mut server = Server::new_async().await;
+        let missing = server
+            .mock("GET", "/table/credentials")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let receiver = std::sync::Mutex::new(receiver);
+        let load = server
+            .mock("GET", "/table")
+            .with_chunked_body(move |writer| {
+                notify.notify_one();
+                let _ = receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15));
+                writer.write_all(b"{}")
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(&server, expiring_set(), None);
+        let task = {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.credential(LOCATION).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(task.await.unwrap().is_err());
+        }
+        let _ = release.send(());
+        // Old credentials are still valid; only the pending 404 confirmation
+        // should prevent their use on this and subsequent calls.
+        let state = provider.state.lock().await;
+        assert!(
+            state
+                .set
+                .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+                .is_ok()
+        );
+        drop(state);
+        assert!(provider.credential(LOCATION).await.is_err());
+        missing.assert_async().await;
+        load.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_endpoint_404_survives_legacy_cancellation() {
+        interrupted_legacy_confirmation(true).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_endpoint_404_survives_legacy_timeout() {
+        interrupted_legacy_confirmation(false).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_is_single_flight_and_replaces_all_prefixes() {
+        let mut server = Server::new_async().await;
+        let refresh = server
+            .mock("GET", "/table/credentials")
+            .match_header("X-Iceberg-Access-Delegation", "vended-credentials")
+            .with_body(
+                json!({"storage-credentials": [
+                    {"prefix": ROOT, "config": config("sig=new-root")},
+                    {"prefix": format!("{ROOT}data/"), "config": config("sig=new-data")}
+                ]})
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(
+            &server,
+            CredentialSet::new(HashMap::new(), None),
+            Some(true),
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let provider = provider.clone();
+            tasks.spawn(async move { provider.credential(LOCATION).await.unwrap() });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.unwrap().properties[ADLS_SAS_TOKEN], "sig=new-data");
+        }
+        let metadata = provider
+            .credential(&format!("{ROOT}metadata/file"))
+            .await
+            .unwrap();
+        assert_eq!(metadata.properties[ADLS_SAS_TOKEN], "sig=new-root");
+        refresh.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn advertised_endpoint_404_does_not_fall_back_and_errors_are_redacted() {
+        let mut server = Server::new_async().await;
+        let missing = server
+            .mock("GET", "/table/credentials")
+            .with_status(404)
+            .with_body("secret-response")
+            .expect(1)
+            .create_async()
+            .await;
+        let load = server.mock("GET", "/table").expect(0).create_async().await;
+        let provider = provider(
+            &server,
+            CredentialSet::new(HashMap::new(), None),
+            Some(true),
+        );
+        for _ in 0..3 {
+            let error = provider.credential(LOCATION).await.unwrap_err();
+            assert!(!format!("{error:?}").contains("secret-response"));
+        }
+        missing.assert_async().await;
+        load.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transient_failure_can_use_unexpired_but_not_expired_credentials() {
+        let mut server = Server::new_async().await;
+        let failure = server
+            .mock("GET", "/table/credentials")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(&server, expiring_set(), Some(true));
+        assert!(provider.credential(LOCATION).await.is_ok());
+        provider.state.lock().await.set =
+            CredentialSet::new(config("sig=expired&se=2000-01-01T00:00:00Z"), None);
+        assert!(provider.credential(LOCATION).await.is_err());
+        failure.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn revoked_credentials_never_fall_back_to_unexpired_tokens() {
+        let mut server = Server::new_async().await;
+        let failure = server
+            .mock("GET", "/table/credentials")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(&server, expiring_set(), Some(true));
+        for _ in 0..3 {
+            assert!(provider.credential(LOCATION).await.is_err());
+        }
+        failure.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_removing_a_prefix_does_not_restore_old_credentials() {
+        let mut server = Server::new_async().await;
+        let refresh = server
+            .mock("GET", "/table/credentials")
+            .with_body(r#"{"storage-credentials":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(&server, expiring_set(), Some(true));
+        for _ in 0..3 {
+            assert!(provider.credential(LOCATION).await.is_err());
+        }
+        refresh.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn failed_oauth_exchange_does_not_hide_revocation() {
+        let mut server = Server::new_async().await;
+        let refresh = server
+            .mock("GET", "/table/credentials")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let oauth = server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(400)
+            .with_body(
+                r#"{"error":{"message":"rejected","type":"UnauthorizedException","code":400}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let cfg = RestCatalogConfig::builder()
+            .uri(server.url())
+            .props(HashMap::from([
+                ("token".to_string(), "old-token".to_string()),
+                ("credential".to_string(), "client:dummy-secret".to_string()),
+            ]))
+            .build();
+        let provider = RestCredentials::new(
+            Arc::new(HttpClient::new(&cfg).unwrap()),
+            format!("{}/table", server.url()),
+            expiring_set(),
+            Some(true),
+        );
+        for _ in 0..3 {
+            assert!(provider.credential(LOCATION).await.is_err());
+        }
+        refresh.assert_async().await;
+        oauth.assert_async().await;
+    }
+}

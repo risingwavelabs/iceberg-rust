@@ -28,3 +28,16 @@ pub(crate) fn from_opendal_error(e: opendal::Error) -> iceberg::Error {
     };
     iceberg::Error::new(kind, "Failure in doing io operation").with_source(e)
 }
+
+/// Errors from signed HTTP requests may include the SAS query in their context.
+pub(crate) fn credential_io_error(e: opendal::Error, redact: bool) -> iceberg::Error {
+    if !redact {
+        return from_opendal_error(e);
+    }
+    iceberg::Error::new(
+        iceberg::ErrorKind::Unexpected,
+        "Credentialed storage operation failed",
+    )
+    .with_context("storage_error_kind", e.kind().to_string())
+    .with_retryable(e.is_temporary())
+}

@@ -53,6 +53,7 @@
 
 mod catalog;
 mod client;
+mod credentials;
 mod endpoint;
 mod types;
 

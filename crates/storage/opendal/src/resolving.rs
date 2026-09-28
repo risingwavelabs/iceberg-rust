@@ -33,8 +33,6 @@ use iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-#[cfg(feature = "opendal-s3")]
-use crate::s3::CustomAwsCredentialLoader;
 use crate::{
     ConfiguredOpenDalStorage, OpenDalStorage, SharedOperatorCache, default_operator_cache,
 };
@@ -88,7 +86,6 @@ fn extract_scheme(path: &str) -> Result<&'static str> {
 fn build_storage_for_scheme(
     scheme: &'static str,
     props: &HashMap<String, String>,
-    #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
 ) -> Result<OpenDalStorage> {
     match scheme {
         #[cfg(feature = "opendal-s3")]
@@ -96,7 +93,6 @@ fn build_storage_for_scheme(
             let config = crate::s3::s3_config_parse(props.clone())?;
             Ok(OpenDalStorage::S3 {
                 config: Arc::new(config),
-                customized_credential_load: customized_credential_load.clone(),
             })
         }
         #[cfg(feature = "opendal-gcs")]
@@ -165,10 +161,6 @@ fn build_storage_for_scheme(
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenDalResolvingStorageFactory {
-    /// Custom AWS credential loader for S3 storage.
-    #[cfg(feature = "opendal-s3")]
-    #[serde(skip)]
-    customized_credential_load: Option<CustomAwsCredentialLoader>,
     /// Operator cache shared by all resolving storages built by this factory.
     #[serde(skip, default = "default_operator_cache")]
     operator_cache: SharedOperatorCache,
@@ -184,17 +176,8 @@ impl OpenDalResolvingStorageFactory {
     /// Create a new resolving storage factory.
     pub fn new() -> Self {
         Self {
-            #[cfg(feature = "opendal-s3")]
-            customized_credential_load: None,
             operator_cache: default_operator_cache(),
         }
-    }
-
-    /// Set a custom AWS credential loader for S3 storage.
-    #[cfg(feature = "opendal-s3")]
-    pub fn with_s3_credential_loader(mut self, loader: CustomAwsCredentialLoader) -> Self {
-        self.customized_credential_load = Some(loader);
-        self
     }
 }
 
@@ -204,9 +187,21 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
         Ok(Arc::new(OpenDalResolvingStorage {
             props: config.props().clone(),
             storages: RwLock::new(HashMap::new()),
-            #[cfg(feature = "opendal-s3")]
-            customized_credential_load: self.customized_credential_load.clone(),
             operator_cache: self.operator_cache.clone(),
+            credentials: None,
+        }))
+    }
+
+    fn build_with_credentials(
+        &self,
+        config: &StorageConfig,
+        provider: iceberg::io::CredentialProvider,
+    ) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(OpenDalResolvingStorage {
+            props: config.props().clone(),
+            storages: RwLock::new(HashMap::new()),
+            operator_cache: self.operator_cache.clone(),
+            credentials: Some(provider),
         }))
     }
 }
@@ -221,13 +216,11 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
 pub struct OpenDalResolvingStorage {
     /// Configuration properties shared across all backends.
     props: HashMap<String, String>,
+    #[serde(default)]
+    credentials: Option<iceberg::io::CredentialProvider>,
     /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
     storages: RwLock<HashMap<&'static str, Arc<ConfiguredOpenDalStorage>>>,
-    /// Custom AWS credential loader for S3 storage.
-    #[cfg(feature = "opendal-s3")]
-    #[serde(skip)]
-    customized_credential_load: Option<CustomAwsCredentialLoader>,
     /// Operator cache inherited from the resolving factory.
     #[serde(skip, default = "default_operator_cache")]
     operator_cache: SharedOperatorCache,
@@ -261,12 +254,14 @@ impl OpenDalResolvingStorage {
             return Ok(storage.clone());
         }
 
-        let storage = build_storage_for_scheme(
-            scheme,
-            &self.props,
-            #[cfg(feature = "opendal-s3")]
-            &self.customized_credential_load,
-        )?;
+        let storage = build_storage_for_scheme(scheme, &self.props)?;
+        let storage = match &self.credentials {
+            Some(provider) => OpenDalStorage::Credentialed {
+                storage: Box::new(storage),
+                provider: provider.clone(),
+            },
+            None => storage,
+        };
         let config = StorageConfig::from_props(self.props.clone());
         let storage = Arc::new(ConfiguredOpenDalStorage::new(
             storage,
@@ -314,6 +309,12 @@ impl Storage for OpenDalResolvingStorage {
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
+        if self.credentials.is_some() {
+            while let Some(path) = paths.next().await {
+                self.delete(&path).await?;
+            }
+            return Ok(());
+        }
         // Group paths by canonical scheme so each resolved storage receives a batch,
         // avoiding repeated operator creation per path.
         let mut grouped: HashMap<&'static str, Vec<String>> = HashMap::new();
@@ -363,10 +364,9 @@ mod tests {
     fn empty_resolving_storage() -> OpenDalResolvingStorage {
         OpenDalResolvingStorage {
             props: HashMap::new(),
+            credentials: None,
             storages: RwLock::new(HashMap::new()),
             operator_cache: default_operator_cache(),
-            #[cfg(feature = "opendal-s3")]
-            customized_credential_load: None,
         }
     }
 

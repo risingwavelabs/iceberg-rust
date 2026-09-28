@@ -146,4 +146,17 @@ pub trait StorageFactory: Debug + Send + Sync {
     /// A `Result` containing an `Arc<dyn Storage>` on success, or an error
     /// if the storage could not be created.
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>>;
+
+    /// Build storage with runtime credentials. Implementations must not silently
+    /// discard the provider or fall back to their default credential chain.
+    fn build_with_credentials(
+        &self,
+        _config: &StorageConfig,
+        _provider: super::CredentialProvider,
+    ) -> Result<Arc<dyn Storage>> {
+        Err(crate::Error::new(
+            crate::ErrorKind::FeatureUnsupported,
+            "Storage factory does not support runtime credentials",
+        ))
+    }
 }

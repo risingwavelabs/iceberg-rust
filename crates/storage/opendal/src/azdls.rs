@@ -21,7 +21,7 @@ use std::str::FromStr;
 
 use iceberg::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_AUTHORITY_HOST, ADLS_CLIENT_ID, ADLS_CLIENT_SECRET,
-    ADLS_CONNECTION_STRING, ADLS_SAS_TOKEN, ADLS_TENANT_ID,
+    ADLS_CONNECTION_STRING, ADLS_ENDPOINT, ADLS_SAS_TOKEN, ADLS_TENANT_ID, CredentialProvider,
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Configurator;
@@ -29,6 +29,7 @@ use opendal::services::AzdlsConfig;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::credentials::{AzdlsPathCredential, PathCredential};
 use crate::utils::from_opendal_error;
 
 /// Local version of `ensure_data_valid` macro since the iceberg crate's macro
@@ -80,6 +81,7 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     if let Some(authority_host) = properties.remove(ADLS_AUTHORITY_HOST) {
         config.authority_host = Some(authority_host);
     }
+    config.endpoint = properties.remove(ADLS_ENDPOINT);
 
     Ok(config)
 }
@@ -92,10 +94,18 @@ pub(crate) fn azdls_create_operator<'a>(
     absolute_path: &'a str,
     config: &AzdlsConfig,
 ) -> Result<(opendal::Operator, &'a str)> {
+    azdls_create_operator_with_credentials(absolute_path, config, None)
+}
+
+pub(crate) fn azdls_create_operator_with_credentials<'a>(
+    absolute_path: &'a str,
+    config: &AzdlsConfig,
+    credentials: Option<&CredentialProvider>,
+) -> Result<(opendal::Operator, &'a str)> {
     let path = absolute_path.parse::<AzureStoragePath>()?;
     match_path_with_config(&path, config)?;
 
-    let op = azdls_config_build(config, &path)?;
+    let op = azdls_config_build(config, &path, absolute_path, credentials)?;
 
     // Paths to files in ADLS tend to be written in fully qualified form,
     // including their filesystem and account name.
@@ -191,7 +201,12 @@ pub(crate) fn match_path_with_config(path: &AzureStoragePath, config: &AzdlsConf
     Ok(())
 }
 
-fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<opendal::Operator> {
+fn azdls_config_build(
+    config: &AzdlsConfig,
+    path: &AzureStoragePath,
+    location: &str,
+    credentials: Option<&CredentialProvider>,
+) -> Result<opendal::Operator> {
     let mut builder = config.clone().into_builder();
 
     if config.endpoint.is_none() {
@@ -199,6 +214,14 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
         builder = builder.endpoint(&path.as_endpoint());
     }
     builder = builder.filesystem(&path.filesystem);
+    if let Some(provider) = credentials {
+        builder = builder.credential_provider_chain(
+            reqsign_core::ProvideCredentialChain::new().push(AzdlsPathCredential(PathCredential {
+                provider: provider.clone(),
+                location: location.to_string(),
+            })),
+        );
+    }
 
     opendal::Operator::new(builder).map_err(from_opendal_error)
 }
@@ -333,6 +356,17 @@ mod tests {
     #[test]
     fn test_azdls_config_parse() {
         let test_cases = vec![
+            (
+                "custom endpoint",
+                HashMap::from([(
+                    iceberg::io::ADLS_ENDPOINT.to_string(),
+                    "http://localhost:10000".to_string(),
+                )]),
+                Some(AzdlsConfig {
+                    endpoint: Some("http://localhost:10000".to_string()),
+                    ..Default::default()
+                }),
+            ),
             (
                 "account name and key",
                 HashMap::from([
