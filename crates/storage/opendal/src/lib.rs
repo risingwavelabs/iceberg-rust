@@ -990,8 +990,7 @@ impl OpenDalStorage {
             OpenDalStorage::Azdls { config } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
                 match_path_with_config(&azure_path, config)?;
-                let relative_path_len = azure_path.path.len();
-                Ok(&path[path.len() - relative_path_len..])
+                Ok(azure_path.relative_path(path))
             }
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { .. } => {
@@ -1965,9 +1964,115 @@ mod tests {
             storage
                 .relativize_path("abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
                 .unwrap(),
-            "/path/to/file.parquet"
+            "path/to/file.parquet"
         );
         assert!(storage.uses_append_mode());
+    }
+
+    /// Answers every request with `200`, and `GET` (ADLS `ListPaths`) with `list_body`.
+    /// Returns the port and the recorded request lines.
+    #[cfg(feature = "opendal-azdls")]
+    fn start_fake_adls(list_body: &'static str) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let recorded = recorded.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                            continue;
+                        };
+                        let line = String::from_utf8_lossy(&buf[..end])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        buf.drain(..end + 4);
+                        let body = if line.starts_with("GET") {
+                            list_body
+                        } else {
+                            ""
+                        };
+                        recorded.lock().unwrap().push(line);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[tokio::test]
+    async fn test_azdls_delete_stream_and_list_paths() {
+        use futures::TryStreamExt;
+
+        let (port, requests) = start_fake_adls(
+            r#"{"paths":[{"name":"dir/f0.parquet","contentLength":"1","isDirectory":"false","lastModified":"Wed, 30 Sep 2026 00:00:00 GMT","etag":"0x1"}]}"#,
+        );
+        // Only the scheme and the suffix of the endpoint are validated, so a local server can
+        // stand in for ADLS.
+        let storage = OpenDalStorage::Azdls {
+            config: Arc::new(AzdlsConfig {
+                account_name: Some("myaccount".to_string()),
+                account_key: Some("a2V5".to_string()),
+                endpoint: Some(format!("http://127.0.0.1:{port}/core.windows.net")),
+                ..Default::default()
+            }),
+        };
+        let options = OpenDalStorageOptions::default();
+        let dir = "abfs://myfs@myaccount.dfs.core.windows.net/dir";
+
+        let paths = vec![format!("{dir}/f0.parquet"), format!("{dir}/f1.parquet")];
+        storage
+            .delete_stream_with_options(futures::stream::iter(paths).boxed(), &options, None)
+            .await
+            .unwrap();
+        let mut deletes: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("DELETE"))
+            .cloned()
+            .collect();
+        deletes.sort();
+        assert_eq!(deletes, vec![
+            "DELETE /core.windows.net/myfs/dir/f0.parquet HTTP/1.1".to_string(),
+            "DELETE /core.windows.net/myfs/dir/f1.parquet HTTP/1.1".to_string(),
+        ]);
+
+        let listed: Vec<String> = storage
+            .list_with_options(dir, false, &options, None)
+            .await
+            .unwrap()
+            .map_ok(|entry| entry.path)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(listed.contains(&format!("{dir}/f0.parquet")), "{listed:?}");
+        assert!(
+            listed
+                .iter()
+                .all(|path| path.starts_with(&format!("{dir}/"))),
+            "{listed:?}"
+        );
     }
 
     #[cfg(feature = "opendal-azblob")]
