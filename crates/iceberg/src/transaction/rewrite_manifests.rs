@@ -18,10 +18,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
+use crate::actions::maintenance::{DEFAULT_LOAD_CONCURRENCY, load_manifests};
 use crate::error::Result;
 use crate::spec::{
     DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
@@ -30,7 +31,6 @@ use crate::table::Table;
 use crate::transaction::{
     ActionCommit, MANIFEST_TARGET_SIZE_BYTES, MANIFEST_TARGET_SIZE_BYTES_DEFAULT, TransactionAction,
 };
-use crate::util::available_parallelism;
 use crate::{Error, ErrorKind};
 
 const KEPT_MANIFESTS_COUNT: &str = "manifests-kept";
@@ -110,6 +110,7 @@ pub struct RewriteManifestsAction {
     manifest_predicate: Option<ManifestPredicate>,
     added_manifests: Vec<ManifestFile>,
     deleted_manifests: Vec<ManifestFile>,
+    load_concurrency: usize,
 
     /// Retry state carried across attempts of this action's commit. The
     /// `Transaction::commit` retry loop reuses the same `Arc<Self>` across
@@ -133,6 +134,7 @@ impl RewriteManifestsAction {
             manifest_predicate: None,
             added_manifests: Vec::new(),
             deleted_manifests: Vec::new(),
+            load_concurrency: DEFAULT_LOAD_CONCURRENCY,
 
             state: Mutex::new(RewriteManifestsState::default()),
         }
@@ -170,6 +172,12 @@ impl RewriteManifestsAction {
     /// in the current snapshot.
     pub fn delete_manifest(mut self, manifest: ManifestFile) -> Self {
         self.deleted_manifests.push(manifest);
+        self
+    }
+
+    /// Set the maximum number of input manifests loaded concurrently.
+    pub fn with_load_concurrency(mut self, load_concurrency: usize) -> Self {
+        self.load_concurrency = load_concurrency;
         self
     }
 
@@ -283,18 +291,10 @@ impl RewriteManifestsAction {
         // count. A large single-key rewrite previously buffered every output
         // entry in memory at once and could OOM the process.
         //
-        // The load stream can run concurrently, but entry routing is
-        // sequential (writers are stateful), so we consume the buffered
+        // Loads decode in parallel on spawned tasks, but entry routing is
+        // sequential (writers are stateful), so we consume the loaded
         // manifests one at a time.
-        let mut load_stream = stream::iter(manifests_to_rewrite)
-            .map(|manifest_file| {
-                let file_io = table.file_io().clone();
-                async move {
-                    let manifest = manifest_file.load_manifest(&file_io).await?;
-                    Ok::<_, Error>((manifest_file, manifest))
-                }
-            })
-            .buffer_unordered(available_parallelism().get());
+        let mut load_stream = load_manifests(table, manifests_to_rewrite, self.load_concurrency);
 
         while let Some(loaded) = load_stream.next().await {
             let (manifest_file, manifest) = loaded?;
@@ -786,7 +786,7 @@ mod tests {
     use crate::transaction::TransactionAction;
     use crate::transaction::rewrite_manifests::{
         CREATED_MANIFESTS_COUNT, KEPT_MANIFESTS_COUNT, PROCESSED_ENTRY_COUNT,
-        RewriteManifestsAction,
+        REPLACED_MANIFESTS_COUNT, RewriteManifestsAction,
     };
     use crate::transaction::tests::{
         make_v2_minimal_table, make_v3_minimal_table, position_delete_file,
@@ -1778,5 +1778,143 @@ mod tests {
                 i + 2,
             );
         }
+    }
+
+    const MANY_INPUT_MANIFESTS: usize = 50;
+    const FILES_PER_INPUT_MANIFEST: usize = 2;
+    const CLUSTER_PREFIXES: [char; 5] = ['a', 'b', 'c', 'd', 'e'];
+
+    fn many_input_manifest_path(i: usize) -> String {
+        format!("memory:///test/location/metadata/many-m{i}.avro")
+    }
+
+    /// Enough input manifests that spawned loads overlap. Returns the table and the
+    /// data file paths it references.
+    async fn table_with_many_input_manifests() -> (Table, Vec<String>) {
+        let base = make_v2_memory_table();
+        let mut manifests = Vec::new();
+        let mut paths = Vec::new();
+        for i in 0..MANY_INPUT_MANIFESTS {
+            let prefix = CLUSTER_PREFIXES[i % CLUSTER_PREFIXES.len()];
+            let files: Vec<DataFile> = (0..FILES_PER_INPUT_MANIFEST)
+                .map(|j| {
+                    let path = format!("{prefix}-{i}-{j}.parquet");
+                    paths.push(path.clone());
+                    data_file(&path, 1, 10)
+                })
+                .collect();
+            manifests
+                .push(write_data_manifest(&base, &many_input_manifest_path(i), 1, 1, files).await);
+        }
+        let snapshot = write_manifest_list_snapshot(
+            &base,
+            "memory:///test/location/metadata/many-mlist.avro",
+            1,
+            1,
+            manifests,
+        )
+        .await;
+        paths.sort();
+        (table_at_snapshot(&base, snapshot), paths)
+    }
+
+    /// Commits `action` and returns its summary plus the sorted live data file paths
+    /// across the manifests it wrote.
+    async fn commit_and_collect_output(
+        action: RewriteManifestsAction,
+        table: &Table,
+    ) -> (HashMap<String, String>, Vec<String>) {
+        let action = Arc::new(action);
+        let mut commit = Arc::clone(&action).commit(table).await.unwrap();
+        let summary = snapshot_summary(&commit.take_updates(), &commit.take_requirements());
+
+        let new_manifests = action.state.lock().unwrap().new_manifests.clone();
+        let mut paths = Vec::new();
+        for manifest_file in new_manifests {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            paths.extend(
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| e.is_alive())
+                    .map(|e| e.data_file().file_path().to_string()),
+            );
+        }
+        paths.sort();
+        (summary, paths)
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_manifests_many_inputs_preserves_entries() {
+        let (table, input_paths) = table_with_many_input_manifests().await;
+
+        let (summary, output_paths) = commit_and_collect_output(
+            RewriteManifestsAction::new().cluster_by(cluster_by_first_char()),
+            &table,
+        )
+        .await;
+
+        assert_eq!(output_paths, input_paths);
+        assert_eq!(
+            summary.get(PROCESSED_ENTRY_COUNT),
+            Some(&input_paths.len().to_string())
+        );
+        assert_eq!(
+            summary.get(REPLACED_MANIFESTS_COUNT),
+            Some(&MANY_INPUT_MANIFESTS.to_string())
+        );
+        assert_eq!(
+            summary.get(CREATED_MANIFESTS_COUNT),
+            Some(&CLUSTER_PREFIXES.len().to_string())
+        );
+        assert_eq!(summary.get(KEPT_MANIFESTS_COUNT), Some(&"0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_manifests_load_concurrency_one_matches_default() {
+        let (table, _) = table_with_many_input_manifests().await;
+
+        let (default_summary, default_paths) = commit_and_collect_output(
+            RewriteManifestsAction::new().cluster_by(cluster_by_first_char()),
+            &table,
+        )
+        .await;
+        let (serial_summary, serial_paths) = commit_and_collect_output(
+            RewriteManifestsAction::new()
+                .cluster_by(cluster_by_first_char())
+                .with_load_concurrency(1),
+            &table,
+        )
+        .await;
+
+        assert_eq!(serial_paths, default_paths);
+        for key in [
+            PROCESSED_ENTRY_COUNT,
+            REPLACED_MANIFESTS_COUNT,
+            CREATED_MANIFESTS_COUNT,
+            KEPT_MANIFESTS_COUNT,
+        ] {
+            assert_eq!(serial_summary.get(key), default_summary.get(key), "{key}");
+        }
+    }
+
+    // A load failure inside a spawned task must fail the commit before any state is
+    // recorded for reuse.
+    #[tokio::test]
+    async fn test_rewrite_manifests_missing_input_manifest_errors() {
+        let (table, _) = table_with_many_input_manifests().await;
+        let missing = many_input_manifest_path(MANY_INPUT_MANIFESTS / 2);
+        table.file_io().delete(&missing).await.unwrap();
+
+        let action = Arc::new(RewriteManifestsAction::new().cluster_by(cluster_by_first_char()));
+        let err = match Arc::clone(&action).commit(&table).await {
+            Ok(_) => panic!("commit must fail when an input manifest is missing"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains(&missing), "{err}");
+        let state = action.state.lock().unwrap();
+        assert!(state.rewritten_manifests.is_empty());
+        assert!(state.new_manifests.is_empty());
     }
 }

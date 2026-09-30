@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 
 use crate::spec::{Manifest, ManifestFile, ManifestList, SnapshotRef, TableMetadataRef};
 use crate::table::Table;
@@ -54,6 +54,27 @@ where
     Ok(())
 }
 
+/// Loads manifests on spawned tasks (see `for_each_manifest_list`), yielding them in
+/// completion order.
+pub(crate) fn load_manifests(
+    table: &Table,
+    manifest_files: Vec<ManifestFile>,
+    concurrency: usize,
+) -> impl Stream<Item = Result<(ManifestFile, Manifest)>> + Send + 'static {
+    let file_io = table.file_io().clone();
+    let runtime = table.runtime().clone();
+    stream::iter(manifest_files)
+        .map(move |manifest_file| {
+            let file_io = file_io.clone();
+            runtime.io().spawn(async move {
+                let manifest = manifest_file.load_manifest(&file_io).await?;
+                Ok::<_, Error>((manifest_file, manifest))
+            })
+        })
+        .buffer_unordered(concurrency.max(1))
+        .map(|loaded| loaded?)
+}
+
 pub(crate) async fn for_each_manifest<F>(
     table: &Table,
     manifest_files: Vec<ManifestFile>,
@@ -63,18 +84,9 @@ pub(crate) async fn for_each_manifest<F>(
 where
     F: FnMut(&ManifestFile, &Manifest),
 {
-    let mut manifests = stream::iter(manifest_files)
-        .map(|manifest_file| {
-            let file_io = table.file_io().clone();
-            table.runtime().io().spawn(async move {
-                let manifest = manifest_file.load_manifest(&file_io).await?;
-                Ok::<_, Error>((manifest_file, manifest))
-            })
-        })
-        .buffer_unordered(concurrency.max(1));
-
+    let mut manifests = load_manifests(table, manifest_files, concurrency);
     while let Some(manifest) = manifests.next().await {
-        let (manifest_file, manifest) = manifest??;
+        let (manifest_file, manifest) = manifest?;
         visit(&manifest_file, &manifest);
     }
     Ok(())
