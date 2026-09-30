@@ -22,7 +22,7 @@ use arrow_array::RecordBatch;
 use futures::future::{self, BoxFuture};
 
 use crate::io::{FileIO, OutputFile};
-use crate::runtime::{JoinHandle, Runtime};
+use crate::runtime::{AbortOnDropHandle, Runtime};
 use crate::spec::{DataFileBuilder, PartitionKey, TableProperties};
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
@@ -191,10 +191,12 @@ where
             ))
     }
 
+    // Aborts on drop so a failed or cancelled write doesn't keep finishing files.
     fn spawn_close(&mut self, inner: B::R) {
-        let handle: JoinHandle<Result<Vec<DataFileBuilder>>> = Runtime::current()
+        let handle: AbortOnDropHandle<Result<Vec<DataFileBuilder>>> = Runtime::current()
             .io()
-            .spawn(async move { inner.close().await });
+            .spawn(async move { inner.close().await })
+            .abort_on_drop();
         self.close_futures
             .push(Box::pin(async move { handle.await? }));
     }
