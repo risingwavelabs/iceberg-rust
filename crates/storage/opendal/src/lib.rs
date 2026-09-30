@@ -253,6 +253,14 @@ struct OperatorCacheEntry {
     last_used: AtomicU64,
 }
 
+impl OperatorCacheEntry {
+    fn mark_used(&self, timestamp: u64) {
+        // Concurrent readers can finish out of order; an older lookup must
+        // not overwrite a newer access and make this entry appear stale.
+        self.last_used.fetch_max(timestamp, Ordering::Relaxed);
+    }
+}
+
 /// A least-recently-used cache of operators.
 struct OperatorCache {
     // OpenDAL config types intentionally do not implement `Hash`. The number of
@@ -295,10 +303,7 @@ impl OperatorCache {
         key: &OperatorCacheKey,
     ) -> Option<Arc<OnceCell<Operator>>> {
         let entry = entries.iter().find(|entry| entry.key == *key)?;
-        entry.last_used.store(
-            self.clock.fetch_add(1, Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        entry.mark_used(self.clock.fetch_add(1, Ordering::Relaxed));
         Some(entry.operator.clone())
     }
 
@@ -1592,6 +1597,43 @@ mod tests {
         get("b");
         assert_eq!(build_count.load(Ordering::SeqCst), 4);
         assert_eq!(cache.len(), 2);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_out_of_order_lookups_preserve_recent_entry() {
+        let cache = OperatorCache::with_capacity(2);
+        let build_count = AtomicUsize::new(0);
+        let get = |bucket: &str| {
+            cache
+                .get_or_create(test_s3_cache_key(bucket), || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    let mut config = S3Config::default();
+                    config.region = Some("us-east-1".to_string());
+                    s3_config_build(&config, &None, &format!("s3://{bucket}/path/to/file"))
+                })
+                .unwrap()
+        };
+
+        get("a");
+        get("b");
+        // Simulate a reader of `a` pausing after reserving its timestamp.
+        let delayed_timestamp = cache.clock.fetch_add(1, Ordering::Relaxed);
+        get("b");
+        get("a");
+        {
+            let entries = cache.entries.read().unwrap();
+            let a = entries
+                .iter()
+                .find(|entry| entry.key == test_s3_cache_key("a"))
+                .unwrap();
+            a.mark_used(delayed_timestamp);
+        }
+
+        // The delayed reader must not make `a` older than `b`.
+        get("c");
+        get("a");
+        assert_eq!(build_count.load(Ordering::SeqCst), 3);
     }
 
     #[cfg(feature = "opendal-s3")]
