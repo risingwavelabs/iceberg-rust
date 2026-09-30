@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iceberg::io::CredentialProvider;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use async_trait::async_trait;
+use iceberg::io::{CredentialProvider, FileIOCredential, FileIOCredentialProvider};
+use iceberg::{Error, ErrorKind, Result};
 use reqsign_core::{Context, ProvideCredential};
 
-fn timestamp(time: std::time::SystemTime) -> reqsign_core::Result<reqsign_core::time::Timestamp> {
+fn timestamp(time: SystemTime) -> reqsign_core::Result<reqsign_core::time::Timestamp> {
     let millis = time
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -43,6 +48,91 @@ impl std::fmt::Debug for PathCredential {
     }
 }
 
+impl PathCredential {
+    async fn load(&self) -> Result<FileIOCredential> {
+        let credential = self.provider.0.credential(&self.location).await?;
+        if !credential.covers(&self.location) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Storage credential does not cover signing location",
+            ));
+        }
+        Ok(credential)
+    }
+}
+
+/// A short-lived signer shared only by paths matched to one credential scope.
+///
+/// Re-select every location before signing, including on retries. Looking up
+/// only the prefix could miss a newly introduced, more-specific child scope.
+pub(crate) struct BatchCredential {
+    provider: CredentialProvider,
+    prefix: String,
+    locations: Vec<String>,
+}
+
+impl std::fmt::Debug for BatchCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchCredential").finish_non_exhaustive()
+    }
+}
+
+impl BatchCredential {
+    pub(crate) fn provider(
+        provider: CredentialProvider,
+        prefix: String,
+        locations: Vec<String>,
+    ) -> CredentialProvider {
+        CredentialProvider(Arc::new(Self {
+            provider,
+            prefix,
+            locations,
+        }))
+    }
+}
+
+#[async_trait]
+impl FileIOCredentialProvider for BatchCredential {
+    async fn credential(&self, _: &str) -> Result<FileIOCredential> {
+        let mut selected: Option<FileIOCredential> = None;
+        for location in &self.locations {
+            let credential = self.provider.0.credential(location).await?;
+            if credential.prefix() != Some(self.prefix.as_str()) || !credential.covers(location) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Storage credential scope changed during bulk deletion",
+                ));
+            }
+            if let Some(selected) = &mut selected {
+                if selected.properties != credential.properties {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Storage credentials differ within a bulk deletion scope",
+                    ));
+                }
+                selected.expires_at = selected.expires_at.min(credential.expires_at);
+            } else {
+                selected = Some(credential);
+            }
+        }
+        let mut selected =
+            selected.ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Empty credential batch"))?;
+        // Stay below reqsign's cache freshness windows (Azure: 20s, AWS:
+        // 120s), but above AWS's 10s signing headroom. Every signing attempt
+        // must re-select the batch, even if a custom provider uses a long TTL.
+        let lease = if selected
+            .properties
+            .contains_key(iceberg::io::ADLS_SAS_TOKEN)
+        {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        };
+        selected.expires_at = selected.expires_at.min(SystemTime::now() + lease);
+        Ok(selected)
+    }
+}
+
 #[cfg(feature = "opendal-azdls")]
 #[derive(Debug)]
 pub(crate) struct AzdlsPathCredential(pub(crate) PathCredential);
@@ -55,15 +145,9 @@ impl ProvideCredential for AzdlsPathCredential {
         &self,
         _: &Context,
     ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let credential = self
-            .0
-            .provider
-            .0
-            .credential(&self.0.location)
-            .await
-            .map_err(|_| {
-                reqsign_core::Error::credential_invalid("Unable to obtain ADLS storage credentials")
-            })?;
+        let credential = self.0.load().await.map_err(|_| {
+            reqsign_core::Error::credential_invalid("Unable to obtain ADLS storage credentials")
+        })?;
         let token = credential
             .properties
             .get(iceberg::io::ADLS_SAS_TOKEN)
@@ -92,15 +176,9 @@ impl ProvideCredential for AwsPathCredential {
         &self,
         _: &Context,
     ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let credential = self
-            .0
-            .provider
-            .0
-            .credential(&self.0.location)
-            .await
-            .map_err(|_| {
-                reqsign_core::Error::credential_invalid("Unable to obtain S3 storage credentials")
-            })?;
+        let credential = self.0.load().await.map_err(|_| {
+            reqsign_core::Error::credential_invalid("Unable to obtain S3 storage credentials")
+        })?;
         let required = |key| {
             credential
                 .properties
@@ -121,6 +199,82 @@ impl ProvideCredential for AwsPathCredential {
     }
 }
 
+#[cfg(all(test, feature = "opendal-azdls"))]
+mod adls_batch_tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    use futures::StreamExt;
+    use iceberg::io::{ADLS_ENDPOINT, ADLS_SAS_TOKEN, FileIOBuilder, StorageFactory};
+    use mockito::{Matcher, Server};
+
+    use super::*;
+    use crate::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
+
+    #[derive(Debug)]
+    struct Provider;
+
+    #[async_trait]
+    impl FileIOCredentialProvider for Provider {
+        async fn credential(&self, location: &str) -> Result<FileIOCredential> {
+            let mut root = url::Url::parse(location)?;
+            let filesystem = root.username().to_string();
+            root.set_path("/");
+            Ok(FileIOCredential {
+                prefix: Some(root.to_string()),
+                properties: HashMap::from([(
+                    ADLS_SAS_TOKEN.to_string(),
+                    format!("sig={filesystem}"),
+                )]),
+                expires_at: SystemTime::now() + Duration::from_secs(30),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_adls_deletes_isolate_filesystems_without_per_file_cache_entries() {
+        let direct = Arc::new(OpenDalStorageFactory::azdls());
+        let factories: [Arc<dyn StorageFactory>; 2] = [
+            direct.clone(),
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ];
+        for factory in factories {
+            let mut server = Server::new_async().await;
+            let mut requests = Vec::new();
+            let mut paths = Vec::new();
+            for (filesystem, file) in [("one", "a"), ("one", "b"), ("two", "a"), ("two", "b")] {
+                requests.push(
+                    server
+                        .mock(
+                            "DELETE",
+                            format!("/core.windows.net/{filesystem}/{file}").as_str(),
+                        )
+                        .match_query(Matcher::UrlEncoded("sig".into(), filesystem.into()))
+                        .with_status(200)
+                        .expect(1)
+                        .create_async()
+                        .await,
+                );
+                paths.push(format!(
+                    "abfs://{filesystem}@account.dfs.core.windows.net/{file}"
+                ));
+            }
+            let io = FileIOBuilder::new(factory)
+                .with_prop(ADLS_ENDPOINT, format!("{}/core.windows.net", server.url()))
+                .with_prop("io.max-retries", "0")
+                .with_credentials(CredentialProvider(Arc::new(Provider)))
+                .build();
+            io.delete_stream(futures::stream::iter(paths).boxed())
+                .await
+                .unwrap();
+            for request in requests {
+                request.assert_async().await;
+            }
+        }
+        assert_eq!(direct.operator_cache.len(), 0);
+    }
+}
+
 #[cfg(all(test, feature = "opendal-s3"))]
 mod tests {
     use std::collections::HashMap;
@@ -129,12 +283,14 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use async_trait::async_trait;
+    use futures::StreamExt;
     use iceberg::io::{
         CredentialProvider, FileIOBuilder, FileIOCredential, FileIOCredentialProvider,
         S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
         S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN, StorageFactory,
     };
     use mockito::{Matcher, Server};
+    use tokio::sync::Barrier;
 
     use crate::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
 
@@ -163,6 +319,7 @@ mod tests {
             assert_eq!(location, "s3://bucket/table/file");
             let generation = self.0.load(Ordering::SeqCst);
             Ok(FileIOCredential {
+                prefix: None,
                 properties: HashMap::from([
                     (S3_ACCESS_KEY_ID.to_string(), format!("KEY{generation}")),
                     (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
@@ -183,6 +340,7 @@ mod tests {
         async fn credential(&self, _: &str) -> iceberg::Result<FileIOCredential> {
             if self.incomplete {
                 Ok(FileIOCredential {
+                    prefix: None,
                     properties: HashMap::new(),
                     expires_at: SystemTime::now() + Duration::from_secs(30),
                 })
@@ -193,6 +351,214 @@ mod tests {
                 ))
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct ScopedDeleteProvider {
+        barrier: Barrier,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FileIOCredentialProvider for ScopedDeleteProvider {
+        async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
+            let key = match location {
+                "s3://bucket/first/file" => "FIRST",
+                "s3://bucket/second/file" => "SECOND",
+                _ => panic!("unexpected credential location"),
+            };
+            // Scope discovery makes the first two calls. Synchronize the next
+            // two, which come from the actual delete signers, so concurrent
+            // discovery alone cannot hide serial HTTP deletion.
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if (2..4).contains(&call) {
+                self.barrier.wait().await;
+            }
+            Ok(FileIOCredential {
+                prefix: None,
+                properties: HashMap::from([
+                    (S3_ACCESS_KEY_ID.to_string(), key.to_string()),
+                    (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
+                ]),
+                expires_at: SystemTime::now() + Duration::from_secs(30),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn credentialed_delete_stream_is_concurrent_and_path_bound() {
+        for factory in s3_factories() {
+            let mut server = Server::new_async().await;
+            let first = server
+                .mock("DELETE", "/bucket/first/file")
+                .match_header(
+                    "authorization",
+                    Matcher::Regex("Credential=FIRST/".to_string()),
+                )
+                .with_status(204)
+                .expect(1)
+                .create_async()
+                .await;
+            let second = server
+                .mock("DELETE", "/bucket/second/file")
+                .match_header(
+                    "authorization",
+                    Matcher::Regex("Credential=SECOND/".to_string()),
+                )
+                .with_status(204)
+                .expect(1)
+                .create_async()
+                .await;
+            let provider = Arc::new(ScopedDeleteProvider {
+                barrier: Barrier::new(2),
+                calls: AtomicUsize::new(0),
+            });
+            let io = anonymous_s3_builder(factory, &server.url())
+                .with_credentials(CredentialProvider(provider.clone()))
+                .build();
+            let paths = ["s3://bucket/first/file", "s3://bucket/second/file"];
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                io.delete_stream(futures::stream::iter(paths.map(str::to_string)).boxed()),
+            )
+            .await
+            .expect("credentialed deletes must make concurrent progress")
+            .unwrap();
+            assert!(provider.calls.load(Ordering::SeqCst) >= 2);
+            first.assert_async().await;
+            second.assert_async().await;
+        }
+    }
+
+    #[derive(Debug)]
+    struct BulkDeleteProvider {
+        repartition: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FileIOCredentialProvider for BulkDeleteProvider {
+        async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
+            let (prefix, key) = [
+                ("s3://bucket/first/", "FIRST"),
+                ("s3://bucket/second/", "SECOND"),
+                ("s3://other/first/", "OTHER"),
+            ]
+            .into_iter()
+            .find(|(prefix, _)| location.starts_with(prefix))
+            .expect("unexpected credential location");
+            let prefix =
+                if self.repartition.load(Ordering::SeqCst) != 0 && location.ends_with("/private") {
+                    location.to_string()
+                } else {
+                    prefix.to_string()
+                };
+            Ok(FileIOCredential {
+                prefix: Some(prefix),
+                properties: HashMap::from([
+                    (S3_ACCESS_KEY_ID.to_string(), key.to_string()),
+                    (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
+                ]),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn credentialed_delete_stream_batches_by_bucket_and_scope() {
+        let direct = Arc::new(OpenDalStorageFactory::s3());
+        let resolving = Arc::new(OpenDalResolvingStorageFactory::new());
+        let factories: [Arc<dyn StorageFactory>; 2] = [direct.clone(), resolving];
+        for factory in factories {
+            let mut server = Server::new_async().await;
+            let first = server
+                .mock("POST", "/bucket/")
+                .match_query(Matcher::Any)
+                .match_header("authorization", Matcher::Regex("Credential=FIRST/".into()))
+                .match_body(Matcher::Regex(
+                    r"^<Delete><Quiet>true</Quiet>(<Object><Key>first/[0-9]+</Key></Object>){1000}</Delete>$".into(),
+                ))
+                .with_body("<DeleteResult/>")
+                .expect(1)
+                .create_async()
+                .await;
+            let remainder = server
+                .mock("POST", "/bucket/")
+                .match_query(Matcher::Any)
+                .match_header("authorization", Matcher::Regex("Credential=FIRST/".into()))
+                .match_body(Matcher::Regex(
+                    r"^<Delete><Quiet>true</Quiet>(<Object><Key>first/100[01]</Key></Object>){2}</Delete>$".into(),
+                ))
+                .with_body("<DeleteResult/>")
+                .expect(1)
+                .create_async()
+                .await;
+            let second = server
+                .mock("POST", "/bucket/")
+                .match_query(Matcher::Any)
+                .match_header("authorization", Matcher::Regex("Credential=SECOND/".into()))
+                .match_body(Matcher::Regex(r"<Key>second/file</Key>".into()))
+                .with_body("<DeleteResult/>")
+                .expect(1)
+                .create_async()
+                .await;
+            let other = server
+                .mock("POST", "/other/")
+                .match_query(Matcher::Any)
+                .match_header("authorization", Matcher::Regex("Credential=OTHER/".into()))
+                .match_body(Matcher::Regex(r"<Key>first/file</Key>".into()))
+                .with_body("<DeleteResult/>")
+                .expect(1)
+                .create_async()
+                .await;
+            let serial = server
+                .mock("DELETE", Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let io = anonymous_s3_builder(factory, &server.url())
+                .with_credentials(CredentialProvider(Arc::new(BulkDeleteProvider {
+                    repartition: AtomicUsize::new(0),
+                })))
+                .build();
+            let mut paths: Vec<_> = (0..1002)
+                .map(|index| format!("s3://bucket/first/{index}"))
+                .collect();
+            paths.extend([
+                "s3://bucket/second/file".to_string(),
+                "s3://bucket/second/other".to_string(),
+                "s3://other/first/file".to_string(),
+                "s3://other/first/other".to_string(),
+            ]);
+            let result = io.delete_stream(futures::stream::iter(paths).boxed()).await;
+            first.assert_async().await;
+            remainder.assert_async().await;
+            second.assert_async().await;
+            other.assert_async().await;
+            serial.assert_async().await;
+            result.unwrap();
+        }
+        // Bulk operators are scope-local, not one cached operator per file.
+        assert_eq!(direct.operator_cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_signer_revalidates_child_scopes_after_refresh() {
+        let provider = Arc::new(BulkDeleteProvider {
+            repartition: AtomicUsize::new(0),
+        });
+        let batch = super::BatchCredential::provider(
+            CredentialProvider(provider.clone()),
+            "s3://bucket/first/".to_string(),
+            vec![
+                "s3://bucket/first/file".to_string(),
+                "s3://bucket/first/private".to_string(),
+            ],
+        );
+        batch.0.credential("s3://bucket/first/file").await.unwrap();
+        provider.repartition.store(1, Ordering::SeqCst);
+        // The representative file still has the old scope, but the child does
+        // not. Re-signing the batch must fail rather than use the parent's key.
+        assert!(batch.0.credential("s3://bucket/first/file").await.is_err());
     }
 
     #[tokio::test]
@@ -270,6 +636,41 @@ mod tests {
             b"data"
         );
         request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn batch_signer_does_not_cache_long_lived_credentials_across_scope_changes() {
+        for factory in s3_factories() {
+            let mut server = Server::new_async().await;
+            let request = server
+                .mock("GET", "/bucket/first/file")
+                .match_header("authorization", Matcher::Regex("Credential=FIRST/".into()))
+                .with_body("data")
+                .expect(1)
+                .create_async()
+                .await;
+            let provider = Arc::new(BulkDeleteProvider {
+                repartition: AtomicUsize::new(0),
+            });
+            let batch = super::BatchCredential::provider(
+                CredentialProvider(provider.clone()),
+                "s3://bucket/first/".to_string(),
+                vec![
+                    "s3://bucket/first/file".to_string(),
+                    "s3://bucket/first/private".to_string(),
+                ],
+            );
+            let io = anonymous_s3_builder(factory, &server.url())
+                .with_credentials(batch)
+                .build();
+            let file = io.new_input("s3://bucket/first/file").unwrap();
+            assert_eq!(file.read().await.unwrap().as_ref(), b"data");
+            provider.repartition.store(1, Ordering::SeqCst);
+            // The cached operator must not hide a new child scope on the next
+            // signing attempt, even when the underlying key has a long TTL.
+            assert!(file.read().await.is_err());
+            request.assert_async().await;
+        }
     }
 
     #[tokio::test]

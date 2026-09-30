@@ -910,7 +910,11 @@ impl core::fmt::Debug for iceberg::io::FileIOBuilder
 pub fn iceberg::io::FileIOBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::io::FileIOCredential
 pub iceberg::io::FileIOCredential::expires_at: std::time::SystemTime
+pub iceberg::io::FileIOCredential::prefix: core::option::Option<alloc::string::String>
 pub iceberg::io::FileIOCredential::properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>
+impl iceberg::io::FileIOCredential
+pub fn iceberg::io::FileIOCredential::covers(&self, location: &str) -> bool
+pub fn iceberg::io::FileIOCredential::prefix(&self) -> core::option::Option<&str>
 impl core::clone::Clone for iceberg::io::FileIOCredential
 pub fn iceberg::io::FileIOCredential::clone(&self) -> iceberg::io::FileIOCredential
 impl core::fmt::Debug for iceberg::io::FileIOCredential

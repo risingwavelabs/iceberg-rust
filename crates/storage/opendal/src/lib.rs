@@ -34,8 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::io::{
     CredentialProvider, FileMetadata, FileRead, FileWrite, IO_CHUNK_SIZE, IO_MAX_RETRIES,
     IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS, IO_TIMEOUT_SECONDS, InputFile, ListEntry,
@@ -261,6 +261,9 @@ struct OperatorCacheKey {
 /// operators expensive to rebuild stay recently used.
 const OPERATOR_CACHE_CAPACITY: usize = 64;
 
+/// Bound in-flight deletes when credentials must be checked for each file.
+pub(crate) const CREDENTIALED_DELETE_CONCURRENCY: usize = 32;
+
 struct OperatorCacheEntry {
     key: OperatorCacheKey,
     operator: Arc<OnceCell<Operator>>,
@@ -361,11 +364,6 @@ impl OperatorCache {
                         entries.swap_remove(lru);
                     }
                     let operator = Arc::new(OnceCell::new());
-                    // Credential rotation and long-lived catalogs must not retain
-                    // an unbounded number of operators. Active handles own clones.
-                    if entries.len() >= 64 {
-                        entries.remove(0);
-                    }
                     entries.push(OperatorCacheEntry {
                         key,
                         operator: operator.clone(),
@@ -1200,11 +1198,18 @@ impl OpenDalStorage {
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
         if matches!(self, Self::Credentialed { .. }) {
-            while let Some(path) = paths.next().await {
-                self.delete_with_options(&path, options, operator_cache)
-                    .await?;
-            }
-            return Ok(());
+            #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+            return self
+                .delete_credentialed_stream(paths, options, operator_cache)
+                .await;
+            #[cfg(not(any(feature = "opendal-s3", feature = "opendal-azdls")))]
+            return paths
+                .map(Ok)
+                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
+                    self.delete_with_options(&path, options, operator_cache)
+                        .await
+                })
+                .await;
         }
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
@@ -1230,6 +1235,104 @@ impl OpenDalStorage {
 
         for (_, mut deleter) in deleters {
             deleter.close().await.map_err(|e| self.io_error(e))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+    async fn delete_credentialed_stream(
+        &self,
+        paths: BoxStream<'static, String>,
+        options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
+    ) -> Result<()> {
+        let Self::Credentialed { storage, provider } = self else {
+            unreachable!("only credentialed storage uses scoped deletion");
+        };
+        // Bound queued keys, operator count and signer validation work. S3 can
+        // send up to 1000 keys in one request; other backends use their deleter.
+        let batch_size = match storage.as_ref() {
+            #[cfg(feature = "opendal-s3")]
+            Self::S3 { .. } => 1000,
+            _ => CREDENTIALED_DELETE_CONCURRENCY,
+        };
+        let mut chunks = paths.chunks(batch_size);
+        while let Some(paths) = chunks.next().await {
+            let matched: Vec<_> = futures::stream::iter(paths)
+                .map(|path| async move {
+                    storage.relativize_path(&path)?;
+                    let credential = provider.0.credential(&path).await?;
+                    if !credential.covers(&path) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Storage credential does not cover deletion path",
+                        ));
+                    }
+                    let bucket = storage
+                        .operator_cache_key(&path, options)?
+                        .map(|key| key.bucket)
+                        .unwrap_or_else(|| storage.batch_key_for_path(&path));
+                    Ok((bucket, credential.prefix, path))
+                })
+                .buffer_unordered(CREDENTIALED_DELETE_CONCURRENCY)
+                .try_collect()
+                .await?;
+            let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+            let mut unscoped = Vec::new();
+            for (bucket, prefix, path) in matched {
+                match prefix {
+                    Some(prefix) => groups.entry((bucket, prefix)).or_default().push(path),
+                    None => unscoped.push(path),
+                }
+            }
+            futures::stream::iter(unscoped.into_iter().map(Ok))
+                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
+                    self.delete_with_options(&path, options, operator_cache)
+                        .await
+                })
+                .await?;
+            futures::stream::iter(groups.into_iter().map(Ok))
+                .try_for_each_concurrent(
+                    CREDENTIALED_DELETE_CONCURRENCY,
+                    |((_, prefix), paths)| async move {
+                        let batch_storage = Self::Credentialed {
+                            storage: storage.clone(),
+                            provider: credentials::BatchCredential::provider(
+                                provider.clone(),
+                                prefix,
+                                paths.clone(),
+                            ),
+                        };
+                        // Do not cache a signer carrying this batch's file list.
+                        // One operator serves the entire bucket/scope group.
+                        let (operator, _) =
+                            batch_storage.create_operator_with_options(&paths[0], options, None)?;
+                        if operator.info().capability().delete_max_size.unwrap_or(1) <= 1 {
+                            // ADLS has no server-side batch delete. Share the
+                            // scope-local operator but bound concurrent requests.
+                            return futures::stream::iter(paths.into_iter().map(Ok))
+                                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| {
+                                    let operator = operator.clone();
+                                    async move {
+                                        operator
+                                            .delete(storage.relativize_path(&path)?)
+                                            .await
+                                            .map_err(|e| self.io_error(e))
+                                    }
+                                })
+                                .await;
+                        }
+                        let mut deleter = operator.deleter().await.map_err(|e| self.io_error(e))?;
+                        for path in paths {
+                            deleter
+                                .delete(storage.relativize_path(&path)?.to_string())
+                                .await
+                                .map_err(|e| self.io_error(e))?;
+                        }
+                        deleter.close().await.map_err(|e| self.io_error(e))
+                    },
+                )
+                .await?;
         }
         Ok(())
     }
@@ -1534,6 +1637,7 @@ mod tests {
             let provider = Arc::new(DirectoryProvider {
                 directory: directory.clone(),
                 credential: FileIOCredential {
+                    prefix: None,
                     properties: credential_properties,
                     expires_at: SystemTime::now() + Duration::from_secs(30),
                 },
@@ -1842,7 +1946,7 @@ mod tests {
                     build_count.fetch_add(1, Ordering::SeqCst);
                     let mut config = S3Config::default();
                     config.region = Some("us-east-1".to_string());
-                    s3_config_build(&config, &None, &format!("s3://{bucket}/path/to/file"))
+                    s3_config_build(&config, &format!("s3://{bucket}/path/to/file"), None)
                 })
                 .unwrap()
         };
@@ -1873,7 +1977,7 @@ mod tests {
                     build_count.fetch_add(1, Ordering::SeqCst);
                     let mut config = S3Config::default();
                     config.region = Some("us-east-1".to_string());
-                    s3_config_build(&config, &None, &format!("s3://{bucket}/path/to/file"))
+                    s3_config_build(&config, &format!("s3://{bucket}/path/to/file"), None)
                 })
                 .unwrap()
         };

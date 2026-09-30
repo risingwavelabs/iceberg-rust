@@ -105,6 +105,7 @@ mod tests {
         async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
             assert!(location.starts_with("s3://bucket1/"));
             Ok(FileIOCredential {
+                prefix: None,
                 properties: HashMap::from([
                     (S3_ACCESS_KEY_ID.into(), "admin".into()),
                     (S3_SECRET_ACCESS_KEY.into(), "password".into()),

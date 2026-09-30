@@ -212,6 +212,17 @@ impl CredentialSet {
 
     fn credential(&self, location: &Url, now: SystemTime, fresh: bool) -> Result<FileIOCredential> {
         let credential = self.select(location)?;
+        let prefix = self
+            .entries
+            .iter()
+            .filter(|entry| matches_prefix(&entry.prefix, location))
+            .max_by_key(|entry| entry.prefix_len)
+            .map(|entry| entry.prefix.to_string())
+            .unwrap_or_else(|| {
+                let mut root = location.clone();
+                root.set_path("/");
+                root.to_string()
+            });
         let deadline = credential.expiry.unwrap_or(self.issued_at + LEASE);
         let lifetime = deadline.duration_since(self.issued_at).unwrap_or_default();
         let margin = (lifetime / 5).min(Duration::from_secs(30));
@@ -227,6 +238,7 @@ impl CredentialSet {
             Duration::from_secs(5)
         };
         Ok(FileIOCredential {
+            prefix: Some(prefix),
             properties: credential.properties.clone(),
             expires_at: deadline.min(now + lease),
         })
@@ -439,6 +451,39 @@ mod tests {
 
     fn config(token: &str) -> HashMap<String, String> {
         HashMap::from([(KEY.to_string(), token.to_string())])
+    }
+
+    #[test]
+    fn returned_credential_declares_longest_matched_scope() {
+        let child = format!("{ROOT}data/");
+        let set = CredentialSet::new(
+            config("sig=default"),
+            Some(vec![
+                StorageCredential {
+                    prefix: ROOT.into(),
+                    config: config("sig=parent"),
+                },
+                StorageCredential {
+                    prefix: child.clone(),
+                    config: config("sig=child"),
+                },
+            ]),
+        );
+        let credential = set
+            .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .unwrap();
+        assert_eq!(credential.prefix(), Some(child.as_str()));
+        assert!(credential.covers(LOCATION));
+        let outside = "abfss://other@acct.dfs.core.windows.net/outside";
+        let credential = set
+            .credential(&Url::parse(outside).unwrap(), SystemTime::now(), true)
+            .unwrap();
+        assert_eq!(
+            credential.prefix(),
+            Some("abfss://other@acct.dfs.core.windows.net/")
+        );
+        assert!(credential.covers(outside));
+        assert!(!credential.covers(LOCATION));
     }
 
     fn provider(

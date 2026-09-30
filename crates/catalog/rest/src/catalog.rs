@@ -605,28 +605,10 @@ impl RestCatalog {
                 "StorageFactory must be provided for RestCatalog. Use `with_storage_factory` to configure it.",
             )
         })?;
-        let existing = self
-            .credentials
-            .lock()
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Credential provider cache lock poisoned",
-                )
-            })?
-            .get(table)
-            .and_then(|provider| provider.upgrade());
-        if !supported || (!delegated && !has_vended && existing.is_none()) {
+        if !supported {
             return Ok(FileIOBuilder::new(factory).with_props(properties).build());
         }
-        if let Some(provider) = &existing
-            && received_credentials
-        {
-            provider
-                .update(CredentialSet::new(config.clone(), entries.clone()))
-                .await;
-        }
-        let provider = {
+        let selected = {
             let mut providers = self.credentials.lock().map_err(|_| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -635,7 +617,9 @@ impl RestCatalog {
             })?;
             providers.retain(|_, provider| provider.strong_count() > 0);
             if let Some(provider) = providers.get(table).and_then(|provider| provider.upgrade()) {
-                provider
+                Some((provider, true))
+            } else if !delegated && !has_vended {
+                None
             } else {
                 let endpoint = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"
                     .parse::<Endpoint>()?;
@@ -645,13 +629,21 @@ impl RestCatalog {
                 let provider = Arc::new(RestCredentials::new(
                     context.client.clone(),
                     context.config.table_endpoint(table),
-                    CredentialSet::new(config, entries),
+                    CredentialSet::new(config.clone(), entries.clone()),
                     endpoint,
                 ));
                 providers.insert(table.clone(), Arc::downgrade(&provider));
-                provider
+                Some((provider, false))
             }
         };
+        let Some((provider, reused)) = selected else {
+            return Ok(FileIOBuilder::new(factory).with_props(properties).build());
+        };
+        // Select or create under one lock so concurrent first loads cannot
+        // skip updating a provider installed by another load.
+        if reused && received_credentials {
+            provider.update(CredentialSet::new(config, entries)).await;
+        }
         // A create response may lack a metadata file yet. Do not require access
         // to its parent directory when credentials only cover child prefixes.
         if let Some(location) = metadata_location {

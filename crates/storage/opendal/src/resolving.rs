@@ -310,8 +310,22 @@ impl Storage for OpenDalResolvingStorage {
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
         if self.credentials.is_some() {
-            while let Some(path) = paths.next().await {
-                self.delete(&path).await?;
+            // Keep memory bounded while delegating scope-local batching to each
+            // backend. Scheme aliases share a configured storage.
+            let mut chunks = paths.chunks(1000);
+            while let Some(paths) = chunks.next().await {
+                let mut grouped: HashMap<&'static str, Vec<String>> = HashMap::new();
+                for path in paths {
+                    grouped
+                        .entry(extract_scheme(&path)?)
+                        .or_default()
+                        .push(path);
+                }
+                for paths in grouped.into_values() {
+                    self.resolve(&paths[0])?
+                        .delete_stream(futures::stream::iter(paths).boxed())
+                        .await?;
+                }
             }
             return Ok(());
         }
