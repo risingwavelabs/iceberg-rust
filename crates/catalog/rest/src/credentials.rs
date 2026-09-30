@@ -200,11 +200,15 @@ impl CredentialSet {
         }
     }
 
-    fn select(&self, location: &Url) -> Result<&ParsedCredential> {
+    fn matched_entry(&self, location: &Url) -> Option<&ScopedCredential> {
         self.entries
             .iter()
             .filter(|entry| matches_prefix(&entry.prefix, location))
             .max_by_key(|entry| entry.prefix_len)
+    }
+
+    fn select(&self, location: &Url) -> Result<&ParsedCredential> {
+        self.matched_entry(location)
             .map(|entry| &entry.properties)
             .unwrap_or(&self.config)
             .select(location)
@@ -213,10 +217,7 @@ impl CredentialSet {
     fn credential(&self, location: &Url, now: SystemTime, fresh: bool) -> Result<FileIOCredential> {
         let credential = self.select(location)?;
         let prefix = self
-            .entries
-            .iter()
-            .filter(|entry| matches_prefix(&entry.prefix, location))
-            .max_by_key(|entry| entry.prefix_len)
+            .matched_entry(location)
             .map(|entry| entry.prefix.to_string())
             .unwrap_or_else(|| {
                 let mut root = location.clone();
@@ -250,6 +251,9 @@ struct State {
     retry_after: SystemTime,
     endpoint: Option<bool>,
     revoked: bool,
+    last_refresh_status: Option<u16>,
+    prefix_only: bool,
+    config_retry_after: SystemTime,
 }
 
 pub(crate) struct RestCredentials {
@@ -271,6 +275,9 @@ impl RestCredentials {
         state.set = set;
         state.retry_after = UNIX_EPOCH;
         state.revoked = false;
+        state.last_refresh_status = None;
+        state.prefix_only = false;
+        state.config_retry_after = UNIX_EPOCH;
     }
 
     pub(crate) fn new(
@@ -287,12 +294,19 @@ impl RestCredentials {
                 endpoint,
                 retry_after: UNIX_EPOCH,
                 revoked: false,
+                last_refresh_status: None,
+                prefix_only: false,
+                config_retry_after: UNIX_EPOCH,
             }),
         }
     }
 
-    async fn fetch(&self, state: &mut State) -> Result<CredentialSet> {
-        if state.endpoint != Some(false) {
+    async fn fetch(&self, state: &mut State, location: &Url) -> Result<CredentialSet> {
+        // A recent /credentials response already refreshed the prefix entries.
+        // An uncovered location needs only loadTable's missing flat config.
+        let needs_config =
+            !state.revoked && state.prefix_only && state.set.matched_entry(location).is_none();
+        if state.endpoint != Some(false) && !needs_config {
             let response = self
                 .request(format!("{}/credentials", self.table_url), state)
                 .await?;
@@ -308,10 +322,19 @@ impl RestCredentials {
                         .await
                         .map_err(|_| invalid("Invalid REST storage credential response"))?;
                     state.endpoint = Some(true);
-                    return Ok(CredentialSet::new(
-                        HashMap::new(),
-                        Some(response.credentials),
-                    ));
+                    let set = CredentialSet::new(HashMap::new(), Some(response.credentials));
+                    state.prefix_only = true;
+                    state.config_retry_after = UNIX_EPOCH;
+                    if set.matched_entry(location).is_some() {
+                        // A matched but malformed/expired entry must not fall
+                        // back to a broader loadTable config credential.
+                        return Ok(set);
+                    }
+                    // /credentials contains no flat config. Publish the new
+                    // scopes before awaiting loadTable so a failure or cancelled
+                    // fallback cannot resurrect credentials the catalog removed.
+                    state.set = set;
+                    state.revoked = false;
                 }
                 StatusCode::NOT_FOUND
                 | StatusCode::METHOD_NOT_ALLOWED
@@ -328,6 +351,7 @@ impl RestCredentials {
                 status => return Err(Self::response_error(state, status)),
             }
         }
+        state.config_retry_after = SystemTime::now() + RETRY_DELAY;
         let response = self.request(self.table_url.clone(), state).await?;
         if response.status() != StatusCode::OK {
             return Err(Self::response_error(state, response.status()));
@@ -336,6 +360,8 @@ impl RestCredentials {
             .json()
             .await
             .map_err(|_| invalid("Invalid REST table credential response"))?;
+        state.prefix_only = false;
+        state.config_retry_after = UNIX_EPOCH;
         Ok(CredentialSet::new(
             response.config,
             response.storage_credentials,
@@ -355,16 +381,23 @@ impl RestCredentials {
             self.client.query_credentials(request, &mut state.revoked),
         )
         .await
-        .map_err(|_| Error::new(ErrorKind::Unexpected, "REST credential refresh timed out"))?
+        .map_err(|_| {
+            Error::new(ErrorKind::Unexpected, "REST credential refresh timed out")
+                .with_context("credential_error", "refresh_timeout")
+                .with_retryable(true)
+        })?
         .map_err(|_| {
             Error::new(
                 ErrorKind::Unexpected,
                 "REST storage credential refresh failed",
             )
+            .with_context("credential_error", "refresh_failed")
+            .with_retryable(!state.revoked)
         })
     }
 
     fn response_error(state: &mut State, status: StatusCode) -> Error {
+        state.last_refresh_status = Some(status.as_u16());
         // Don't expose response bodies, which may contain credential material.
         if matches!(
             status,
@@ -377,6 +410,8 @@ impl RestCredentials {
             "REST storage credential refresh rejected",
         )
         .with_context("status", status.as_u16().to_string())
+        .with_context("credential_error", "refresh_rejected")
+        .with_retryable(status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS)
     }
 }
 
@@ -402,16 +437,35 @@ impl FileIOCredentialProvider for RestCredentials {
         {
             return Ok(credential);
         }
-        if now < state.retry_after {
-            return if state.revoked {
-                Err(invalid("Vended storage access was revoked"))
+        let config_refresh_ready = !state.revoked
+            && state.prefix_only
+            && state.set.matched_entry(&location).is_none()
+            && now >= state.config_retry_after;
+        if now < state.retry_after && !config_refresh_ready {
+            let result = if state.revoked {
+                Err(invalid("Vended storage access was revoked")
+                    .with_context("credential_error", "revoked"))
             } else {
                 state.set.credential(&location, now, false)
             };
+            return result.map_err(|error| {
+                if let Some(status) = state.last_refresh_status {
+                    error
+                        .with_context("status", status.to_string())
+                        .with_context("credential_error", "refresh_backoff")
+                        .with_retryable(status >= 500 || status == 429)
+                } else {
+                    error
+                }
+            });
         }
         state.retry_after = now + RETRY_DELAY;
-        let refreshed = self.fetch(&mut state).await;
+        state.last_refresh_status = None;
+        let refreshed = self.fetch(&mut state, &location).await;
         state.retry_after = SystemTime::now() + RETRY_DELAY;
+        if state.config_retry_after != UNIX_EPOCH {
+            state.config_retry_after = state.retry_after;
+        }
         match refreshed {
             Ok(set) => {
                 // Even an empty/narrower successful response replaces the old
@@ -689,8 +743,32 @@ mod tests {
                 let location = LOCATION.replace("abfss:", "abfs:");
                 let reader = io.new_input(&location).unwrap().reader().await.unwrap();
                 let mut writer = io.new_output(&location).unwrap().writer().await.unwrap();
-                assert!(reader.read(0..4).await.is_err());
-                assert!(writer.write(b"datad".as_slice().into()).await.is_err());
+                let error = reader.read(0..4).await.unwrap_err();
+                let diagnostic = format!("{error:?}");
+                assert!(
+                    diagnostic.contains("failure_stage: credential"),
+                    "{diagnostic}"
+                );
+                if status != 200 {
+                    assert!(
+                        diagnostic.contains(&format!("status: {status}")),
+                        "{diagnostic}"
+                    );
+                    assert!(diagnostic.contains("refresh_rejected"), "{diagnostic}");
+                }
+                assert!(!diagnostic.contains("sig=expired"));
+                let error = writer.write(b"datad".as_slice().into()).await.unwrap_err();
+                let diagnostic = format!("{error:?}");
+                assert!(
+                    diagnostic.contains("failure_stage: credential"),
+                    "{diagnostic}"
+                );
+                if status != 200 {
+                    assert!(
+                        diagnostic.contains(&format!("status: {status}")),
+                        "{diagnostic}"
+                    );
+                }
                 refresh.assert_async().await;
                 for request in requests {
                     request.assert_async().await;
@@ -1115,6 +1193,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outside_prefix_reads_renew_flat_credentials_through_load_table() {
+        for factory in adls_factories() {
+            let mut catalog = Server::new_async().await;
+            let mut storage = Server::new_async().await;
+            let root = ROOT.replace("abfss:", "abfs:");
+            let outside = "abfs://fs@acct.dfs.core.windows.net/outside/file";
+            let provider = provider(
+                &catalog,
+                CredentialSet::new(config("sig=old"), None),
+                Some(true),
+            );
+            let io = adls_file_io(factory, &storage, provider.clone());
+            let old = storage
+                .mock("GET", "/core.windows.net/fs/outside/file")
+                .match_query(Matcher::UrlEncoded("sig".into(), "old".into()))
+                .with_body("old")
+                .expect(1)
+                .create_async()
+                .await;
+            let file = io.new_input(outside).unwrap();
+            assert_eq!(file.read().await.unwrap().as_ref(), b"old");
+            provider.state.lock().await.set.issued_at = SystemTime::now() - LEASE;
+            let entries = json!([{"prefix": root, "config": config("sig=scoped")}]);
+            let refresh = catalog
+                .mock("GET", "/table/credentials")
+                .with_body(json!({"storage-credentials": entries}).to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let mut response: serde_json::Value =
+                serde_json::from_str(include_str!("../testdata/load_table_response.json")).unwrap();
+            response["config"] = json!(config("sig=renewed"));
+            response["storage-credentials"] = entries;
+            let load = catalog
+                .mock("GET", "/table")
+                .match_header("X-Iceberg-Access-Delegation", "vended-credentials")
+                .with_body(response.to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let renewed = storage
+                .mock("GET", "/core.windows.net/fs/outside/file")
+                .match_query(Matcher::UrlEncoded("sig".into(), "renewed".into()))
+                .with_body("renewed")
+                .expect(1)
+                .create_async()
+                .await;
+            // Refresh a covered file first, then immediately access an uncovered
+            // one. The successful prefix refresh must not throttle fetching the
+            // missing config or trigger another /credentials request.
+            assert_eq!(
+                provider
+                    .credential(&format!("{root}data/file"))
+                    .await
+                    .unwrap()
+                    .properties[ADLS_SAS_TOKEN],
+                "sig=scoped"
+            );
+            assert_eq!(file.read().await.unwrap().as_ref(), b"renewed");
+            // Both fresh config and prefixed credentials remain available.
+            assert_eq!(
+                provider
+                    .credential(&format!("{root}data/file"))
+                    .await
+                    .unwrap()
+                    .properties[ADLS_SAS_TOKEN],
+                "sig=scoped"
+            );
+            old.assert_async().await;
+            renewed.assert_async().await;
+            refresh.assert_async().await;
+            load.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_scope_fallback_does_not_resurrect_old_config() {
+        let mut server = Server::new_async().await;
+        let refresh = server
+            .mock("GET", "/table/credentials")
+            .with_body(
+                json!({"storage-credentials": [{
+                    "prefix": format!("{ROOT}new/"), "config": config("sig=new")
+                }]})
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let receiver = std::sync::Mutex::new(receiver);
+        let load = server
+            .mock("GET", "/table")
+            .with_chunked_body(move |writer| {
+                notify.notify_one();
+                let _ = receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                writer.write_all(b"{}")
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = provider(&server, expiring_set(), Some(true));
+        let task = {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.credential(LOCATION).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let _ = release.send(());
+        assert!(provider.credential(LOCATION).await.is_err());
+        assert_eq!(
+            provider
+                .credential(&format!("{ROOT}new/file"))
+                .await
+                .unwrap()
+                .properties[ADLS_SAS_TOKEN],
+            "sig=new"
+        );
+        refresh.assert_async().await;
+        load.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_matched_scope_does_not_use_load_table_fallback() {
+        let mut server = Server::new_async().await;
+        let refresh = server
+            .mock("GET", "/table/credentials")
+            .with_body(
+                json!({"storage-credentials": [{
+                    "prefix": ROOT, "config": config("sig=bad&se=invalid")
+                }]})
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let load = server.mock("GET", "/table").expect(0).create_async().await;
+        let provider = provider(&server, expiring_set(), Some(true));
+        assert!(provider.credential(LOCATION).await.is_err());
+        refresh.assert_async().await;
+        load.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn successful_refresh_removing_a_prefix_does_not_restore_old_credentials() {
         let mut server = Server::new_async().await;
         let refresh = server
@@ -1123,11 +1353,18 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
+        let load = server
+            .mock("GET", "/table")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
         let provider = provider(&server, expiring_set(), Some(true));
         for _ in 0..3 {
             assert!(provider.credential(LOCATION).await.is_err());
         }
         refresh.assert_async().await;
+        load.assert_async().await;
     }
 
     #[tokio::test]

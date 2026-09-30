@@ -4016,6 +4016,7 @@ pub fn iceberg::Credential::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core
 pub struct iceberg::Error
 impl iceberg::Error
 pub fn iceberg::Error::backtrace(&self) -> &std::backtrace::Backtrace
+pub fn iceberg::Error::context(&self) -> &[(&'static str, alloc::string::String)]
 pub fn iceberg::Error::kind(&self) -> iceberg::ErrorKind
 pub fn iceberg::Error::message(&self) -> &str
 pub fn iceberg::Error::new(kind: iceberg::ErrorKind, message: impl core::convert::Into<alloc::string::String>) -> Self

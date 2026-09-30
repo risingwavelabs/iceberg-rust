@@ -25,9 +25,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use base64::Engine as _;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
-use iceberg::io::{
-    CredentialProvider, FileIO, FileIOBuilder, FileIOCredentialProvider, StorageFactory,
-};
+use iceberg::io::{CredentialProvider, FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
@@ -644,11 +642,9 @@ impl RestCatalog {
         if reused && received_credentials {
             provider.update(CredentialSet::new(config, entries)).await;
         }
-        // A create response may lack a metadata file yet. Do not require access
-        // to its parent directory when credentials only cover child prefixes.
-        if let Some(location) = metadata_location {
-            provider.credential(location).await?;
-        }
+        // A successful catalog mutation must not become a reported failure
+        // because refreshing storage credentials needs another network request.
+        // Install the provider here; validate and refresh on actual storage I/O.
         // Credentials live only in the redacted provider, never in FileIO's
         // serializable/debuggable properties or a competing default auth chain.
         properties.retain(|key, _| {
@@ -2804,6 +2800,117 @@ mod tests {
                 .await
                 .is_err()
         );
+        config_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn successful_mutations_do_not_refresh_expired_storage_credentials() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/create_table_response.json")).unwrap();
+        response["config"] = serde_json::json!({
+            "s3.access-key-id": "EXPIRED",
+            "s3.secret-access-key": "dummy-secret",
+            "s3.session-token-expires-at-ms": "0"
+        });
+        let create = server
+            .mock("POST", "/v1/namespaces/ns1/tables")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let register = server
+            .mock("POST", "/v1/namespaces/ns1/register")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let load = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let commit = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .with_body(include_str!("../testdata/update_table_response.json"))
+            .expect(1)
+            .create_async()
+            .await;
+        let refresh = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1/credentials")
+            .with_status(503)
+            .expect(0)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([
+                    (
+                        "header.X-Iceberg-Access-Delegation".into(),
+                        "vended-credentials".into(),
+                    ),
+                    ("s3.region".into(), "us-east-1".into()),
+                    ("io.max-retries".into(), "0".into()),
+                ]))
+                .build(),
+            Some(Arc::new(
+                iceberg_storage_opendal::OpenDalStorageFactory::s3(),
+            )),
+            Runtime::current(),
+            None,
+        );
+        let loaded: LoadTableResult = serde_json::from_value(response).unwrap();
+        let creation = TableCreation::builder()
+            .name("test1".to_string())
+            .schema(loaded.metadata.current_schema().as_ref().clone())
+            .build();
+        let created = catalog
+            .create_table(&NamespaceIdent::from_strs(["ns1"]).unwrap(), creation)
+            .await
+            .unwrap();
+        let registered = catalog
+            .register_table(
+                created.identifier(),
+                created.metadata_location().unwrap().to_string(),
+            )
+            .await
+            .unwrap();
+        let tx = Transaction::new(&registered);
+        let committed = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V2)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(committed.metadata().format_version(), FormatVersion::V2);
+        create.assert_async().await;
+        register.assert_async().await;
+        load.assert_async().await;
+        commit.assert_async().await;
+        refresh.assert_async().await;
+        refresh.remove_async().await;
+        // Refresh is deferred, not disabled: the first real storage access fails.
+        let refresh = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1/credentials")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        assert!(
+            committed
+                .file_io()
+                .new_input(committed.metadata_location().unwrap())
+                .unwrap()
+                .read()
+                .await
+                .is_err()
+        );
+        refresh.assert_async().await;
         config_mock.assert_async().await;
     }
 

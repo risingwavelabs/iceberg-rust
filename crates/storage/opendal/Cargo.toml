@@ -69,6 +69,7 @@ reqsign-aws-v4 = { version = "3.0.0", optional = true }
 reqsign-azure-storage = { version = "3.2.0", optional = true }
 reqsign-core = { version = "3.0.0", optional = true }
 serde = { workspace = true }
+tokio = { workspace = true }
 typetag = { workspace = true }
 url = { workspace = true }
 

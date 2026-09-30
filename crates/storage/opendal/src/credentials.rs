@@ -50,6 +50,7 @@ impl std::fmt::Debug for PathCredential {
 
 impl PathCredential {
     async fn load(&self) -> Result<FileIOCredential> {
+        crate::utils::clear_credential_failure();
         let credential = self.provider.0.credential(&self.location).await?;
         if !credential.covers(&self.location) {
             return Err(Error::new(
@@ -145,9 +146,11 @@ impl ProvideCredential for AzdlsPathCredential {
         &self,
         _: &Context,
     ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let credential = self.0.load().await.map_err(|_| {
-            reqsign_core::Error::credential_invalid("Unable to obtain ADLS storage credentials")
-        })?;
+        let credential = self
+            .0
+            .load()
+            .await
+            .map_err(crate::utils::credential_provider_error)?;
         let token = credential
             .properties
             .get(iceberg::io::ADLS_SAS_TOKEN)
@@ -176,9 +179,11 @@ impl ProvideCredential for AwsPathCredential {
         &self,
         _: &Context,
     ) -> reqsign_core::Result<Option<Self::Credential>> {
-        let credential = self.0.load().await.map_err(|_| {
-            reqsign_core::Error::credential_invalid("Unable to obtain S3 storage credentials")
-        })?;
+        let credential = self
+            .0
+            .load()
+            .await
+            .map_err(crate::utils::credential_provider_error)?;
         let required = |key| {
             credential
                 .properties
@@ -229,6 +234,45 @@ mod adls_batch_tests {
                 expires_at: SystemTime::now() + Duration::from_secs(30),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn adls_storage_errors_keep_status_without_sas_or_response_contents() {
+        let mut server = Server::new_async().await;
+        let request = server
+            .mock("GET", "/core.windows.net/one/file")
+            .match_query(Matcher::UrlEncoded("sig".into(), "one".into()))
+            .with_status(403)
+            .with_header("x-ms-error-code", "AuthorizationPermissionMismatch")
+            .with_header("x-secret-header", "secret-header")
+            .with_body("<Error><Code>AuthorizationPermissionMismatch</Code><Message>secret-body</Message></Error>")
+            .expect(1)
+            .create_async()
+            .await;
+        let io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::azdls()))
+            .with_prop(ADLS_ENDPOINT, format!("{}/core.windows.net", server.url()))
+            .with_prop("io.max-retries", "0")
+            .with_credentials(CredentialProvider(Arc::new(Provider)))
+            .build();
+        let error = io
+            .new_input("abfs://one@account.dfs.core.windows.net/file")
+            .unwrap()
+            .read()
+            .await
+            .unwrap_err();
+        let diagnostic = format!("{error} {error:?} {error:#?}");
+        assert!(
+            diagnostic.contains("failure_stage: storage"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("status: 403"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("AuthorizationPermissionMismatch"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("sig="));
+        assert!(!diagnostic.contains("secret-"));
+        request.assert_async().await;
     }
 
     #[tokio::test]
@@ -669,6 +713,39 @@ mod tests {
             // The cached operator must not hide a new child scope on the next
             // signing attempt, even when the underlying key has a long TTL.
             assert!(file.read().await.is_err());
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn credentialed_s3_storage_errors_keep_status_and_service_code() {
+        for factory in s3_factories() {
+            let mut server = Server::new_async().await;
+            let request = server
+                .mock("GET", "/bucket/table/file")
+                .with_status(403)
+                .with_header("x-secret-header", "secret-header")
+                .with_body("<Error><Code>AccessDenied</Code><Message>secret-body</Message></Error>")
+                .expect(1)
+                .create_async()
+                .await;
+            let io = anonymous_s3_builder(factory, &server.url())
+                .with_credentials(CredentialProvider(Arc::new(Provider(AtomicUsize::new(0)))))
+                .build();
+            let error = io
+                .new_input("s3://bucket/table/file")
+                .unwrap()
+                .read()
+                .await
+                .unwrap_err();
+            let diagnostic = format!("{error} {error:?} {error:#?}");
+            assert!(
+                diagnostic.contains("failure_stage: storage"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("status: 403"), "{diagnostic}");
+            assert!(diagnostic.contains("AccessDenied"), "{diagnostic}");
+            assert!(!diagnostic.contains("secret-"));
             request.assert_async().await;
         }
     }

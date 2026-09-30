@@ -660,6 +660,10 @@ impl OpenDalStorage {
         utils::credential_io_error(error, matches!(self, Self::Credentialed { .. }))
     }
 
+    async fn io<T>(&self, future: impl Future<Output = opendal::Result<T>>) -> Result<T> {
+        utils::credential_io(future, matches!(self, Self::Credentialed { .. })).await
+    }
+
     #[allow(unreachable_patterns)]
     fn operator_cache_key(
         &self,
@@ -1071,10 +1075,7 @@ impl OpenDalStorage {
     ) -> Result<bool> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        operator
-            .exists(relative_path)
-            .await
-            .map_err(|e| self.io_error(e))
+        self.io(operator.exists(relative_path)).await
     }
 
     async fn metadata_with_options(
@@ -1085,10 +1086,7 @@ impl OpenDalStorage {
     ) -> Result<FileMetadata> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        let metadata = operator
-            .stat(relative_path)
-            .await
-            .map_err(|e| self.io_error(e))?;
+        let metadata = self.io(operator.stat(relative_path)).await?;
         Ok(FileMetadata {
             size: metadata.content_length(),
         })
@@ -1102,11 +1100,7 @@ impl OpenDalStorage {
     ) -> Result<Bytes> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        Ok(operator
-            .read(relative_path)
-            .await
-            .map_err(|e| self.io_error(e))?
-            .to_bytes())
+        Ok(self.io(operator.read(relative_path)).await?.to_bytes())
     }
 
     async fn reader_with_options(
@@ -1118,10 +1112,7 @@ impl OpenDalStorage {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(Box::new(OpenDalReader(
-            operator
-                .reader(relative_path)
-                .await
-                .map_err(|e| self.io_error(e))?,
+            self.io(operator.reader(relative_path)).await?,
             matches!(self, Self::Credentialed { .. }),
         )))
     }
@@ -1156,7 +1147,7 @@ impl OpenDalStorage {
             writer = writer.chunk(chunk_size);
         }
         Ok(Box::new(OpenDalWriter(
-            writer.await.map_err(|e| self.io_error(e))?,
+            self.io(async { writer.await }).await?,
             matches!(self, Self::Credentialed { .. }),
         )))
     }
@@ -1169,10 +1160,7 @@ impl OpenDalStorage {
     ) -> Result<()> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        operator
-            .delete(relative_path)
-            .await
-            .map_err(|e| self.io_error(e))
+        self.io(operator.delete(relative_path)).await
     }
 
     async fn delete_prefix_with_options(
@@ -1184,11 +1172,8 @@ impl OpenDalStorage {
         let path = directory_path(path);
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        operator
-            .delete_with(relative_path)
-            .recursive(true)
+        self.io(async { operator.delete_with(relative_path).recursive(true).await })
             .await
-            .map_err(|e| self.io_error(e))
     }
 
     async fn delete_stream_with_options(
@@ -1314,22 +1299,18 @@ impl OpenDalStorage {
                                 .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| {
                                     let operator = operator.clone();
                                     async move {
-                                        operator
-                                            .delete(storage.relativize_path(&path)?)
+                                        self.io(operator.delete(storage.relativize_path(&path)?))
                                             .await
-                                            .map_err(|e| self.io_error(e))
                                     }
                                 })
                                 .await;
                         }
-                        let mut deleter = operator.deleter().await.map_err(|e| self.io_error(e))?;
+                        let mut deleter = self.io(operator.deleter()).await?;
                         for path in paths {
-                            deleter
-                                .delete(storage.relativize_path(&path)?.to_string())
-                                .await
-                                .map_err(|e| self.io_error(e))?;
+                            self.io(deleter.delete(storage.relativize_path(&path)?.to_string()))
+                                .await?;
                         }
-                        deleter.close().await.map_err(|e| self.io_error(e))
+                        self.io(deleter.close()).await
                     },
                 )
                 .await?;
@@ -1349,37 +1330,42 @@ impl OpenDalStorage {
             self.create_operator_with_options(&path, options, operator_cache)?;
         let absolute_prefix: Arc<str> =
             Arc::from(&path[..path.len().saturating_sub(relative_path.len())]);
-        let lister = operator
-            .lister_with(relative_path)
-            .recursive(recursive)
-            .await
-            .map_err(|e| self.io_error(e))?;
+        let lister = self
+            .io(async {
+                operator
+                    .lister_with(relative_path)
+                    .recursive(recursive)
+                    .await
+            })
+            .await?;
         let redact = matches!(self, Self::Credentialed { .. });
 
-        Ok(lister
-            .map(move |entry| {
-                entry
-                    .map_err(|e| utils::credential_io_error(e, redact))
-                    .map(|entry| {
-                        let metadata = entry.metadata();
-                        let last_modified_ms = metadata
-                            .last_modified()
-                            .and_then(|timestamp| {
-                                let modified: SystemTime = timestamp.into();
-                                modified.duration_since(UNIX_EPOCH).ok()
-                            })
-                            .map(|duration| {
-                                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-                            });
-                        ListEntry {
-                            path: format!("{absolute_prefix}{}", entry.path()),
-                            size: metadata.content_length(),
-                            last_modified_ms,
-                            is_dir: metadata.is_dir(),
-                        }
-                    })
+        Ok(
+            futures::stream::try_unfold(lister, move |mut lister| async move {
+                utils::credential_io(lister.try_next(), redact)
+                    .await
+                    .map(|entry| entry.map(|entry| (entry, lister)))
             })
-            .boxed())
+            .map(move |entry| {
+                entry.map(|entry| {
+                    let metadata = entry.metadata();
+                    let last_modified_ms = metadata
+                        .last_modified()
+                        .and_then(|timestamp| {
+                            let modified: SystemTime = timestamp.into();
+                            modified.duration_since(UNIX_EPOCH).ok()
+                        })
+                        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+                    ListEntry {
+                        path: format!("{absolute_prefix}{}", entry.path()),
+                        size: metadata.content_length(),
+                        last_modified_ms,
+                        is_dir: metadata.is_dir(),
+                    }
+                })
+            })
+            .boxed(),
+        )
     }
 }
 
@@ -1537,10 +1523,11 @@ pub(crate) struct OpenDalReader(pub(crate) opendal::Reader, bool);
 #[async_trait]
 impl FileRead for OpenDalReader {
     async fn read(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Ok(opendal::Reader::read(&self.0, range)
-            .await
-            .map_err(|e| utils::credential_io_error(e, self.1))?
-            .to_bytes())
+        Ok(
+            utils::credential_io(opendal::Reader::read(&self.0, range), self.1)
+                .await?
+                .to_bytes(),
+        )
     }
 }
 
@@ -1550,15 +1537,11 @@ pub(crate) struct OpenDalWriter(pub(crate) opendal::Writer, bool);
 #[async_trait]
 impl FileWrite for OpenDalWriter {
     async fn write(&mut self, bs: Bytes) -> Result<()> {
-        Ok(opendal::Writer::write(&mut self.0, bs)
-            .await
-            .map_err(|e| utils::credential_io_error(e, self.1))?)
+        utils::credential_io(opendal::Writer::write(&mut self.0, bs), self.1).await
     }
 
     async fn close(&mut self) -> Result<()> {
-        let _ = opendal::Writer::close(&mut self.0)
-            .await
-            .map_err(|e| utils::credential_io_error(e, self.1))?;
+        let _ = utils::credential_io(opendal::Writer::close(&mut self.0), self.1).await?;
         Ok(())
     }
 }
