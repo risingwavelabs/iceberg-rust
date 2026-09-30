@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
 use crate::actions::maintenance::{DEFAULT_LOAD_CONCURRENCY, load_manifests};
 use crate::error::Result;
-use crate::runtime::JoinHandle;
+use crate::runtime::AbortOnDropHandle;
 use crate::spec::{
     DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestWriter, Operation,
 };
@@ -374,11 +374,12 @@ impl RewriteManifestsAction {
 }
 
 /// Spawns `writer`'s encode and upload, first waiting for one in-flight write to
-/// finish if `write_concurrency` are already running.
+/// finish if `write_concurrency` are already running. Writes abort on drop, so an
+/// early error or a cancelled commit doesn't keep uploading orphan manifests.
 async fn spawn_bounded_write(
     table: &Table,
     writer: ManifestWriter,
-    writes_in_flight: &mut FuturesUnordered<JoinHandle<Result<ManifestFile>>>,
+    writes_in_flight: &mut FuturesUnordered<AbortOnDropHandle<Result<ManifestFile>>>,
     write_concurrency: usize,
     written: &mut Vec<ManifestFile>,
 ) -> Result<()> {
@@ -387,7 +388,13 @@ async fn spawn_bounded_write(
     {
         written.push(done??);
     }
-    writes_in_flight.push(table.runtime().io().spawn(writer.write_manifest_file()));
+    writes_in_flight.push(
+        table
+            .runtime()
+            .io()
+            .spawn(writer.write_manifest_file())
+            .abort_on_drop(),
+    );
     Ok(())
 }
 

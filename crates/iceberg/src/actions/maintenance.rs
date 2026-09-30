@@ -28,6 +28,7 @@ pub(crate) const DEFAULT_LOAD_CONCURRENCY: usize = 16;
 // Each load is spawned as its own task so Avro decoding runs in parallel across runtime
 // workers; `buffer_unordered` alone polls every future on the caller's task, which
 // serializes decoding. `visit` stays on the caller's task, so it needs no synchronization.
+// Loads abort on drop so an early error or cancellation doesn't leave them running.
 pub(crate) async fn for_each_manifest_list<F>(
     table: &Table,
     snapshots: Vec<SnapshotRef>,
@@ -44,6 +45,7 @@ where
                 .runtime()
                 .io()
                 .spawn(async move { reader.load().await })
+                .abort_on_drop()
         })
         .buffer_unordered(concurrency.max(1));
 
@@ -66,10 +68,13 @@ pub(crate) fn load_manifests(
     stream::iter(manifest_files)
         .map(move |manifest_file| {
             let file_io = file_io.clone();
-            runtime.io().spawn(async move {
-                let manifest = manifest_file.load_manifest(&file_io).await?;
-                Ok::<_, Error>((manifest_file, manifest))
-            })
+            runtime
+                .io()
+                .spawn(async move {
+                    let manifest = manifest_file.load_manifest(&file_io).await?;
+                    Ok::<_, Error>((manifest_file, manifest))
+                })
+                .abort_on_drop()
         })
         .buffer_unordered(concurrency.max(1))
         .map(|loaded| loaded?)
