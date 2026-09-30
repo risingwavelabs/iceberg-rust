@@ -87,7 +87,7 @@ pub struct FileIO {
     factory: Arc<dyn StorageFactory>,
     /// Cached storage instance (lazily initialized)
     storage: Arc<OnceLock<Arc<dyn Storage>>>,
-    credentials: Option<CredentialProvider>,
+    credential_provider: Option<CredentialProvider>,
 }
 
 impl FileIO {
@@ -99,7 +99,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(MemoryStorageFactory),
             storage: Arc::new(OnceLock::new()),
-            credentials: None,
+            credential_provider: None,
         }
     }
 
@@ -111,7 +111,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(LocalFsStorageFactory),
             storage: Arc::new(OnceLock::new()),
-            credentials: None,
+            credential_provider: None,
         }
     }
 
@@ -131,10 +131,10 @@ impl FileIO {
         }
 
         // Build the storage
-        let storage = match &self.credentials {
+        let storage = match &self.credential_provider {
             Some(provider) => self
                 .factory
-                .build_with_credentials(&self.config, provider.clone())?,
+                .build_with_credentials(&self.config, Some(provider.0.clone()))?,
             None => self.factory.build(&self.config)?,
         };
 
@@ -233,7 +233,7 @@ pub struct FileIOBuilder {
     factory: Arc<dyn StorageFactory>,
     /// Storage configuration
     config: StorageConfig,
-    credentials: Option<CredentialProvider>,
+    credential_provider: Option<CredentialProvider>,
 }
 
 impl FileIOBuilder {
@@ -242,7 +242,7 @@ impl FileIOBuilder {
         Self {
             factory,
             config: StorageConfig::new(),
-            credentials: None,
+            credential_provider: None,
         }
     }
 
@@ -269,8 +269,11 @@ impl FileIOBuilder {
     }
 
     /// Share a runtime credential provider with all derived file handles.
-    pub fn with_credentials(mut self, provider: CredentialProvider) -> Self {
-        self.credentials = Some(provider);
+    pub fn with_credential_provider(
+        mut self,
+        provider: Arc<dyn super::StorageCredentialProvider>,
+    ) -> Self {
+        self.credential_provider = Some(CredentialProvider(provider));
         self
     }
 
@@ -280,7 +283,7 @@ impl FileIOBuilder {
             config: self.config,
             factory: self.factory,
             storage: Arc::new(OnceLock::new()),
-            credentials: self.credentials,
+            credential_provider: self.credential_provider,
         }
     }
 }

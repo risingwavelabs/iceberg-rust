@@ -21,16 +21,14 @@
 //! Each test uses unique file paths based on module path to avoid conflicts.
 #[cfg(feature = "opendal-s3")]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use async_trait::async_trait;
     use futures::StreamExt;
     use iceberg::io::{
-        CredentialProvider, FileIO, FileIOBuilder, FileIOCredential, FileIOCredentialProvider,
-        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
-        StorageFactory,
+        FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
+        S3_SECRET_ACCESS_KEY, StorageCredential, StorageCredentialProvider, StorageFactory,
     };
     use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
     use iceberg_test_utils::{get_object_store_endpoint, normalize_test_name_with_parts, set_up};
@@ -101,17 +99,15 @@ mod tests {
     struct TestCredentialProvider;
 
     #[async_trait]
-    impl FileIOCredentialProvider for TestCredentialProvider {
-        async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
+    impl StorageCredentialProvider for TestCredentialProvider {
+        async fn load_credential(&self, location: &str) -> iceberg::Result<StorageCredential> {
             assert!(location.starts_with("s3://bucket1/"));
-            Ok(FileIOCredential {
-                prefix: None,
-                properties: HashMap::from([
-                    (S3_ACCESS_KEY_ID.into(), "admin".into()),
-                    (S3_SECRET_ACCESS_KEY.into(), "password".into()),
-                ]),
-                expires_at: SystemTime::now() + Duration::from_secs(30),
-            })
+            Ok(
+                StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                    iceberg::io::S3Credential::new("admin", "password", None),
+                ))
+                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+            )
         }
     }
 
@@ -129,7 +125,7 @@ mod tests {
                     (S3_REGION, "us-east-1".to_string()),
                     (S3_PATH_STYLE_ACCESS, "true".to_string()),
                 ])
-                .with_credentials(CredentialProvider(Arc::new(TestCredentialProvider)))
+                .with_credential_provider(Arc::new(TestCredentialProvider))
                 .build();
             let path = format!(
                 "s3://bucket1/{}/{index}",

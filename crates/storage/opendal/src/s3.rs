@@ -29,7 +29,7 @@ use opendal::{Configurator, Operator};
 use reqsign_core::ProvideCredentialChain;
 use url::Url;
 
-use crate::credentials::{AwsPathCredential, PathCredential};
+use crate::credentials::{VendedCredentialSource, VendedS3CredentialProvider};
 use crate::utils::{from_opendal_error, is_truthy};
 
 /// Parse iceberg props to s3 config.
@@ -151,7 +151,7 @@ pub(crate) fn s3_config_build(
 
     if let Some(provider) = credentials {
         builder = builder.credential_provider_chain(ProvideCredentialChain::new().push(
-            AwsPathCredential(PathCredential {
+            VendedS3CredentialProvider(VendedCredentialSource {
                 provider: provider.clone(),
                 location: path.to_string(),
             }),

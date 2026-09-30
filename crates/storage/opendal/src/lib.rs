@@ -264,6 +264,21 @@ const OPERATOR_CACHE_CAPACITY: usize = 64;
 /// Bound in-flight deletes when credentials must be checked for each file.
 pub(crate) const CREDENTIALED_DELETE_CONCURRENCY: usize = 32;
 
+/// Keep bulk deletion within one backend resource and selected credential scope.
+#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+#[derive(PartialEq, Eq, Hash)]
+struct DeleteBatchKey {
+    storage: String,
+    credential_location: String,
+}
+
+#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+enum DeleteCredentialScope {
+    Static,
+    PerPath,
+    Prefix(String),
+}
+
 struct OperatorCacheEntry {
     key: OperatorCacheKey,
     operator: Arc<OnceCell<Operator>>,
@@ -572,13 +587,15 @@ impl StorageFactory for OpenDalStorageFactory {
     fn build_with_credentials(
         &self,
         config: &StorageConfig,
-        provider: CredentialProvider,
+        credential_provider: Option<Arc<dyn iceberg::io::StorageCredentialProvider>>,
     ) -> Result<Arc<dyn Storage>> {
         let mut storage = self.build_configured(config)?;
-        storage.storage = OpenDalStorage::Credentialed {
-            storage: Box::new(storage.storage),
-            provider,
-        };
+        if let Some(provider) = credential_provider {
+            storage.storage = OpenDalStorage::Credentialed {
+                storage: Box::new(storage.storage),
+                provider: CredentialProvider(provider),
+            };
+        }
         Ok(Arc::new(storage))
     }
 }
@@ -671,6 +688,9 @@ impl OpenDalStorage {
         options: &OpenDalStorageOptions,
     ) -> Result<Option<OperatorCacheKey>> {
         if let Self::Credentialed { storage, provider } = self {
+            if !provider.0.supports_path(path) {
+                return storage.operator_cache_key(path, options);
+            }
             return Ok(storage.operator_cache_key(path, options)?.map(|mut key| {
                 key.credentials = Some((provider.clone(), path.to_string()));
                 key
@@ -760,6 +780,11 @@ impl OpenDalStorage {
         path: &'a str,
         options: &OpenDalStorageOptions,
     ) -> Result<(Operator, &'a str)> {
+        if let Self::Credentialed { storage, provider } = self
+            && !provider.0.supports_path(path)
+        {
+            return storage.build_operator_with_options(path, options);
+        }
         let (operator, relative_path): (Operator, &str) = match self {
             Self::Credentialed { storage, provider } => match storage.as_ref() {
                 #[cfg(feature = "opendal-azdls")]
@@ -1246,7 +1271,14 @@ impl OpenDalStorage {
             let matched: Vec<_> = futures::stream::iter(paths)
                 .map(|path| async move {
                     storage.relativize_path(&path)?;
-                    let credential = provider.0.credential(&path).await?;
+                    if !provider.0.supports_path(&path) {
+                        return Ok((
+                            storage.batch_key_for_path(&path),
+                            DeleteCredentialScope::Static,
+                            path,
+                        ));
+                    }
+                    let credential = provider.0.load_credential(&path).await?;
                     if !credential.covers(&path) {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
@@ -1257,18 +1289,41 @@ impl OpenDalStorage {
                         .operator_cache_key(&path, options)?
                         .map(|key| key.bucket)
                         .unwrap_or_else(|| storage.batch_key_for_path(&path));
-                    Ok((bucket, credential.prefix, path))
+                    let scope = credential
+                        .prefix()
+                        .map_or(DeleteCredentialScope::PerPath, |prefix| {
+                            DeleteCredentialScope::Prefix(prefix.to_string())
+                        });
+                    Ok((bucket, scope, path))
                 })
                 .buffer_unordered(CREDENTIALED_DELETE_CONCURRENCY)
                 .try_collect()
                 .await?;
-            let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+            let mut groups: HashMap<DeleteBatchKey, Vec<String>> = HashMap::new();
             let mut unscoped = Vec::new();
-            for (bucket, prefix, path) in matched {
-                match prefix {
-                    Some(prefix) => groups.entry((bucket, prefix)).or_default().push(path),
-                    None => unscoped.push(path),
+            let mut static_paths = Vec::new();
+            for (bucket, scope, path) in matched {
+                match scope {
+                    DeleteCredentialScope::Prefix(prefix) => groups
+                        .entry(DeleteBatchKey {
+                            storage: bucket,
+                            credential_location: prefix,
+                        })
+                        .or_default()
+                        .push(path),
+                    DeleteCredentialScope::PerPath => unscoped.push(path),
+                    DeleteCredentialScope::Static => static_paths.push(path),
                 }
+            }
+            if !static_paths.is_empty() {
+                // An opt-out must retain ordinary backend batching, not just
+                // ordinary authentication.
+                Box::pin(storage.delete_stream_with_options(
+                    futures::stream::iter(static_paths).boxed(),
+                    options,
+                    operator_cache,
+                ))
+                .await?;
             }
             futures::stream::iter(unscoped.into_iter().map(Ok))
                 .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
@@ -1279,12 +1334,12 @@ impl OpenDalStorage {
             futures::stream::iter(groups.into_iter().map(Ok))
                 .try_for_each_concurrent(
                     CREDENTIALED_DELETE_CONCURRENCY,
-                    |((_, prefix), paths)| async move {
+                    |(key, paths)| async move {
                         let batch_storage = Self::Credentialed {
                             storage: storage.clone(),
                             provider: credentials::BatchCredential::provider(
                                 provider.clone(),
-                                prefix,
+                                key.credential_location,
                                 paths.clone(),
                             ),
                         };
@@ -1584,7 +1639,7 @@ mod tests {
     #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
     mod directory_credentials {
         use futures::TryStreamExt;
-        use iceberg::io::{FileIOBuilder, FileIOCredential, FileIOCredentialProvider};
+        use iceberg::io::{FileIOBuilder, StorageCredential, StorageCredentialProvider};
         use mockito::{Matcher, Server};
 
         use super::*;
@@ -1592,12 +1647,12 @@ mod tests {
         #[derive(Debug)]
         struct DirectoryProvider {
             directory: String,
-            credential: FileIOCredential,
+            credential: StorageCredential,
         }
 
         #[async_trait]
-        impl FileIOCredentialProvider for DirectoryProvider {
-            async fn credential(&self, location: &str) -> Result<FileIOCredential> {
+        impl StorageCredentialProvider for DirectoryProvider {
+            async fn load_credential(&self, location: &str) -> Result<StorageCredential> {
                 // A directory grant deliberately does not cover the file of
                 // the same name. Do not trim slashes in credential matching.
                 if location != self.directory {
@@ -1613,22 +1668,19 @@ mod tests {
         async fn assert_directory_credential_binding(
             factory: OpenDalStorageFactory,
             props: HashMap<String, String>,
-            credential_properties: HashMap<String, String>,
+            credential_kind: iceberg::io::StorageCredentialKind,
             file: &str,
         ) {
             let directory = format!("{file}/");
             let provider = Arc::new(DirectoryProvider {
                 directory: directory.clone(),
-                credential: FileIOCredential {
-                    prefix: None,
-                    properties: credential_properties,
-                    expires_at: SystemTime::now() + Duration::from_secs(30),
-                },
+                credential: StorageCredential::new(credential_kind)
+                    .with_expiration(SystemTime::now() + Duration::from_secs(30)),
             });
             let io = FileIOBuilder::new(Arc::new(factory))
                 .with_props(props)
                 .with_prop(IO_MAX_RETRIES, "0")
-                .with_credentials(CredentialProvider(provider))
+                .with_credential_provider(provider)
                 .build();
 
             // Cache the rejected file operator first. A subsequent directory
@@ -1683,10 +1735,11 @@ mod tests {
                     (S3_REGION.to_string(), "us-east-1".to_string()),
                     (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
                 ]),
-                HashMap::from([
-                    (S3_ACCESS_KEY_ID.to_string(), "DIRECTORY".to_string()),
-                    (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
-                ]),
+                iceberg::io::StorageCredentialKind::S3(iceberg::io::S3Credential::new(
+                    "DIRECTORY",
+                    "dummy-secret",
+                    None,
+                )),
                 "s3://bucket/table",
             )
             .await;
@@ -1698,7 +1751,7 @@ mod tests {
         #[cfg(feature = "opendal-azdls")]
         #[tokio::test]
         async fn adls_directory_operations_bind_normalized_uri_before_cache_lookup() {
-            use iceberg::io::{ADLS_ENDPOINT, ADLS_SAS_TOKEN};
+            use iceberg::io::ADLS_ENDPOINT;
 
             let mut server = Server::new_async().await;
             // The endpoint path satisfies ADLS's endpoint-suffix validation
@@ -1736,7 +1789,9 @@ mod tests {
             assert_directory_credential_binding(
                 OpenDalStorageFactory::azdls(),
                 HashMap::from([(ADLS_ENDPOINT.to_string(), endpoint)]),
-                HashMap::from([(ADLS_SAS_TOKEN.to_string(), "sig=directory".to_string())]),
+                iceberg::io::StorageCredentialKind::Azdls(iceberg::io::AzdlsCredential::new(
+                    "sig=directory",
+                )),
                 "abfs://myfs@myaccount.dfs.core.windows.net/table",
             )
             .await;
@@ -1786,13 +1841,13 @@ mod tests {
     #[cfg(feature = "opendal-azdls")]
     #[test]
     fn credentialed_operators_are_isolated_and_cache_is_bounded() {
-        use iceberg::io::{CredentialProvider, FileIOCredential, FileIOCredentialProvider};
+        use iceberg::io::{CredentialProvider, StorageCredential, StorageCredentialProvider};
 
         #[derive(Debug)]
         struct Provider;
         #[async_trait]
-        impl FileIOCredentialProvider for Provider {
-            async fn credential(&self, _: &str) -> Result<FileIOCredential> {
+        impl StorageCredentialProvider for Provider {
+            async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
                 unreachable!("operator construction must not fetch credentials")
             }
         }

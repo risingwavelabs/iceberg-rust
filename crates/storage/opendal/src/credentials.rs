@@ -19,9 +19,23 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use iceberg::io::{CredentialProvider, FileIOCredential, FileIOCredentialProvider};
+use iceberg::io::{
+    CredentialProvider, StorageCredential, StorageCredentialKind, StorageCredentialProvider,
+};
 use iceberg::{Error, ErrorKind, Result};
 use reqsign_core::{Context, ProvideCredential};
+
+#[cfg(test)]
+#[derive(Debug)]
+struct FixedCredentialProvider(StorageCredential);
+
+#[cfg(test)]
+#[async_trait]
+impl StorageCredentialProvider for FixedCredentialProvider {
+    async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
+        Ok(self.0.clone())
+    }
+}
 
 fn timestamp(time: SystemTime) -> reqsign_core::Result<reqsign_core::time::Timestamp> {
     let millis = time
@@ -37,21 +51,22 @@ fn timestamp(time: SystemTime) -> reqsign_core::Result<reqsign_core::time::Times
 /// Bind to a file, not the prefix selected when the operator was constructed:
 /// a refreshed credential set can partition the locations differently.
 #[derive(Clone)]
-pub(crate) struct PathCredential {
+pub(crate) struct VendedCredentialSource {
     pub(crate) provider: CredentialProvider,
     pub(crate) location: String,
 }
 
-impl std::fmt::Debug for PathCredential {
+impl std::fmt::Debug for VendedCredentialSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PathCredential").finish_non_exhaustive()
+        f.debug_struct("VendedCredentialSource")
+            .finish_non_exhaustive()
     }
 }
 
-impl PathCredential {
-    async fn load(&self) -> Result<FileIOCredential> {
+impl VendedCredentialSource {
+    async fn load(&self) -> Result<StorageCredential> {
         crate::utils::clear_credential_failure();
-        let credential = self.provider.0.credential(&self.location).await?;
+        let credential = self.provider.0.load_credential(&self.location).await?;
         if !credential.covers(&self.location) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -93,53 +108,60 @@ impl BatchCredential {
 }
 
 #[async_trait]
-impl FileIOCredentialProvider for BatchCredential {
-    async fn credential(&self, _: &str) -> Result<FileIOCredential> {
-        let mut selected: Option<FileIOCredential> = None;
+impl StorageCredentialProvider for BatchCredential {
+    async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
+        let mut selected: Option<StorageCredential> = None;
         for location in &self.locations {
-            let credential = self.provider.0.credential(location).await?;
+            let credential = self.provider.0.load_credential(location).await?;
             if credential.prefix() != Some(self.prefix.as_str()) || !credential.covers(location) {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Storage credential scope changed during bulk deletion",
                 ));
             }
-            if let Some(selected) = &mut selected {
-                if selected.properties != credential.properties {
+            if let Some(previous) = selected.take() {
+                if previous.kind() != credential.kind() {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
                         "Storage credentials differ within a bulk deletion scope",
                     ));
                 }
-                selected.expires_at = selected.expires_at.min(credential.expires_at);
+                let expiry = match (previous.expires_at(), credential.expires_at()) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                selected = Some(match expiry {
+                    Some(expiry) => previous.with_expiration(expiry),
+                    None => previous,
+                });
             } else {
                 selected = Some(credential);
             }
         }
-        let mut selected =
+        let selected =
             selected.ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Empty credential batch"))?;
         // Stay below reqsign's cache freshness windows (Azure: 20s, AWS:
         // 120s), but above AWS's 10s signing headroom. Every signing attempt
         // must re-select the batch, even if a custom provider uses a long TTL.
-        let lease = if selected
-            .properties
-            .contains_key(iceberg::io::ADLS_SAS_TOKEN)
-        {
+        let lease = if matches!(selected.kind(), StorageCredentialKind::Azdls(_)) {
             Duration::from_secs(5)
         } else {
             Duration::from_secs(30)
         };
-        selected.expires_at = selected.expires_at.min(SystemTime::now() + lease);
-        Ok(selected)
+        let deadline = SystemTime::now() + lease;
+        let expiry = selected
+            .expires_at()
+            .map_or(deadline, |expiry| expiry.min(deadline));
+        Ok(selected.with_expiration(expiry))
     }
 }
 
 #[cfg(feature = "opendal-azdls")]
 #[derive(Debug)]
-pub(crate) struct AzdlsPathCredential(pub(crate) PathCredential);
+pub(crate) struct VendedAzdlsCredentialProvider(pub(crate) VendedCredentialSource);
 
 #[cfg(feature = "opendal-azdls")]
-impl ProvideCredential for AzdlsPathCredential {
+impl ProvideCredential for VendedAzdlsCredentialProvider {
     type Credential = reqsign_azure_storage::Credential;
 
     async fn provide_credential(
@@ -151,28 +173,32 @@ impl ProvideCredential for AzdlsPathCredential {
             .load()
             .await
             .map_err(crate::utils::credential_provider_error)?;
-        let token = credential
-            .properties
-            .get(iceberg::io::ADLS_SAS_TOKEN)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| {
-                reqsign_core::Error::credential_invalid("Missing ADLS SAS credential")
-            })?;
-        Ok(Some(
-            reqsign_azure_storage::Credential::with_sas_token_expires_at(
-                token,
-                timestamp(credential.expires_at)?,
+        let StorageCredentialKind::Azdls(material) = credential.kind() else {
+            return Err(reqsign_core::Error::credential_invalid(
+                "Expected ADLS credential",
+            ));
+        };
+        if material.sas_token().trim_start_matches('?').is_empty() {
+            return Err(reqsign_core::Error::credential_invalid(
+                "Missing ADLS SAS credential",
+            ));
+        }
+        Ok(Some(match credential.expires_at() {
+            Some(expiry) => reqsign_azure_storage::Credential::with_sas_token_expires_at(
+                material.sas_token(),
+                timestamp(expiry)?,
             ),
-        ))
+            None => reqsign_azure_storage::Credential::with_sas_token(material.sas_token()),
+        }))
     }
 }
 
 #[cfg(feature = "opendal-s3")]
 #[derive(Debug)]
-pub(crate) struct AwsPathCredential(pub(crate) PathCredential);
+pub(crate) struct VendedS3CredentialProvider(pub(crate) VendedCredentialSource);
 
 #[cfg(feature = "opendal-s3")]
-impl ProvideCredential for AwsPathCredential {
+impl ProvideCredential for VendedS3CredentialProvider {
     type Credential = reqsign_aws_v4::Credential;
 
     async fn provide_credential(
@@ -184,33 +210,31 @@ impl ProvideCredential for AwsPathCredential {
             .load()
             .await
             .map_err(crate::utils::credential_provider_error)?;
-        let required = |key| {
-            credential
-                .properties
-                .get(key)
-                .filter(|v| !v.is_empty())
-                .cloned()
-                .ok_or_else(|| reqsign_core::Error::credential_invalid("Incomplete S3 credential"))
+        let StorageCredentialKind::S3(material) = credential.kind() else {
+            return Err(reqsign_core::Error::credential_invalid(
+                "Expected S3 credential",
+            ));
         };
+        if material.access_key_id().is_empty() || material.secret_access_key().is_empty() {
+            return Err(reqsign_core::Error::credential_invalid(
+                "Incomplete S3 credential",
+            ));
+        }
         Ok(Some(reqsign_aws_v4::Credential {
-            access_key_id: required(iceberg::io::S3_ACCESS_KEY_ID)?,
-            secret_access_key: required(iceberg::io::S3_SECRET_ACCESS_KEY)?,
-            session_token: credential
-                .properties
-                .get(iceberg::io::S3_SESSION_TOKEN)
-                .cloned(),
-            expires_in: Some(timestamp(credential.expires_at)?),
+            access_key_id: material.access_key_id().to_string(),
+            secret_access_key: material.secret_access_key().to_string(),
+            session_token: material.session_token().map(str::to_string),
+            expires_in: credential.expires_at().map(timestamp).transpose()?,
         }))
     }
 }
 
 #[cfg(all(test, feature = "opendal-azdls"))]
 mod adls_batch_tests {
-    use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
     use futures::StreamExt;
-    use iceberg::io::{ADLS_ENDPOINT, ADLS_SAS_TOKEN, FileIOBuilder, StorageFactory};
+    use iceberg::io::{ADLS_ENDPOINT, AzdlsCredential, FileIOBuilder, StorageFactory};
     use mockito::{Matcher, Server};
 
     use super::*;
@@ -219,20 +243,56 @@ mod adls_batch_tests {
     #[derive(Debug)]
     struct Provider;
 
+    #[tokio::test]
+    async fn adls_typed_credentials_accept_no_expiry_and_reject_wrong_backend() {
+        for factory in [
+            Arc::new(OpenDalStorageFactory::azdls()) as Arc<dyn StorageFactory>,
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ] {
+            let mut server = Server::new_async().await;
+            let request = server
+                .mock("GET", "/core.windows.net/one/file")
+                .match_query(Matcher::UrlEncoded("sig".into(), "fixed".into()))
+                .with_body("data")
+                .expect(1)
+                .create_async()
+                .await;
+            for kind in [
+                StorageCredentialKind::Azdls(AzdlsCredential::new("sig=fixed")),
+                StorageCredentialKind::S3(iceberg::io::S3Credential::new("wrong", "wrong", None)),
+            ] {
+                let is_adls = matches!(kind, StorageCredentialKind::Azdls(_));
+                let io = FileIOBuilder::new(factory.clone())
+                    .with_prop(ADLS_ENDPOINT, format!("{}/core.windows.net", server.url()))
+                    .with_prop("io.max-retries", "0")
+                    .with_credential_provider(Arc::new(FixedCredentialProvider(
+                        StorageCredential::new(kind),
+                    )))
+                    .build();
+                let result = io
+                    .new_input("abfs://one@account.dfs.core.windows.net/file")
+                    .unwrap()
+                    .read()
+                    .await;
+                assert_eq!(result.is_ok(), is_adls);
+            }
+            request.assert_async().await;
+        }
+    }
+
     #[async_trait]
-    impl FileIOCredentialProvider for Provider {
-        async fn credential(&self, location: &str) -> Result<FileIOCredential> {
+    impl StorageCredentialProvider for Provider {
+        async fn load_credential(&self, location: &str) -> Result<StorageCredential> {
             let mut root = url::Url::parse(location)?;
             let filesystem = root.username().to_string();
             root.set_path("/");
-            Ok(FileIOCredential {
-                prefix: Some(root.to_string()),
-                properties: HashMap::from([(
-                    ADLS_SAS_TOKEN.to_string(),
+            Ok(
+                StorageCredential::new(StorageCredentialKind::Azdls(AzdlsCredential::new(
                     format!("sig={filesystem}"),
-                )]),
-                expires_at: SystemTime::now() + Duration::from_secs(30),
-            })
+                )))
+                .with_prefix(root.to_string())
+                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+            )
         }
     }
 
@@ -252,7 +312,7 @@ mod adls_batch_tests {
         let io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::azdls()))
             .with_prop(ADLS_ENDPOINT, format!("{}/core.windows.net", server.url()))
             .with_prop("io.max-retries", "0")
-            .with_credentials(CredentialProvider(Arc::new(Provider)))
+            .with_credential_provider(Arc::new(Provider))
             .build();
         let error = io
             .new_input("abfs://one@account.dfs.core.windows.net/file")
@@ -306,7 +366,7 @@ mod adls_batch_tests {
             let io = FileIOBuilder::new(factory)
                 .with_prop(ADLS_ENDPOINT, format!("{}/core.windows.net", server.url()))
                 .with_prop("io.max-retries", "0")
-                .with_credentials(CredentialProvider(Arc::new(Provider)))
+                .with_credential_provider(Arc::new(Provider))
                 .build();
             io.delete_stream(futures::stream::iter(paths).boxed())
                 .await
@@ -321,7 +381,6 @@ mod adls_batch_tests {
 
 #[cfg(all(test, feature = "opendal-s3"))]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
@@ -329,9 +388,9 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use iceberg::io::{
-        CredentialProvider, FileIOBuilder, FileIOCredential, FileIOCredentialProvider,
-        S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
-        S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN, StorageFactory,
+        CredentialProvider, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ENDPOINT,
+        S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY, StorageCredential,
+        StorageCredentialProvider, StorageFactory,
     };
     use mockito::{Matcher, Server};
     use tokio::sync::Barrier;
@@ -354,23 +413,135 @@ mod tests {
             .with_prop("io.max-retries", "0")
     }
 
+    #[tokio::test]
+    async fn s3_typed_credentials_accept_no_expiry_and_reject_wrong_backend() {
+        for factory in s3_factories() {
+            let mut server = Server::new_async().await;
+            let request = server
+                .mock("GET", "/bucket/table/file")
+                .match_header("authorization", Matcher::Regex("Credential=FIXED/".into()))
+                .with_body("data")
+                .expect(1)
+                .create_async()
+                .await;
+            for kind in [
+                iceberg::io::StorageCredentialKind::S3(iceberg::io::S3Credential::new(
+                    "FIXED",
+                    "dummy-secret",
+                    None,
+                )),
+                iceberg::io::StorageCredentialKind::Azdls(iceberg::io::AzdlsCredential::new(
+                    "sig=wrong",
+                )),
+            ] {
+                let is_s3 = matches!(kind, iceberg::io::StorageCredentialKind::S3(_));
+                let io = anonymous_s3_builder(factory.clone(), &server.url())
+                    .with_credential_provider(Arc::new(super::FixedCredentialProvider(
+                        StorageCredential::new(kind),
+                    )))
+                    .build();
+                let result = io.new_input("s3://bucket/table/file").unwrap().read().await;
+                assert_eq!(result.is_ok(), is_s3);
+            }
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_paths_keep_static_authentication_for_reads_and_deletes() {
+        #[derive(Debug)]
+        struct UnsupportedProvider;
+        #[async_trait]
+        impl StorageCredentialProvider for UnsupportedProvider {
+            fn supports_path(&self, _: &str) -> bool {
+                false
+            }
+            async fn load_credential(&self, _: &str) -> iceberg::Result<StorageCredential> {
+                panic!("unsupported paths must not load vended credentials");
+            }
+        }
+        for factory in s3_factories() {
+            let mut server = Server::new_async().await;
+            let read = server
+                .mock("GET", "/bucket/table/file")
+                .match_header("authorization", Matcher::Regex("Credential=STATIC/".into()))
+                .with_body("data")
+                .expect(1)
+                .create_async()
+                .await;
+            let delete = server
+                .mock("POST", "/bucket/")
+                .match_header("authorization", Matcher::Regex("Credential=STATIC/".into()))
+                .match_query(Matcher::Any)
+                .match_body(Matcher::Regex(r"^<Delete><Quiet>true</Quiet>(<Object><Key>table/(file|other)</Key></Object>){2}</Delete>$".into()))
+                .with_body("<DeleteResult/>")
+                .expect(1)
+                .create_async()
+                .await;
+            let io = anonymous_s3_builder(factory, &server.url())
+                .with_prop(S3_ALLOW_ANONYMOUS, "false")
+                .with_prop(S3_ACCESS_KEY_ID, "STATIC")
+                .with_prop(S3_SECRET_ACCESS_KEY, "dummy-static-secret")
+                .with_credential_provider(Arc::new(UnsupportedProvider))
+                .build();
+            assert_eq!(
+                io.new_input("s3://bucket/table/file")
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"data"
+            );
+            io.delete_stream(futures::stream::iter(vec![
+                "s3://bucket/table/file".to_string(),
+                "s3://bucket/table/other".to_string(),
+            ]))
+            .await
+            .unwrap();
+            read.assert_async().await;
+            delete.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_non_expiring_credentials_still_receive_a_short_signing_lease() {
+        let credential = StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+            iceberg::io::S3Credential::new("key", "dummy-secret", None),
+        ))
+        .with_prefix("s3://bucket/table/");
+        let batch = super::BatchCredential::provider(
+            CredentialProvider(Arc::new(super::FixedCredentialProvider(credential))),
+            "s3://bucket/table/".into(),
+            vec![
+                "s3://bucket/table/one".into(),
+                "s3://bucket/table/two".into(),
+            ],
+        );
+        let start = SystemTime::now();
+        let selected = batch.0.load_credential("s3://bucket/table/").await.unwrap();
+        assert!(selected.expires_at().unwrap() >= start);
+        assert!(selected.expires_at().unwrap() <= SystemTime::now() + Duration::from_secs(30));
+    }
+
     #[derive(Debug)]
     struct Provider(AtomicUsize);
 
     #[async_trait]
-    impl FileIOCredentialProvider for Provider {
-        async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
+    impl StorageCredentialProvider for Provider {
+        async fn load_credential(&self, location: &str) -> iceberg::Result<StorageCredential> {
             assert_eq!(location, "s3://bucket/table/file");
             let generation = self.0.load(Ordering::SeqCst);
-            Ok(FileIOCredential {
-                prefix: None,
-                properties: HashMap::from([
-                    (S3_ACCESS_KEY_ID.to_string(), format!("KEY{generation}")),
-                    (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
-                    (S3_SESSION_TOKEN.to_string(), format!("SESSION{generation}")),
-                ]),
-                expires_at: SystemTime::now() + Duration::from_secs(30),
-            })
+            Ok(
+                StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                    iceberg::io::S3Credential::new(
+                        format!("KEY{generation}"),
+                        "dummy-secret",
+                        Some(format!("SESSION{generation}")),
+                    ),
+                ))
+                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+            )
         }
     }
 
@@ -380,14 +551,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl FileIOCredentialProvider for RejectingProvider {
-        async fn credential(&self, _: &str) -> iceberg::Result<FileIOCredential> {
+    impl StorageCredentialProvider for RejectingProvider {
+        async fn load_credential(&self, _: &str) -> iceberg::Result<StorageCredential> {
             if self.incomplete {
-                Ok(FileIOCredential {
-                    prefix: None,
-                    properties: HashMap::new(),
-                    expires_at: SystemTime::now() + Duration::from_secs(30),
-                })
+                Ok(
+                    StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                        iceberg::io::S3Credential::new("", "", None),
+                    ))
+                    .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+                )
             } else {
                 Err(iceberg::Error::new(
                     iceberg::ErrorKind::DataInvalid,
@@ -404,8 +576,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl FileIOCredentialProvider for ScopedDeleteProvider {
-        async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
+    impl StorageCredentialProvider for ScopedDeleteProvider {
+        async fn load_credential(&self, location: &str) -> iceberg::Result<StorageCredential> {
             let key = match location {
                 "s3://bucket/first/file" => "FIRST",
                 "s3://bucket/second/file" => "SECOND",
@@ -418,14 +590,12 @@ mod tests {
             if (2..4).contains(&call) {
                 self.barrier.wait().await;
             }
-            Ok(FileIOCredential {
-                prefix: None,
-                properties: HashMap::from([
-                    (S3_ACCESS_KEY_ID.to_string(), key.to_string()),
-                    (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
-                ]),
-                expires_at: SystemTime::now() + Duration::from_secs(30),
-            })
+            Ok(
+                StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                    iceberg::io::S3Credential::new(key, "dummy-secret", None),
+                ))
+                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+            )
         }
     }
 
@@ -458,7 +628,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             });
             let io = anonymous_s3_builder(factory, &server.url())
-                .with_credentials(CredentialProvider(provider.clone()))
+                .with_credential_provider(provider.clone())
                 .build();
             let paths = ["s3://bucket/first/file", "s3://bucket/second/file"];
             tokio::time::timeout(
@@ -480,8 +650,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl FileIOCredentialProvider for BulkDeleteProvider {
-        async fn credential(&self, location: &str) -> iceberg::Result<FileIOCredential> {
+    impl StorageCredentialProvider for BulkDeleteProvider {
+        async fn load_credential(&self, location: &str) -> iceberg::Result<StorageCredential> {
             let (prefix, key) = [
                 ("s3://bucket/first/", "FIRST"),
                 ("s3://bucket/second/", "SECOND"),
@@ -496,14 +666,13 @@ mod tests {
                 } else {
                     prefix.to_string()
                 };
-            Ok(FileIOCredential {
-                prefix: Some(prefix),
-                properties: HashMap::from([
-                    (S3_ACCESS_KEY_ID.to_string(), key.to_string()),
-                    (S3_SECRET_ACCESS_KEY.to_string(), "dummy-secret".to_string()),
-                ]),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            })
+            Ok(
+                StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                    iceberg::io::S3Credential::new(key, "dummy-secret", None),
+                ))
+                .with_prefix(prefix)
+                .with_expiration(SystemTime::now() + Duration::from_secs(3600)),
+            )
         }
     }
 
@@ -560,9 +729,9 @@ mod tests {
                 .create_async()
                 .await;
             let io = anonymous_s3_builder(factory, &server.url())
-                .with_credentials(CredentialProvider(Arc::new(BulkDeleteProvider {
+                .with_credential_provider(Arc::new(BulkDeleteProvider {
                     repartition: AtomicUsize::new(0),
-                })))
+                }))
                 .build();
             let mut paths: Vec<_> = (0..1002)
                 .map(|index| format!("s3://bucket/first/{index}"))
@@ -598,11 +767,21 @@ mod tests {
                 "s3://bucket/first/private".to_string(),
             ],
         );
-        batch.0.credential("s3://bucket/first/file").await.unwrap();
+        batch
+            .0
+            .load_credential("s3://bucket/first/file")
+            .await
+            .unwrap();
         provider.repartition.store(1, Ordering::SeqCst);
         // The representative file still has the old scope, but the child does
         // not. Re-signing the batch must fail rather than use the parent's key.
-        assert!(batch.0.credential("s3://bucket/first/file").await.is_err());
+        assert!(
+            batch
+                .0
+                .load_credential("s3://bucket/first/file")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -621,9 +800,7 @@ mod tests {
                     // A rejected provider must not fall back to static credentials either.
                     .with_prop(S3_ACCESS_KEY_ID, "STATIC")
                     .with_prop(S3_SECRET_ACCESS_KEY, "dummy-static-secret")
-                    .with_credentials(CredentialProvider(Arc::new(RejectingProvider {
-                        incomplete,
-                    })))
+                    .with_credential_provider(Arc::new(RejectingProvider { incomplete }))
                     .build();
 
                 assert!(
@@ -705,7 +882,7 @@ mod tests {
                 ],
             );
             let io = anonymous_s3_builder(factory, &server.url())
-                .with_credentials(batch)
+                .with_credential_provider(batch.0)
                 .build();
             let file = io.new_input("s3://bucket/first/file").unwrap();
             assert_eq!(file.read().await.unwrap().as_ref(), b"data");
@@ -730,7 +907,7 @@ mod tests {
                 .create_async()
                 .await;
             let io = anonymous_s3_builder(factory, &server.url())
-                .with_credentials(CredentialProvider(Arc::new(Provider(AtomicUsize::new(0)))))
+                .with_credential_provider(Arc::new(Provider(AtomicUsize::new(0))))
                 .build();
             let error = io
                 .new_input("s3://bucket/table/file")
@@ -783,7 +960,7 @@ mod tests {
             let mut server = Server::new_async().await;
             let provider = Arc::new(Provider(AtomicUsize::new(0)));
             let io = anonymous_s3_builder(factory, &server.url())
-                .with_credentials(CredentialProvider(provider.clone()))
+                .with_credential_provider(provider.clone())
                 .build();
             let reader = io
                 .new_input("s3://bucket/table/file")

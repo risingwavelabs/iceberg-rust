@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use iceberg::io::{ADLS_SAS_TOKEN, FileIOCredential, FileIOCredentialProvider};
+use iceberg::io::{
+    ADLS_SAS_TOKEN, AzdlsCredential, S3Credential, StorageCredential as IoStorageCredential,
+    StorageCredentialKind, StorageCredentialProvider, storage_prefix_covers,
+};
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
@@ -40,23 +43,12 @@ fn invalid(message: &'static str) -> Error {
 
 /// Reject URL aliasing and compare directory boundaries, not host suffixes.
 fn matches_prefix(prefix: &Url, location: &Url) -> bool {
-    prefix.scheme() == location.scheme()
-        && prefix.host_str() == location.host_str()
-        && prefix.port() == location.port()
-        && prefix.username() == location.username()
-        && prefix.password().is_none()
-        && prefix.query().is_none()
-        && prefix.fragment().is_none()
-        && (prefix.path() == location.path()
-            || location
-                .path()
-                .strip_prefix(prefix.path())
-                .is_some_and(|suffix| prefix.path().ends_with('/') || suffix.starts_with('/')))
+    storage_prefix_covers(prefix.as_str(), location.as_str())
 }
 
 // These types deliberately have no Debug implementation: they contain secrets.
 struct ParsedCredential {
-    properties: HashMap<String, String>,
+    kind: StorageCredentialKind,
     expiry: Option<SystemTime>,
 }
 
@@ -120,7 +112,7 @@ impl ParsedProperties {
             expiry = Some(expiry.map_or(time, |old| old.min(time)));
         }
         Ok(ParsedCredential {
-            properties: HashMap::from([(ADLS_SAS_TOKEN.to_string(), token)]),
+            kind: StorageCredentialKind::Azdls(AzdlsCredential::new(token)),
             expiry,
         })
     }
@@ -135,20 +127,14 @@ impl ParsedProperties {
             .get("s3.session-token-expires-at-ms")
             .map(|value| parse_expiry(value, "Invalid S3 credential expiry"))
             .transpose()?;
-        // Only authentication fields are needed by the signer.
-        let properties = [
-            "s3.access-key-id",
-            "s3.secret-access-key",
-            "s3.session-token",
-        ]
-        .into_iter()
-        .filter_map(|key| {
-            properties
-                .get(key)
-                .map(|value| (key.to_string(), value.clone()))
+        Ok(ParsedCredential {
+            kind: StorageCredentialKind::S3(S3Credential::new(
+                &properties["s3.access-key-id"],
+                &properties["s3.secret-access-key"],
+                properties.get("s3.session-token").cloned(),
+            )),
+            expiry,
         })
-        .collect();
-        Ok(ParsedCredential { properties, expiry })
     }
 
     fn select(&self, location: &Url) -> Result<&ParsedCredential> {
@@ -214,7 +200,12 @@ impl CredentialSet {
             .select(location)
     }
 
-    fn credential(&self, location: &Url, now: SystemTime, fresh: bool) -> Result<FileIOCredential> {
+    fn load_credential(
+        &self,
+        location: &Url,
+        now: SystemTime,
+        fresh: bool,
+    ) -> Result<IoStorageCredential> {
         let credential = self.select(location)?;
         let prefix = self
             .matched_entry(location)
@@ -238,11 +229,9 @@ impl CredentialSet {
         } else {
             Duration::from_secs(5)
         };
-        Ok(FileIOCredential {
-            prefix: Some(prefix),
-            properties: credential.properties.clone(),
-            expires_at: deadline.min(now + lease),
-        })
+        Ok(IoStorageCredential::new(credential.kind.clone())
+            .with_prefix(prefix)
+            .with_expiration(deadline.min(now + lease)))
     }
 }
 
@@ -256,19 +245,20 @@ struct State {
     config_retry_after: SystemTime,
 }
 
-pub(crate) struct RestCredentials {
+pub(crate) struct RestVendedCredentialProvider {
     client: Arc<HttpClient>,
     table_url: String,
     state: Mutex<State>,
 }
 
-impl std::fmt::Debug for RestCredentials {
+impl std::fmt::Debug for RestVendedCredentialProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RestCredentials").finish_non_exhaustive()
+        f.debug_struct("RestVendedCredentialProvider")
+            .finish_non_exhaustive()
     }
 }
 
-impl RestCredentials {
+impl RestVendedCredentialProvider {
     /// Feed newer load/commit credentials to all existing handles.
     pub(crate) async fn update(&self, set: CredentialSet) {
         let mut state = self.state.lock().await;
@@ -416,8 +406,17 @@ impl RestCredentials {
 }
 
 #[async_trait]
-impl FileIOCredentialProvider for RestCredentials {
-    async fn credential(&self, location: &str) -> Result<FileIOCredential> {
+impl StorageCredentialProvider for RestVendedCredentialProvider {
+    fn supports_path(&self, path: &str) -> bool {
+        Url::parse(path).is_ok_and(|location| {
+            matches!(
+                location.scheme(),
+                "s3" | "s3a" | "s3n" | "abfs" | "abfss" | "wasb" | "wasbs"
+            )
+        })
+    }
+
+    async fn load_credential(&self, location: &str) -> Result<IoStorageCredential> {
         let location = Url::parse(location).map_err(|_| invalid("Invalid credential location"))?;
         if location.query().is_some()
             || location.fragment().is_some()
@@ -433,7 +432,7 @@ impl FileIOCredentialProvider for RestCredentials {
         let mut state = self.state.lock().await;
         let now = SystemTime::now();
         if !state.revoked
-            && let Ok(credential) = state.set.credential(&location, now, true)
+            && let Ok(credential) = state.set.load_credential(&location, now, true)
         {
             return Ok(credential);
         }
@@ -446,7 +445,7 @@ impl FileIOCredentialProvider for RestCredentials {
                 Err(invalid("Vended storage access was revoked")
                     .with_context("credential_error", "revoked"))
             } else {
-                state.set.credential(&location, now, false)
+                state.set.load_credential(&location, now, false)
             };
             return result.map_err(|error| {
                 if let Some(status) = state.last_refresh_status {
@@ -472,12 +471,16 @@ impl FileIOCredentialProvider for RestCredentials {
                 // authorization. Never resurrect an old prefix during backoff.
                 state.set = set;
                 state.revoked = false;
-                state.set.credential(&location, SystemTime::now(), false)
+                state
+                    .set
+                    .load_credential(&location, SystemTime::now(), false)
             }
             Err(error) => {
                 if !state.revoked
                     && let Ok(credential) =
-                        state.set.credential(&location, SystemTime::now(), false)
+                        state
+                            .set
+                            .load_credential(&location, SystemTime::now(), false)
                 {
                     return Ok(credential);
                 }
@@ -488,10 +491,33 @@ impl FileIOCredentialProvider for RestCredentials {
 }
 
 #[cfg(test)]
+pub(crate) trait TestCredentialExt {
+    fn test_sas_token(&self) -> &str;
+}
+
+#[cfg(test)]
+impl TestCredentialExt for IoStorageCredential {
+    fn test_sas_token(&self) -> &str {
+        let StorageCredentialKind::Azdls(credential) = self.kind() else {
+            panic!("expected ADLS credential");
+        };
+        credential.sas_token()
+    }
+}
+
+#[cfg(test)]
+impl TestCredentialExt for ParsedCredential {
+    fn test_sas_token(&self) -> &str {
+        let StorageCredentialKind::Azdls(credential) = &self.kind else {
+            panic!("expected ADLS credential");
+        };
+        credential.sas_token()
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use iceberg::io::{
-        ADLS_ACCOUNT_KEY, ADLS_ENDPOINT, CredentialProvider, FileIO, FileIOBuilder, StorageFactory,
-    };
+    use iceberg::io::{ADLS_ACCOUNT_KEY, ADLS_ENDPOINT, FileIO, FileIOBuilder, StorageFactory};
     use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
     use mockito::{Matcher, Server};
     use serde_json::json;
@@ -524,13 +550,13 @@ mod tests {
             ]),
         );
         let credential = set
-            .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
             .unwrap();
         assert_eq!(credential.prefix(), Some(child.as_str()));
         assert!(credential.covers(LOCATION));
         let outside = "abfss://other@acct.dfs.core.windows.net/outside";
         let credential = set
-            .credential(&Url::parse(outside).unwrap(), SystemTime::now(), true)
+            .load_credential(&Url::parse(outside).unwrap(), SystemTime::now(), true)
             .unwrap();
         assert_eq!(
             credential.prefix(),
@@ -544,9 +570,9 @@ mod tests {
         server: &mockito::ServerGuard,
         set: CredentialSet,
         endpoint: Option<bool>,
-    ) -> Arc<RestCredentials> {
+    ) -> Arc<RestVendedCredentialProvider> {
         let cfg = RestCatalogConfig::builder().uri(server.url()).build();
-        Arc::new(RestCredentials::new(
+        Arc::new(RestVendedCredentialProvider::new(
             Arc::new(HttpClient::new(&cfg).unwrap()),
             format!("{}/table", server.url()),
             set,
@@ -564,7 +590,7 @@ mod tests {
     fn adls_file_io(
         factory: Arc<dyn StorageFactory>,
         server: &mockito::ServerGuard,
-        provider: Arc<RestCredentials>,
+        provider: Arc<RestVendedCredentialProvider>,
     ) -> FileIO {
         FileIOBuilder::new(factory)
             // Keep endpoint-suffix validation while routing directly to loopback.
@@ -575,7 +601,7 @@ mod tests {
             .with_prop("io.max-retries", "0")
             .with_prop("io.timeout", "3")
             .with_prop("io.write.chunk-size", "4")
-            .with_credentials(CredentialProvider(provider))
+            .with_credential_provider(provider)
             .build()
     }
 
@@ -791,9 +817,9 @@ mod tests {
         ];
         let set = CredentialSet::new(config("sig=fallback"), Some(entries));
         let selected = set
-            .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
             .unwrap();
-        assert_eq!(selected.properties[ADLS_SAS_TOKEN], "sig=data");
+        assert_eq!(selected.test_sas_token(), "sig=data");
         assert!(!matches_prefix(
             &Url::parse(ROOT).unwrap(),
             &Url::parse(&LOCATION.replace("/table/", "/table2/")).unwrap()
@@ -820,7 +846,7 @@ mod tests {
     fn expiry_and_debug_do_not_expose_tokens() {
         let set = CredentialSet::new(config("sig=secret&se=2000-01-01T00%3A00%3A00Z"), None);
         assert!(
-            set.credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+            set.load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
                 .is_err()
         );
         let set = CredentialSet::new(config("sig=secret&se=not-a-date"), None);
@@ -829,7 +855,7 @@ mod tests {
         assert!(!format!("{error:?}").contains("not-a-date"));
         let set = CredentialSet::new(config("sig=secret"), None);
         let credential = set
-            .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
             .unwrap();
         assert!(!format!("{credential:?}").contains("secret"));
     }
@@ -872,7 +898,7 @@ mod tests {
         );
         let set = CredentialSet::new(properties, None);
         let selected = set.select(&Url::parse(LOCATION).unwrap()).ok().unwrap();
-        assert!(selected.properties[ADLS_SAS_TOKEN].starts_with("sig=account&"));
+        assert!(selected.test_sas_token().starts_with("sig=account&"));
         assert_eq!(
             selected
                 .expiry
@@ -902,11 +928,11 @@ mod tests {
             None,
         );
         assert!(
-            set.credential(&Url::parse(LOCATION).unwrap(), now, false)
+            set.load_credential(&Url::parse(LOCATION).unwrap(), now, false)
                 .is_err()
         );
         assert!(
-            set.credential(
+            set.load_credential(
                 &Url::parse(&LOCATION.replace("acct.", "other.")).unwrap(),
                 now,
                 false
@@ -933,7 +959,7 @@ mod tests {
             None,
         );
         assert!(
-            set.credential(&Url::parse(LOCATION).unwrap(), now, false)
+            set.load_credential(&Url::parse(LOCATION).unwrap(), now, false)
                 .is_err()
         );
     }
@@ -959,14 +985,14 @@ mod tests {
         );
         let metadata = Url::parse(&format!("{ROOT}metadata/file")).unwrap();
         assert_eq!(
-            set.credential(&metadata, SystemTime::now(), true)
+            set.load_credential(&metadata, SystemTime::now(), true)
                 .unwrap()
-                .properties[ADLS_SAS_TOKEN],
+                .test_sas_token(),
             "sig=root"
         );
         // A selected invalid child must not fall back to a valid parent grant.
         assert!(
-            set.credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+            set.load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
                 .is_err()
         );
 
@@ -1010,7 +1036,7 @@ mod tests {
             .await;
         let provider = provider(&server, expiring_set(), None);
         for _ in 0..3 {
-            assert!(provider.credential(LOCATION).await.is_err());
+            assert!(provider.load_credential(LOCATION).await.is_err());
         }
         failure.assert_async().await;
         failure.remove_async().await;
@@ -1026,7 +1052,11 @@ mod tests {
             .await;
         provider.state.lock().await.retry_after = UNIX_EPOCH;
         assert_eq!(
-            provider.credential(LOCATION).await.unwrap().properties[ADLS_SAS_TOKEN],
+            provider
+                .load_credential(LOCATION)
+                .await
+                .unwrap()
+                .test_sas_token(),
             "sig=confirmed"
         );
         missing.assert_async().await;
@@ -1061,7 +1091,7 @@ mod tests {
         let provider = provider(&server, expiring_set(), None);
         let task = {
             let provider = provider.clone();
-            tokio::spawn(async move { provider.credential(LOCATION).await })
+            tokio::spawn(async move { provider.load_credential(LOCATION).await })
         };
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
@@ -1079,11 +1109,11 @@ mod tests {
         assert!(
             state
                 .set
-                .credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+                .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
                 .is_ok()
         );
         drop(state);
-        assert!(provider.credential(LOCATION).await.is_err());
+        assert!(provider.load_credential(LOCATION).await.is_err());
         missing.assert_async().await;
         load.assert_async().await;
     }
@@ -1122,16 +1152,16 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..32 {
             let provider = provider.clone();
-            tasks.spawn(async move { provider.credential(LOCATION).await.unwrap() });
+            tasks.spawn(async move { provider.load_credential(LOCATION).await.unwrap() });
         }
         while let Some(result) = tasks.join_next().await {
-            assert_eq!(result.unwrap().properties[ADLS_SAS_TOKEN], "sig=new-data");
+            assert_eq!(result.unwrap().test_sas_token(), "sig=new-data");
         }
         let metadata = provider
-            .credential(&format!("{ROOT}metadata/file"))
+            .load_credential(&format!("{ROOT}metadata/file"))
             .await
             .unwrap();
-        assert_eq!(metadata.properties[ADLS_SAS_TOKEN], "sig=new-root");
+        assert_eq!(metadata.test_sas_token(), "sig=new-root");
         refresh.assert_async().await;
     }
 
@@ -1152,7 +1182,7 @@ mod tests {
             Some(true),
         );
         for _ in 0..3 {
-            let error = provider.credential(LOCATION).await.unwrap_err();
+            let error = provider.load_credential(LOCATION).await.unwrap_err();
             assert!(!format!("{error:?}").contains("secret-response"));
         }
         missing.assert_async().await;
@@ -1169,10 +1199,10 @@ mod tests {
             .create_async()
             .await;
         let provider = provider(&server, expiring_set(), Some(true));
-        assert!(provider.credential(LOCATION).await.is_ok());
+        assert!(provider.load_credential(LOCATION).await.is_ok());
         provider.state.lock().await.set =
             CredentialSet::new(config("sig=expired&se=2000-01-01T00:00:00Z"), None);
-        assert!(provider.credential(LOCATION).await.is_err());
+        assert!(provider.load_credential(LOCATION).await.is_err());
         failure.assert_async().await;
     }
 
@@ -1187,7 +1217,7 @@ mod tests {
             .await;
         let provider = provider(&server, expiring_set(), Some(true));
         for _ in 0..3 {
-            assert!(provider.credential(LOCATION).await.is_err());
+            assert!(provider.load_credential(LOCATION).await.is_err());
         }
         failure.assert_async().await;
     }
@@ -1245,20 +1275,20 @@ mod tests {
             // missing config or trigger another /credentials request.
             assert_eq!(
                 provider
-                    .credential(&format!("{root}data/file"))
+                    .load_credential(&format!("{root}data/file"))
                     .await
                     .unwrap()
-                    .properties[ADLS_SAS_TOKEN],
+                    .test_sas_token(),
                 "sig=scoped"
             );
             assert_eq!(file.read().await.unwrap().as_ref(), b"renewed");
             // Both fresh config and prefixed credentials remain available.
             assert_eq!(
                 provider
-                    .credential(&format!("{root}data/file"))
+                    .load_credential(&format!("{root}data/file"))
                     .await
                     .unwrap()
-                    .properties[ADLS_SAS_TOKEN],
+                    .test_sas_token(),
                 "sig=scoped"
             );
             old.assert_async().await;
@@ -1302,7 +1332,7 @@ mod tests {
         let provider = provider(&server, expiring_set(), Some(true));
         let task = {
             let provider = provider.clone();
-            tokio::spawn(async move { provider.credential(LOCATION).await })
+            tokio::spawn(async move { provider.load_credential(LOCATION).await })
         };
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
@@ -1310,13 +1340,13 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         let _ = release.send(());
-        assert!(provider.credential(LOCATION).await.is_err());
+        assert!(provider.load_credential(LOCATION).await.is_err());
         assert_eq!(
             provider
-                .credential(&format!("{ROOT}new/file"))
+                .load_credential(&format!("{ROOT}new/file"))
                 .await
                 .unwrap()
-                .properties[ADLS_SAS_TOKEN],
+                .test_sas_token(),
             "sig=new"
         );
         refresh.assert_async().await;
@@ -1339,7 +1369,7 @@ mod tests {
             .await;
         let load = server.mock("GET", "/table").expect(0).create_async().await;
         let provider = provider(&server, expiring_set(), Some(true));
-        assert!(provider.credential(LOCATION).await.is_err());
+        assert!(provider.load_credential(LOCATION).await.is_err());
         refresh.assert_async().await;
         load.assert_async().await;
     }
@@ -1361,7 +1391,7 @@ mod tests {
             .await;
         let provider = provider(&server, expiring_set(), Some(true));
         for _ in 0..3 {
-            assert!(provider.credential(LOCATION).await.is_err());
+            assert!(provider.load_credential(LOCATION).await.is_err());
         }
         refresh.assert_async().await;
         load.assert_async().await;
@@ -1392,14 +1422,14 @@ mod tests {
                 ("credential".to_string(), "client:dummy-secret".to_string()),
             ]))
             .build();
-        let provider = RestCredentials::new(
+        let provider = RestVendedCredentialProvider::new(
             Arc::new(HttpClient::new(&cfg).unwrap()),
             format!("{}/table", server.url()),
             expiring_set(),
             Some(true),
         );
         for _ in 0..3 {
-            assert!(provider.credential(LOCATION).await.is_err());
+            assert!(provider.load_credential(LOCATION).await.is_err());
         }
         refresh.assert_async().await;
         oauth.assert_async().await;

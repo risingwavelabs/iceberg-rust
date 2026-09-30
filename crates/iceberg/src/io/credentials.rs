@@ -17,7 +17,6 @@
 
 //! Runtime credentials shared by catalogs and storage implementations.
 
-use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -27,22 +26,67 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Result;
 
-/// One complete authentication configuration, valid until `expires_at`.
+/// One complete authentication configuration, with optional scope and expiration.
 ///
 /// Providers must not combine fields belonging to different credentials.
 #[derive(Clone)]
-pub struct FileIOCredential {
+pub struct StorageCredential {
     /// Matched storage-location prefix. `None` provides no reusable scope.
     ///
     /// This is the selected match, not just an enclosing permission boundary.
-    pub prefix: Option<String>,
-    /// Backend authentication properties. Never log these values.
-    pub properties: HashMap<String, String>,
+    prefix: Option<String>,
+    /// Backend authentication material. Never log these values.
+    kind: StorageCredentialKind,
     /// Deadline for the signer's cached copy, including any refresh lease.
-    pub expires_at: SystemTime,
+    expires_at: Option<SystemTime>,
 }
 
-impl FileIOCredential {
+impl Debug for StorageCredential {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageCredential")
+            .field("kind", &self.kind)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StorageCredential {
+    /// Create a credential with no declared scope or expiration.
+    pub fn new(kind: StorageCredentialKind) -> Self {
+        Self {
+            prefix: None,
+            kind,
+            expires_at: None,
+        }
+    }
+
+    /// Set the selected storage-location prefix.
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Set the expiration or the deadline of the signer's cached lease.
+    pub fn with_expiration(mut self, expires_at: SystemTime) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Return the backend-specific credential material.
+    pub fn kind(&self) -> &StorageCredentialKind {
+        &self.kind
+    }
+
+    /// Consume the credential and return its backend-specific material.
+    pub fn into_kind(self) -> StorageCredentialKind {
+        self.kind
+    }
+
+    /// Return the expiration, if known. `None` means non-expiring.
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        self.expires_at
+    }
+
     /// Return the matched storage-location prefix.
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
@@ -56,45 +100,149 @@ impl FileIOCredential {
         let Some(prefix) = self.prefix() else {
             return true;
         };
-        let (Ok(prefix), Ok(location)) = (url::Url::parse(prefix), url::Url::parse(location))
-        else {
-            return false;
-        };
-        prefix.scheme() == location.scheme()
-            && prefix.host_str() == location.host_str()
-            && prefix.port() == location.port()
-            && prefix.username() == location.username()
-            && prefix.password().is_none()
-            && location.password().is_none()
-            && prefix.query().is_none()
-            && location.query().is_none()
-            && prefix.fragment().is_none()
-            && location.fragment().is_none()
-            && (prefix.path() == location.path()
-                || location
-                    .path()
-                    .strip_prefix(prefix.path())
-                    .is_some_and(|suffix| prefix.path().ends_with('/') || suffix.starts_with('/')))
+        storage_prefix_covers(prefix, location)
     }
 }
 
-impl Debug for FileIOCredential {
+/// Check a declared URI scope using exact scheme, authority and path boundaries.
+///
+/// Unlike scheme aliases in storage routing, credential scopes remain exact:
+/// changing transport schemes must not broaden a catalog's selected scope.
+pub fn storage_prefix_covers(prefix: &str, location: &str) -> bool {
+    let (Ok(prefix), Ok(location)) = (url::Url::parse(prefix), url::Url::parse(location)) else {
+        return false;
+    };
+    prefix.scheme() == location.scheme()
+        && prefix.host_str() == location.host_str()
+        && prefix.port() == location.port()
+        && prefix.username() == location.username()
+        && prefix.password().is_none()
+        && location.password().is_none()
+        && prefix.query().is_none()
+        && location.query().is_none()
+        && prefix.fragment().is_none()
+        && location.fragment().is_none()
+        && (prefix.path() == location.path()
+            || location
+                .path()
+                .strip_prefix(prefix.path())
+                .is_some_and(|suffix| prefix.path().ends_with('/') || suffix.starts_with('/')))
+}
+
+/// Backend-specific authentication material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StorageCredentialKind {
+    /// Amazon S3 credentials.
+    S3(S3Credential),
+    /// Azure Data Lake Storage credentials.
+    Azdls(AzdlsCredential),
+}
+
+/// Amazon S3 access keys and an optional session token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3Credential {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+impl S3Credential {
+    /// Create Amazon S3 credentials.
+    pub fn new(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        session_token: Option<String>,
+    ) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            session_token,
+        }
+    }
+
+    /// Return the AWS access key ID.
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    /// Return the AWS secret access key.
+    pub fn secret_access_key(&self) -> &str {
+        &self.secret_access_key
+    }
+
+    /// Return the AWS session token, if present.
+    pub fn session_token(&self) -> Option<&str> {
+        self.session_token.as_deref()
+    }
+
+    /// Consume the credentials and return their component values.
+    pub fn into_parts(self) -> (String, String, Option<String>) {
+        (
+            self.access_key_id,
+            self.secret_access_key,
+            self.session_token,
+        )
+    }
+}
+
+impl Debug for S3Credential {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileIOCredential")
-            .field("expires_at", &self.expires_at)
-            .finish_non_exhaustive()
+        f.debug_struct("S3Credential").finish_non_exhaustive()
+    }
+}
+
+/// Azure Data Lake Storage shared access signature.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzdlsCredential {
+    sas_token: String,
+}
+
+impl AzdlsCredential {
+    /// Create Azure Data Lake Storage credentials.
+    pub fn new(sas_token: impl Into<String>) -> Self {
+        Self {
+            sas_token: sas_token.into(),
+        }
+    }
+
+    /// Return the Azure shared access signature.
+    pub fn sas_token(&self) -> &str {
+        &self.sas_token
+    }
+
+    /// Consume the credential and return its shared access signature.
+    pub fn into_sas_token(self) -> String {
+        self.sas_token
+    }
+}
+
+impl Debug for AzdlsCredential {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzdlsCredential").finish_non_exhaustive()
     }
 }
 
 /// Supplies credentials for the actual file URI, including for open handles.
+///
+/// Implementations must cache internally: `load_credential` can run on every
+/// signing attempt and must not perform network I/O for each cache hit.
 #[async_trait]
-pub trait FileIOCredentialProvider: Debug + Send + Sync + 'static {
+pub trait StorageCredentialProvider: Debug + Send + Sync {
+    /// Whether this provider is configured for a path.
+    ///
+    /// Unsupported paths retain normal authentication. Supported paths must
+    /// fail closed if credential loading fails.
+    fn supports_path(&self, _path: &str) -> bool {
+        true
+    }
+
     /// Return a usable credential, refreshing it if necessary.
     ///
     /// Providers may declare the selected prefix to enable scope-local bulk
     /// operations. Consumers must revalidate all batch locations on refresh,
     /// since the selected prefixes can change.
-    async fn credential(&self, location: &str) -> Result<FileIOCredential>;
+    async fn load_credential(&self, path: &str) -> Result<StorageCredential>;
 }
 
 /// An identity-bearing, redacted runtime provider.
@@ -102,7 +250,7 @@ pub trait FileIOCredentialProvider: Debug + Send + Sync + 'static {
 /// Runtime providers cannot be serialized: silently dropping one would enable
 /// an unintended fallback to static or ambient credentials after deserialization.
 #[derive(Clone)]
-pub struct CredentialProvider(pub Arc<dyn FileIOCredentialProvider>);
+pub struct CredentialProvider(pub Arc<dyn StorageCredentialProvider>);
 
 impl Debug for CredentialProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -139,12 +287,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn credential_scope_checks_authority_and_path_boundaries() {
-        let credential = FileIOCredential {
-            prefix: Some("abfss://fs@account.dfs.core.windows.net/table/".into()),
-            properties: HashMap::new(),
-            expires_at: SystemTime::now(),
+    fn upstream_style_constructors_and_accessors() {
+        let material = S3Credential::new("key", "secret", Some("session".into()));
+        assert_eq!(material.access_key_id(), "key");
+        assert_eq!(material.secret_access_key(), "secret");
+        assert_eq!(material.session_token(), Some("session"));
+        let credential = StorageCredential::new(StorageCredentialKind::S3(material.clone()));
+        assert_eq!(credential.prefix(), None);
+        assert_eq!(credential.expires_at(), None);
+        assert!(credential.covers("s3://bucket/file"));
+        assert_eq!(credential.kind(), &StorageCredentialKind::S3(material));
+        let expiry = SystemTime::now();
+        let credential = credential
+            .with_prefix("s3://bucket/")
+            .with_expiration(expiry);
+        assert_eq!(credential.prefix(), Some("s3://bucket/"));
+        assert_eq!(credential.expires_at(), Some(expiry));
+        let StorageCredentialKind::S3(material) = credential.into_kind() else {
+            panic!("expected S3 credential");
         };
+        assert_eq!(
+            material.into_parts(),
+            ("key".into(), "secret".into(), Some("session".into()))
+        );
+        let material = AzdlsCredential::new("sig=token");
+        assert_eq!(material.sas_token(), "sig=token");
+        assert_eq!(material.into_sas_token(), "sig=token");
+    }
+
+    #[test]
+    fn typed_credentials_debug_redacts_material_and_prefix() {
+        for kind in [
+            StorageCredentialKind::S3(S3Credential::new(
+                "secret-key",
+                "secret-value",
+                Some("secret-session".into()),
+            )),
+            StorageCredentialKind::Azdls(AzdlsCredential::new("sig=secret-token")),
+        ] {
+            let credential =
+                StorageCredential::new(kind).with_prefix("s3://secret-bucket/secret-prefix/");
+            for diagnostic in [format!("{credential:?}"), format!("{credential:#?}")] {
+                assert!(!diagnostic.contains("secret-"));
+                assert!(!diagnostic.contains("sig="));
+            }
+        }
+    }
+
+    #[test]
+    fn default_factory_accepts_no_provider_but_rejects_a_supplied_provider() {
+        use crate::io::{MemoryStorageFactory, StorageConfig, StorageFactory};
+
+        #[derive(Debug)]
+        struct Provider;
+        #[async_trait]
+        impl StorageCredentialProvider for Provider {
+            async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
+                unreachable!("unsupported factories must not fetch credentials");
+            }
+        }
+        let config = StorageConfig::new();
+        assert!(
+            MemoryStorageFactory
+                .build_with_credentials(&config, None)
+                .is_ok()
+        );
+        let error = MemoryStorageFactory
+            .build_with_credentials(&config, Some(Arc::new(Provider)))
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
+    }
+
+    #[test]
+    fn credential_scope_checks_authority_and_path_boundaries() {
+        let credential = StorageCredential::new(StorageCredentialKind::Azdls(
+            AzdlsCredential::new("sig=test"),
+        ))
+        .with_prefix("abfss://fs@account.dfs.core.windows.net/table/");
         assert!(credential.covers("abfss://fs@account.dfs.core.windows.net/table/file"));
         for location in [
             "abfss://other@account.dfs.core.windows.net/table/file",
@@ -156,10 +375,7 @@ mod tests {
         ] {
             assert!(!credential.covers(location));
         }
-        let credential = FileIOCredential {
-            prefix: Some("s3://bucket/table".into()),
-            ..credential
-        };
+        let credential = credential.with_prefix("s3://bucket/table");
         assert!(credential.covers("s3://bucket/table"));
         assert!(credential.covers("s3://bucket/table/file"));
         assert!(!credential.covers("s3://bucket/table-other/file"));

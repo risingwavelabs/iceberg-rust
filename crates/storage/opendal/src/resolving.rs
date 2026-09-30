@@ -195,13 +195,13 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
     fn build_with_credentials(
         &self,
         config: &StorageConfig,
-        provider: iceberg::io::CredentialProvider,
+        credential_provider: Option<Arc<dyn iceberg::io::StorageCredentialProvider>>,
     ) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(OpenDalResolvingStorage {
             props: config.props().clone(),
             storages: RwLock::new(HashMap::new()),
             operator_cache: self.operator_cache.clone(),
-            credentials: Some(provider),
+            credentials: credential_provider.map(iceberg::io::CredentialProvider),
         }))
     }
 }

@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use base64::Engine as _;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
-use iceberg::io::{CredentialProvider, FileIO, FileIOBuilder, StorageFactory};
+use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
@@ -42,7 +42,7 @@ use typed_builder::TypedBuilder;
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
-use crate::credentials::{CredentialSet, RestCredentials};
+use crate::credential::{CredentialSet, RestVendedCredentialProvider};
 use crate::endpoint::{Endpoint, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
@@ -403,7 +403,7 @@ pub struct RestCatalog {
     runtime: Runtime,
     /// Optional KMS client for encrypted tables.
     kms_client: Option<Arc<dyn KeyManagementClient>>,
-    credentials: Mutex<HashMap<TableIdent, Weak<RestCredentials>>>,
+    credentials: Mutex<HashMap<TableIdent, Weak<RestVendedCredentialProvider>>>,
 }
 
 impl RestCatalog {
@@ -624,7 +624,7 @@ impl RestCatalog {
                 let endpoint = context
                     .advertised_endpoints
                     .then(|| context.endpoints.contains(&endpoint));
-                let provider = Arc::new(RestCredentials::new(
+                let provider = Arc::new(RestVendedCredentialProvider::new(
                     context.client.clone(),
                     context.config.table_endpoint(table),
                     CredentialSet::new(config.clone(), entries.clone()),
@@ -663,7 +663,7 @@ impl RestCatalog {
         });
         Ok(FileIOBuilder::new(factory)
             .with_props(properties)
-            .with_credentials(CredentialProvider(provider))
+            .with_credential_provider(provider)
             .build())
     }
 
@@ -2916,7 +2916,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vended_file_io_preserves_provider_across_loads_and_empty_commits() {
-        use iceberg::io::{ADLS_SAS_TOKEN, FileIOCredentialProvider};
+        use iceberg::io::{ADLS_SAS_TOKEN, StorageCredentialProvider};
+
+        use crate::credential::TestCredentialExt;
 
         let mut server = Server::new_async().await;
         let config_mock = create_config_mock(&mut server).await;
@@ -2960,7 +2962,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            provider.credential(&location).await.unwrap().properties[ADLS_SAS_TOKEN],
+            provider
+                .load_credential(&location)
+                .await
+                .unwrap()
+                .test_sas_token(),
             "sig=second"
         );
         let _committed = catalog
@@ -2968,7 +2974,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            provider.credential(&location).await.unwrap().properties[ADLS_SAS_TOKEN],
+            provider
+                .load_credential(&location)
+                .await
+                .unwrap()
+                .test_sas_token(),
             "sig=second"
         );
         let created_id = TableIdent::from_strs(["ns", "created"]).unwrap();
@@ -2990,10 +3000,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             created_provider
-                .credential(&location)
+                .load_credential(&location)
                 .await
                 .unwrap()
-                .properties[ADLS_SAS_TOKEN],
+                .test_sas_token(),
             "sig=created"
         );
         config_mock.assert_async().await;

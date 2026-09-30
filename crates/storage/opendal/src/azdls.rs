@@ -29,7 +29,7 @@ use opendal::services::AzdlsConfig;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::credentials::{AzdlsPathCredential, PathCredential};
+use crate::credentials::{VendedAzdlsCredentialProvider, VendedCredentialSource};
 use crate::utils::from_opendal_error;
 
 /// Local version of `ensure_data_valid` macro since the iceberg crate's macro
@@ -215,12 +215,13 @@ fn azdls_config_build(
     }
     builder = builder.filesystem(&path.filesystem);
     if let Some(provider) = credentials {
-        builder = builder.credential_provider_chain(
-            reqsign_core::ProvideCredentialChain::new().push(AzdlsPathCredential(PathCredential {
-                provider: provider.clone(),
-                location: location.to_string(),
-            })),
-        );
+        builder =
+            builder.credential_provider_chain(reqsign_core::ProvideCredentialChain::new().push(
+                VendedAzdlsCredentialProvider(VendedCredentialSource {
+                    provider: provider.clone(),
+                    location: location.to_string(),
+                }),
+            ));
     }
 
     opendal::Operator::new(builder).map_err(from_opendal_error)
