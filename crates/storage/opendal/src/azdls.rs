@@ -143,8 +143,7 @@ pub(crate) fn azdls_create_operator<'a>(
     // including their filesystem and account name.
     // OpenDAL's operator methods expect only the relative path, so we split it
     // off and save it for later use.
-    let relative_path_len = path.path.len();
-    let (_, relative_path) = absolute_path.split_at(absolute_path.len() - relative_path_len);
+    let relative_path = path.relative_path(absolute_path);
 
     Ok((op, relative_path))
 }
@@ -290,6 +289,14 @@ impl AzureStoragePath {
             self.account_name,
             self.endpoint_suffix
         )
+    }
+
+    /// The part of `absolute_path` below the filesystem, without a leading `/`,
+    /// like the relative paths of the other backends. OpenDAL does not strip it
+    /// everywhere: `Deleter::delete` sends `/a` as `<filesystem>//a`.
+    pub(crate) fn relative_path<'a>(&self, absolute_path: &'a str) -> &'a str {
+        let path = &absolute_path[absolute_path.len() - self.path.len()..];
+        path.strip_prefix('/').unwrap_or(path)
     }
 }
 
@@ -553,7 +560,19 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
+            ),
+            (
+                "filesystem root",
+                (
+                    "abfss://myfs@myaccount.dfs.core.windows.net/",
+                    AzdlsConfig {
+                        account_name: Some("myaccount".to_string()),
+                        endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                Some(("myfs", "")),
             ),
             (
                 "different account",
@@ -603,7 +622,7 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
             ),
             (
                 "scheme differs from a previously-configured one is accepted",
@@ -617,7 +636,7 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
             ),
         ];
 
