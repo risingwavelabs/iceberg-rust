@@ -390,6 +390,11 @@ struct RestContext {
     advertised_endpoints: bool,
 }
 
+enum TableResponseKind {
+    Load,
+    Commit,
+}
+
 /// Rest catalog implementation.
 #[derive(Debug)]
 pub struct RestCatalog {
@@ -569,6 +574,7 @@ impl RestCatalog {
     async fn table_file_io(
         &self,
         table: &TableIdent,
+        response_kind: TableResponseKind,
         metadata_location: Option<&str>,
         table_location: &str,
         config: HashMap<String, String>,
@@ -595,7 +601,6 @@ impl RestCatalog {
                     || key == "s3.access-key-id"
                     || key == "s3.secret-access-key"
             });
-        let received_credentials = entries.is_some() || has_vended;
         let mut properties = self.file_io_properties(Some(location), &config).await?;
         let factory = self.storage_factory.clone().ok_or_else(|| {
             Error::new(
@@ -639,7 +644,9 @@ impl RestCatalog {
         };
         // Select or create under one lock so concurrent first loads cannot
         // skip updating a provider installed by another load.
-        if reused && received_credentials {
+        // Load responses replace authorization even when credentials are absent.
+        // Commit responses do not carry credentials and preserve the existing set.
+        if reused && matches!(response_kind, TableResponseKind::Load) {
             provider.update(CredentialSet::new(config, entries)).await;
         }
         // A successful catalog mutation must not become a reported failure
@@ -970,6 +977,7 @@ impl Catalog for RestCatalog {
         let file_io = self
             .table_file_io(
                 &table_ident,
+                TableResponseKind::Load,
                 Some(metadata_location),
                 response.metadata.location(),
                 response.config,
@@ -1030,6 +1038,7 @@ impl Catalog for RestCatalog {
         let file_io = self
             .table_file_io(
                 table_ident,
+                TableResponseKind::Load,
                 response.metadata_location.as_deref(),
                 response.metadata.location(),
                 response.config,
@@ -1172,6 +1181,7 @@ impl Catalog for RestCatalog {
         let file_io = self
             .table_file_io(
                 table_ident,
+                TableResponseKind::Load,
                 Some(metadata_location),
                 response.metadata.location(),
                 response.config,
@@ -1254,6 +1264,7 @@ impl Catalog for RestCatalog {
         let file_io = self
             .table_file_io(
                 commit.identifier(),
+                TableResponseKind::Commit,
                 Some(&response.metadata_location),
                 response.metadata.location(),
                 HashMap::new(),
@@ -2765,7 +2776,14 @@ mod tests {
             ("table-only".into(), "table".into()),
         ]);
         let static_io = catalog
-            .table_file_io(&table, Some(&location), root, table_config.clone(), None)
+            .table_file_io(
+                &table,
+                TableResponseKind::Load,
+                Some(&location),
+                root,
+                table_config.clone(),
+                None,
+            )
             .await
             .unwrap();
         let properties = static_io.config().props();
@@ -2778,7 +2796,14 @@ mod tests {
 
         table_config.insert(ADLS_SAS_TOKEN.into(), "sig=vended-secret".into());
         let delegated = catalog
-            .table_file_io(&table, Some(&location), root, table_config, None)
+            .table_file_io(
+                &table,
+                TableResponseKind::Load,
+                Some(&location),
+                root,
+                table_config,
+                None,
+            )
             .await
             .unwrap();
         let properties = delegated.config().props();
@@ -2915,6 +2940,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_table_without_credentials_clears_shared_provider() {
+        use iceberg::io::{ADLS_SAS_TOKEN, StorageCredentialProvider};
+
+        for (root, credentials) in [
+            (
+                "abfss://fs@acct.dfs.core.windows.net/table",
+                HashMap::from([(ADLS_SAS_TOKEN.to_string(), "sig=initial".to_string())]),
+            ),
+            (
+                "s3://bucket/table",
+                HashMap::from([
+                    ("s3.access-key-id".to_string(), "initial-key".to_string()),
+                    (
+                        "s3.secret-access-key".to_string(),
+                        "initial-secret".to_string(),
+                    ),
+                ]),
+            ),
+        ] {
+            for scoped in [false, true] {
+                let mut server = Server::new_async().await;
+                let config_mock = create_config_mock(&mut server).await;
+                let catalog = RestCatalog::new(
+                    RestCatalogConfig::builder()
+                        .uri(server.url())
+                        .props(HashMap::from([
+                            (
+                                "header.X-Iceberg-Access-Delegation".into(),
+                                "vended-credentials".into(),
+                            ),
+                            ("s3.region".into(), "us-east-1".into()),
+                            ("io.max-retries".into(), "0".into()),
+                        ]))
+                        .build(),
+                    Some(Arc::new(
+                        iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+                    )),
+                    Runtime::current(),
+                    None,
+                );
+                let id = TableIdent::from_strs(["ns", "table"]).unwrap();
+                let location = format!("{root}/metadata/file");
+                let mut response: serde_json::Value =
+                    serde_json::from_str(include_str!("../testdata/load_table_response.json"))
+                        .unwrap();
+                response["metadata"]["location"] = root.into();
+                response["metadata-location"] = location.clone().into();
+                response["config"] = serde_json::json!({});
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("storage-credentials");
+                let empty_response = response.to_string();
+                if scoped {
+                    response["storage-credentials"] = serde_json::json!([{
+                        "prefix": format!("{root}/"),
+                        "config": credentials,
+                    }]);
+                } else {
+                    response["config"] = serde_json::json!(credentials);
+                }
+                let load = server
+                    .mock("GET", "/v1/namespaces/ns/tables/table")
+                    .with_body(response.to_string())
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let first = catalog.load_table(&id).await.unwrap();
+                let provider = catalog.credentials.lock().unwrap()[&id].upgrade().unwrap();
+                assert!(provider.load_credential(&location).await.is_ok());
+                load.assert_async().await;
+                load.remove_async().await;
+
+                let reload = server
+                    .mock("GET", "/v1/namespaces/ns/tables/table")
+                    .with_body(empty_response)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let refresh = server
+                    .mock("GET", "/v1/namespaces/ns/tables/table/credentials")
+                    .with_status(403)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let second = catalog.load_table(&id).await.unwrap();
+                let reused = catalog.credentials.lock().unwrap()[&id].upgrade().unwrap();
+                assert!(Arc::ptr_eq(&provider, &reused));
+                assert!(provider.load_credential(&location).await.is_err());
+                for table in [&first, &second] {
+                    assert!(
+                        table
+                            .file_io()
+                            .new_input(&location)
+                            .unwrap()
+                            .read()
+                            .await
+                            .is_err()
+                    );
+                }
+                reload.assert_async().await;
+                refresh.assert_async().await;
+                config_mock.assert_async().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_vended_file_io_preserves_provider_across_loads_and_empty_commits() {
         use iceberg::io::{ADLS_SAS_TOKEN, StorageCredentialProvider};
 
@@ -2938,6 +3071,7 @@ mod tests {
         let first = catalog
             .table_file_io(
                 &table,
+                TableResponseKind::Load,
                 Some(&location),
                 root,
                 credentials("sig=first"),
@@ -2954,6 +3088,7 @@ mod tests {
         let _second = catalog
             .table_file_io(
                 &table,
+                TableResponseKind::Load,
                 Some(&location),
                 root,
                 credentials("sig=second"),
@@ -2970,7 +3105,14 @@ mod tests {
             "sig=second"
         );
         let _committed = catalog
-            .table_file_io(&table, None, root, HashMap::new(), None)
+            .table_file_io(
+                &table,
+                TableResponseKind::Commit,
+                None,
+                root,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2985,6 +3127,7 @@ mod tests {
         let _created = catalog
             .table_file_io(
                 &created_id,
+                TableResponseKind::Load,
                 None,
                 root,
                 HashMap::new(),
