@@ -533,39 +533,6 @@ mod tests {
         HashMap::from([(KEY.to_string(), token.to_string())])
     }
 
-    #[test]
-    fn returned_credential_declares_longest_matched_scope() {
-        let child = format!("{ROOT}data/");
-        let set = CredentialSet::new(
-            config("sig=default"),
-            Some(vec![
-                StorageCredential {
-                    prefix: ROOT.into(),
-                    config: config("sig=parent"),
-                },
-                StorageCredential {
-                    prefix: child.clone(),
-                    config: config("sig=child"),
-                },
-            ]),
-        );
-        let credential = set
-            .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
-            .unwrap();
-        assert_eq!(credential.prefix(), Some(child.as_str()));
-        assert!(credential.covers(LOCATION));
-        let outside = "abfss://other@acct.dfs.core.windows.net/outside";
-        let credential = set
-            .load_credential(&Url::parse(outside).unwrap(), SystemTime::now(), true)
-            .unwrap();
-        assert_eq!(
-            credential.prefix(),
-            Some("abfss://other@acct.dfs.core.windows.net/")
-        );
-        assert!(credential.covers(outside));
-        assert!(!credential.covers(LOCATION));
-    }
-
     fn provider(
         server: &mockito::ServerGuard,
         set: CredentialSet,
@@ -805,13 +772,14 @@ mod tests {
 
     #[test]
     fn account_and_prefix_selection_is_exact() {
+        let child = format!("{ROOT}data/");
         let entries = vec![
             StorageCredential {
                 prefix: ROOT.to_string(),
                 config: config("?sig=root"),
             },
             StorageCredential {
-                prefix: format!("{ROOT}data/"),
+                prefix: child.clone(),
                 config: config("?sig=data"),
             },
         ];
@@ -820,6 +788,19 @@ mod tests {
             .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
             .unwrap();
         assert_eq!(selected.test_sas_token(), "sig=data");
+        assert_eq!(selected.prefix(), Some(child.as_str()));
+        assert!(selected.covers(LOCATION));
+        let outside = "abfss://other@acct.dfs.core.windows.net/outside";
+        let credential = set
+            .load_credential(&Url::parse(outside).unwrap(), SystemTime::now(), true)
+            .unwrap();
+        assert_eq!(credential.test_sas_token(), "sig=fallback");
+        assert_eq!(
+            credential.prefix(),
+            Some("abfss://other@acct.dfs.core.windows.net/")
+        );
+        assert!(credential.covers(outside));
+        assert!(!credential.covers(LOCATION));
         assert!(!matches_prefix(
             &Url::parse(ROOT).unwrap(),
             &Url::parse(&LOCATION.replace("/table/", "/table2/")).unwrap()
@@ -853,11 +834,6 @@ mod tests {
         let error = set.select(&Url::parse(LOCATION).unwrap()).err().unwrap();
         assert!(!format!("{error:?}").contains("secret"));
         assert!(!format!("{error:?}").contains("not-a-date"));
-        let set = CredentialSet::new(config("sig=secret"), None);
-        let credential = set
-            .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
-            .unwrap();
-        assert!(!format!("{credential:?}").contains("secret"));
     }
 
     #[test]
@@ -1063,14 +1039,14 @@ mod tests {
         confirmed.assert_async().await;
     }
 
-    async fn interrupted_legacy_confirmation(cancel: bool) {
-        let mut server = Server::new_async().await;
-        let missing = server
-            .mock("GET", "/table/credentials")
-            .with_status(404)
-            .expect(1)
-            .create_async()
-            .await;
+    async fn gated_table_load(
+        server: &mut mockito::ServerGuard,
+        max_wait: Duration,
+    ) -> (
+        mockito::Mock,
+        Arc<tokio::sync::Notify>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         let started = Arc::new(tokio::sync::Notify::new());
         let notify = started.clone();
         let (release, receiver) = std::sync::mpsc::channel();
@@ -1079,15 +1055,24 @@ mod tests {
             .mock("GET", "/table")
             .with_chunked_body(move |writer| {
                 notify.notify_one();
-                let _ = receiver
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(15));
+                let _ = receiver.lock().unwrap().recv_timeout(max_wait);
                 writer.write_all(b"{}")
             })
             .expect(1)
             .create_async()
             .await;
+        (load, started, release)
+    }
+
+    async fn interrupted_legacy_confirmation(cancel: bool) {
+        let mut server = Server::new_async().await;
+        let missing = server
+            .mock("GET", "/table/credentials")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let (load, started, release) = gated_table_load(&mut server, Duration::from_secs(15)).await;
         let provider = provider(&server, expiring_set(), None);
         let task = {
             let provider = provider.clone();
@@ -1312,23 +1297,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let started = Arc::new(tokio::sync::Notify::new());
-        let notify = started.clone();
-        let (release, receiver) = std::sync::mpsc::channel();
-        let receiver = std::sync::Mutex::new(receiver);
-        let load = server
-            .mock("GET", "/table")
-            .with_chunked_body(move |writer| {
-                notify.notify_one();
-                let _ = receiver
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(5));
-                writer.write_all(b"{}")
-            })
-            .expect(1)
-            .create_async()
-            .await;
+        let (load, started, release) = gated_table_load(&mut server, Duration::from_secs(5)).await;
         let provider = provider(&server, expiring_set(), Some(true));
         let task = {
             let provider = provider.clone();

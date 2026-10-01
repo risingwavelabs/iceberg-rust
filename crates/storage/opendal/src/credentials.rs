@@ -755,36 +755,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_signer_revalidates_child_scopes_after_refresh() {
-        let provider = Arc::new(BulkDeleteProvider {
-            repartition: AtomicUsize::new(0),
-        });
-        let batch = super::BatchCredential::provider(
-            CredentialProvider(provider.clone()),
-            "s3://bucket/first/".to_string(),
-            vec![
-                "s3://bucket/first/file".to_string(),
-                "s3://bucket/first/private".to_string(),
-            ],
-        );
-        batch
-            .0
-            .load_credential("s3://bucket/first/file")
-            .await
-            .unwrap();
-        provider.repartition.store(1, Ordering::SeqCst);
-        // The representative file still has the old scope, but the child does
-        // not. Re-signing the batch must fail rather than use the parent's key.
-        assert!(
-            batch
-                .0
-                .load_credential("s3://bucket/first/file")
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn delegated_s3_allow_anonymous_does_not_bypass_provider_errors() {
         for factory in s3_factories() {
             for incomplete in [false, true] {
@@ -881,12 +851,16 @@ mod tests {
                     "s3://bucket/first/private".to_string(),
                 ],
             );
+            let location = "s3://bucket/first/file";
+            batch.0.load_credential(location).await.unwrap();
             let io = anonymous_s3_builder(factory, &server.url())
-                .with_credential_provider(batch.0)
+                .with_credential_provider(batch.0.clone())
                 .build();
-            let file = io.new_input("s3://bucket/first/file").unwrap();
+            let file = io.new_input(location).unwrap();
             assert_eq!(file.read().await.unwrap().as_ref(), b"data");
             provider.repartition.store(1, Ordering::SeqCst);
+            // Revalidate the child both directly and through the cached signer.
+            assert!(batch.0.load_credential(location).await.is_err());
             // The cached operator must not hide a new child scope on the next
             // signing attempt, even when the underlying key has a long TTL.
             assert!(file.read().await.is_err());

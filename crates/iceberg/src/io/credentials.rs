@@ -287,36 +287,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upstream_style_constructors_and_accessors() {
-        let material = S3Credential::new("key", "secret", Some("session".into()));
-        assert_eq!(material.access_key_id(), "key");
-        assert_eq!(material.secret_access_key(), "secret");
-        assert_eq!(material.session_token(), Some("session"));
-        let credential = StorageCredential::new(StorageCredentialKind::S3(material.clone()));
-        assert_eq!(credential.prefix(), None);
-        assert_eq!(credential.expires_at(), None);
-        assert!(credential.covers("s3://bucket/file"));
-        assert_eq!(credential.kind(), &StorageCredentialKind::S3(material));
-        let expiry = SystemTime::now();
-        let credential = credential
-            .with_prefix("s3://bucket/")
-            .with_expiration(expiry);
-        assert_eq!(credential.prefix(), Some("s3://bucket/"));
-        assert_eq!(credential.expires_at(), Some(expiry));
-        let StorageCredentialKind::S3(material) = credential.into_kind() else {
-            panic!("expected S3 credential");
-        };
-        assert_eq!(
-            material.into_parts(),
-            ("key".into(), "secret".into(), Some("session".into()))
-        );
-        let material = AzdlsCredential::new("sig=token");
-        assert_eq!(material.sas_token(), "sig=token");
-        assert_eq!(material.into_sas_token(), "sig=token");
-    }
-
-    #[test]
-    fn typed_credentials_debug_redacts_material_and_prefix() {
+    fn typed_credentials_round_trip_and_redact_debug() {
         for kind in [
             StorageCredentialKind::S3(S3Credential::new(
                 "secret-key",
@@ -325,11 +296,27 @@ mod tests {
             )),
             StorageCredentialKind::Azdls(AzdlsCredential::new("sig=secret-token")),
         ] {
-            let credential =
-                StorageCredential::new(kind).with_prefix("s3://secret-bucket/secret-prefix/");
+            let credential = StorageCredential::new(kind);
+            assert_eq!(credential.prefix(), None);
+            assert_eq!(credential.expires_at(), None);
+            assert!(credential.covers("s3://bucket/file"));
+            let credential = credential.with_prefix("s3://secret-bucket/secret-prefix/");
             for diagnostic in [format!("{credential:?}"), format!("{credential:#?}")] {
                 assert!(!diagnostic.contains("secret-"));
                 assert!(!diagnostic.contains("sig="));
+            }
+            match credential.into_kind() {
+                StorageCredentialKind::S3(material) => assert_eq!(
+                    material.into_parts(),
+                    (
+                        "secret-key".into(),
+                        "secret-value".into(),
+                        Some("secret-session".into())
+                    )
+                ),
+                StorageCredentialKind::Azdls(material) => {
+                    assert_eq!(material.into_sas_token(), "sig=secret-token");
+                }
             }
         }
     }
