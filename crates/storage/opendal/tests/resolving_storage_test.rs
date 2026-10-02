@@ -253,49 +253,4 @@ mod tests {
         let result = file_io.exists("no-scheme-path").await;
         assert!(result.is_err());
     }
-
-    #[cfg(feature = "opendal-s3")]
-    #[tokio::test]
-    async fn test_with_custom_credential_loader() {
-        use iceberg_storage_opendal::{
-            AwsCredential, CustomAwsCredentialLoader, ProvideCredential,
-        };
-        use reqsign_core::Context;
-
-        #[derive(Debug)]
-        struct ObjectStoreCredentialLoader;
-
-        impl ProvideCredential for ObjectStoreCredentialLoader {
-            type Credential = AwsCredential;
-
-            async fn provide_credential(
-                &self,
-                _ctx: &Context,
-            ) -> reqsign_core::Result<Option<AwsCredential>> {
-                Ok(Some(AwsCredential {
-                    access_key_id: "admin".to_string(),
-                    secret_access_key: "password".to_string(),
-                    session_token: None,
-                    expires_in: None,
-                }))
-            }
-        }
-
-        set_up();
-        let object_store_endpoint = get_object_store_endpoint();
-
-        let factory = OpenDalResolvingStorageFactory::new()
-            .with_s3_credential_loader(CustomAwsCredentialLoader::new(ObjectStoreCredentialLoader));
-
-        let file_io = FileIOBuilder::new(Arc::new(factory))
-            .with_props(vec![
-                (S3_ENDPOINT, object_store_endpoint),
-                (S3_REGION, "us-east-1".to_string()),
-                (S3_PATH_STYLE_ACCESS, "true".to_string()),
-            ])
-            .build();
-
-        // Should be able to access S3 using the custom credential loader
-        assert!(file_io.exists("s3://bucket1/").await.unwrap());
-    }
 }

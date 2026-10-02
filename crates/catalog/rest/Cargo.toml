@@ -43,9 +43,11 @@ serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 typed-builder = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
 mockito = { workspace = true }
 tokio = { workspace = true }
