@@ -1636,35 +1636,10 @@ mod tests {
     #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
     mod directory_credentials {
         use futures::TryStreamExt;
-        use iceberg::io::{FileIOBuilder, StorageCredential, StorageCredentialProvider};
+        use iceberg::io::{FileIOBuilder, StorageCredential};
         use mockito::{Matcher, Server};
 
         use super::*;
-
-        #[derive(Debug)]
-        struct DirectoryProvider {
-            directory: String,
-            credential: StorageCredential,
-        }
-
-        #[async_trait]
-        impl StorageCredentialProvider for DirectoryProvider {
-            async fn load_credential_with_minimum_validity(
-                &self,
-                location: &str,
-                _minimum_validity: Duration,
-            ) -> Result<StorageCredential> {
-                // A directory grant deliberately does not cover the file of
-                // the same name. Do not trim slashes in credential matching.
-                if location != self.directory {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "No matching directory credential",
-                    ));
-                }
-                Ok(self.credential.clone())
-            }
-        }
 
         async fn assert_directory_credential_binding(
             factory: OpenDalStorageFactory,
@@ -1673,11 +1648,19 @@ mod tests {
             file: &str,
         ) {
             let directory = format!("{file}/");
-            let provider = Arc::new(DirectoryProvider {
-                directory: directory.clone(),
-                credential: StorageCredential::new(credential_kind)
-                    .with_expiration(SystemTime::now() + Duration::from_secs(30)),
-            });
+            let granted_directory = directory.clone();
+            let credential = StorageCredential::new(credential_kind)
+                .with_expiration(SystemTime::now() + Duration::from_secs(30));
+            let provider = Arc::new(credentials::test_provider(move |location, _| {
+                // A directory grant must not cover the file of the same name.
+                if location != granted_directory {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "No matching directory credential",
+                    ));
+                }
+                Ok(credential.clone())
+            }));
             let io = FileIOBuilder::new(Arc::new(factory))
                 .with_props(props)
                 .with_prop(IO_MAX_RETRIES, "0")
@@ -1842,29 +1825,20 @@ mod tests {
     #[cfg(feature = "opendal-azdls")]
     #[test]
     fn credentialed_operators_are_isolated_and_cache_is_bounded() {
-        use iceberg::io::{CredentialProvider, StorageCredential, StorageCredentialProvider};
-
-        #[derive(Debug)]
-        struct Provider;
-        #[async_trait]
-        impl StorageCredentialProvider for Provider {
-            async fn load_credential_with_minimum_validity(
-                &self,
-                _: &str,
-                _minimum_validity: Duration,
-            ) -> Result<StorageCredential> {
-                unreachable!("operator construction must not fetch credentials")
-            }
-        }
+        let provider = || {
+            CredentialProvider(Arc::new(credentials::test_provider(|_, _| {
+                panic!("operator construction must not fetch credentials");
+            })))
+        };
         let mut first = test_azdls_storage(None);
-        first.storage.provider = Some(CredentialProvider(Arc::new(Provider)));
+        first.storage.provider = Some(provider());
         let path = "abfss://myfs@myaccount.dfs.core.windows.net/data/0";
         create_cached_operator(&first, path);
         create_cached_operator(&first, path);
         assert_eq!(first.operator_cache.len(), 1);
         let mut second = test_azdls_storage(None);
         second.operator_cache = first.operator_cache.clone();
-        second.storage.provider = Some(CredentialProvider(Arc::new(Provider)));
+        second.storage.provider = Some(provider());
         create_cached_operator(&second, path);
         assert_eq!(first.operator_cache.len(), 2);
         for index in 1..80 {

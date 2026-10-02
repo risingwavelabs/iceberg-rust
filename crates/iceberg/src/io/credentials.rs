@@ -307,27 +307,28 @@ impl<'de> Deserialize<'de> for CredentialProvider {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct RecordingProvider(std::sync::Mutex<Vec<(String, Duration)>>);
+    #[async_trait]
+    impl StorageCredentialProvider for RecordingProvider {
+        async fn load_credential_with_minimum_validity(
+            &self,
+            path: &str,
+            minimum_validity: Duration,
+        ) -> Result<StorageCredential> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_string(), minimum_validity));
+            Ok(StorageCredential::new(StorageCredentialKind::S3(
+                S3Credential::new("key", "dummy-secret", None),
+            )))
+        }
+    }
+
     #[tokio::test]
     async fn default_load_forwards_the_path_with_zero_minimum_validity() {
-        #[derive(Debug, Default)]
-        struct Provider(std::sync::Mutex<Vec<(String, Duration)>>);
-        #[async_trait]
-        impl StorageCredentialProvider for Provider {
-            async fn load_credential_with_minimum_validity(
-                &self,
-                path: &str,
-                minimum_validity: Duration,
-            ) -> Result<StorageCredential> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((path.to_string(), minimum_validity));
-                Ok(StorageCredential::new(StorageCredentialKind::S3(
-                    S3Credential::new("key", "dummy-secret", None),
-                )))
-            }
-        }
-        let provider = Provider::default();
+        let provider = RecordingProvider::default();
         let dynamic: &dyn StorageCredentialProvider = &provider;
         let path = "s3://bucket/table/file";
         dynamic.load_credential(path).await.unwrap();
@@ -380,24 +381,17 @@ mod tests {
     fn default_factory_builds_static_storage_but_rejects_runtime_credentials() {
         use crate::io::{MemoryStorageFactory, StorageConfig, StorageFactory};
 
-        #[derive(Debug)]
-        struct Provider;
-        #[async_trait]
-        impl StorageCredentialProvider for Provider {
-            async fn load_credential_with_minimum_validity(
-                &self,
-                _: &str,
-                _minimum_validity: Duration,
-            ) -> Result<StorageCredential> {
-                unreachable!("unsupported factories must not fetch credentials");
-            }
-        }
+        let provider = Arc::new(RecordingProvider::default());
         let config = StorageConfig::new();
         assert!(MemoryStorageFactory.build(&config).is_ok());
         let error = MemoryStorageFactory
-            .build_with_credentials(&config, Arc::new(Provider))
+            .build_with_credentials(&config, provider.clone())
             .unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
+        assert!(
+            provider.0.lock().unwrap().is_empty(),
+            "unsupported factories must not fetch credentials"
+        );
     }
 
     #[test]

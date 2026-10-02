@@ -37,7 +37,7 @@ const S3_SIGNING_LEASE: Duration = Duration::from_secs(30);
 const S3_MINIMUM_SIGNING_VALIDITY: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
-struct TestCredentialProvider<F> {
+pub(super) struct TestCredentialProvider<F> {
     load: F,
     supports: fn(&str) -> bool,
 }
@@ -51,7 +51,7 @@ impl<F> std::fmt::Debug for TestCredentialProvider<F> {
 }
 
 #[cfg(test)]
-fn test_provider<F>(load: F) -> TestCredentialProvider<F>
+pub(super) fn test_provider<F>(load: F) -> TestCredentialProvider<F>
 where F: Fn(&str, Duration) -> Result<StorageCredential> + Send + Sync {
     TestCredentialProvider {
         load,
