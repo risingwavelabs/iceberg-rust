@@ -25,3 +25,30 @@
 This crate contains the official Native Rust implementation of Apache Iceberg Rest Catalog.
 
 See the [API documentation](https://docs.rs/iceberg-catalog-rest/latest) for examples and the full API.
+
+## Vended storage credentials
+
+With `iceberg` and its `storage-azdls` or `storage-s3` feature,
+set `header.X-Iceberg-Access-Delegation=vended-credentials` on the REST catalog.
+Use `OpenDalResolvingStorageFactory` for tables spanning storage locations.
+
+Credentials are selected for each file URI, not just the metadata URI. The
+longest matching `storage-credentials` prefix wins, followed by the response's
+`config`. Azure supports `adls.sas-token.<account-host>` and `adls.sas-token`;
+account-specific keys take precedence. A leading `?` is accepted.
+
+Already-open readers and writers share automatic renewal through the table's
+`/credentials` endpoint. Legacy catalogs without that endpoint fall back to
+loadTable without replacing the query's metadata snapshot. SAS `se`, optional
+`adls.sas-token-expires-at-ms[.<account-host>]`, and
+`s3.session-token-expires-at-ms` bound credential lifetime. Missing expiry gets
+a five-minute renewal lease. Refresh is single-flight, with a ten-second timeout
+and a one-second retry gate.
+
+Delegated mode fails closed: it never falls back to static or ambient storage
+credentials after a missing, expired or revoked vended credential. To use only
+static credentials, do not request delegation. Non-authentication options such
+as `adls.endpoint`, retries and write chunk size remain in FileIO configuration.
+Delegated S3 requests always require signing, even if anonymous access was
+configured. An unadvertised credentials endpoint returning 404 blocks reuse of
+old credentials until the catalog successfully confirms access through loadTable.

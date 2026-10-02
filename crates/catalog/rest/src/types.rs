@@ -27,6 +27,8 @@ use serde_derive::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct CatalogConfig {
+    #[serde(default)]
+    pub(super) endpoints: Option<Vec<String>>,
     pub(super) overrides: HashMap<String, String>,
     pub(super) defaults: HashMap<String, String>,
 }

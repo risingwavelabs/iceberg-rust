@@ -15,49 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Azure blob storage properties
-use std::collections::HashMap;
-
-use opendal::Operator;
-use opendal::services::AzblobConfig;
-use url::Url;
-
-use crate::{Error, ErrorKind, Result};
-
 /// Azure blob account name.
 pub const AZBLOB_ACCOUNT_NAME: &str = "azblob.account-name";
 /// Azure blob account key.
 pub const AZBLOB_ACCOUNT_KEY: &str = "azblob.account-key";
 /// Azure blob account endpoint.
 pub const AZBLOB_ENDPOINT: &str = "azblob.endpoint";
-
-/// Parse iceberg properties to [`AzblobConfig`].
-pub(crate) fn azblob_config_parse(mut m: HashMap<String, String>) -> Result<AzblobConfig> {
-    let mut cfg = AzblobConfig::default();
-
-    if let Some(account_name) = m.remove(AZBLOB_ACCOUNT_NAME) {
-        cfg.account_name = Some(account_name);
-    };
-    if let Some(account_key) = m.remove(AZBLOB_ACCOUNT_KEY) {
-        cfg.account_key = Some(account_key);
-    };
-    if let Some(endpoint) = m.remove(AZBLOB_ENDPOINT) {
-        cfg.endpoint = Some(endpoint);
-    };
-
-    Ok(cfg)
-}
-
-/// Build a new OpenDAL [`Operator`] based on a provided [`AzblobConfig`].
-pub(crate) fn azblob_config_build(cfg: &AzblobConfig, path: &str) -> Result<Operator> {
-    let url = Url::parse(path)?;
-    let container = url.host_str().ok_or_else(|| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!("Invalid azblob url: {path}, container is required"),
-        )
-    })?;
-
-    let mut cfg = cfg.clone();
-    cfg.container = container.to_string();
-    Ok(Operator::from_config(cfg)?.finish())
-}

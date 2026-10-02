@@ -66,9 +66,11 @@
 //! - `new_input`: Create input file for reading.
 //! - `new_output`: Create output file for writing.
 
+mod credentials;
 mod file_io;
 mod storage;
 
+pub use credentials::*;
 pub use file_io::*;
 pub use storage::*;
 

@@ -1,0 +1,431 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Resolving storage that auto-detects the scheme from a path and delegates
+//! to the appropriate [`OpenDalStorage`] variant.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+use super::{
+    ConfiguredOpenDalStorage, OpenDalStorage, SharedOperatorCache, default_operator_cache,
+};
+use crate::io::{
+    CredentialProvider, FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile,
+    Storage, StorageConfig, StorageCredentialProvider, StorageFactory,
+};
+use crate::{Error, ErrorKind, Result};
+
+/// Schemes supported by OpenDalResolvingStorage
+/// Storage routing scheme identifier.
+pub const SCHEME_MEMORY: &str = "memory";
+/// Storage routing scheme identifier.
+pub const SCHEME_FILE: &str = "file";
+/// Storage routing scheme identifier.
+pub const SCHEME_S3: &str = "s3";
+/// Storage routing scheme identifier.
+pub const SCHEME_S3A: &str = "s3a";
+/// Storage routing scheme identifier.
+pub const SCHEME_S3N: &str = "s3n";
+/// Storage routing scheme identifier.
+pub const SCHEME_GS: &str = "gs";
+/// Storage routing scheme identifier.
+pub const SCHEME_GCS: &str = "gcs";
+/// Storage routing scheme identifier.
+pub const SCHEME_OSS: &str = "oss";
+/// Storage routing scheme identifier.
+pub const SCHEME_ABFSS: &str = "abfss";
+/// Storage routing scheme identifier.
+pub const SCHEME_ABFS: &str = "abfs";
+/// Storage routing scheme identifier.
+pub const SCHEME_WASBS: &str = "wasbs";
+/// Storage routing scheme identifier.
+pub const SCHEME_WASB: &str = "wasb";
+/// Storage routing scheme identifier.
+pub const SCHEME_AZBLOB: &str = "azblob";
+
+/// Parse a URL scheme string.
+fn parse_scheme(scheme: &str) -> Result<&'static str> {
+    match scheme {
+        SCHEME_MEMORY => Ok("memory"),
+        SCHEME_FILE | "" => Ok("file"),
+        SCHEME_S3 | SCHEME_S3A | SCHEME_S3N => Ok("s3"),
+        SCHEME_GS | SCHEME_GCS => Ok("gcs"),
+        SCHEME_OSS => Ok("oss"),
+        SCHEME_ABFSS | SCHEME_ABFS | SCHEME_WASBS | SCHEME_WASB => Ok("azdls"),
+        SCHEME_AZBLOB => Ok("azblob"),
+        s => Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Unsupported storage scheme: {s}"),
+        )),
+    }
+}
+
+/// Extract the scheme from a path URL.
+fn extract_scheme(path: &str) -> Result<&'static str> {
+    let url = Url::parse(path).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Invalid path: {path}, failed to parse URL: {e}"),
+        )
+    })?;
+    parse_scheme(url.scheme())
+}
+
+/// Build an [`OpenDalStorage`] variant for the given scheme and config properties.
+fn build_storage_for_scheme(
+    scheme: &'static str,
+    props: &HashMap<String, String>,
+) -> Result<OpenDalStorage> {
+    match scheme {
+        #[cfg(feature = "storage-s3")]
+        "s3" => {
+            let config = super::s3::s3_config_parse(props.clone())?;
+            Ok(OpenDalStorage::S3 {
+                config: Arc::new(config),
+            })
+        }
+        #[cfg(feature = "storage-gcs")]
+        "gcs" => {
+            let config = super::gcs::gcs_config_parse(props.clone())?;
+            Ok(OpenDalStorage::Gcs {
+                config: Arc::new(config),
+            })
+        }
+        #[cfg(feature = "storage-oss")]
+        "oss" => {
+            let config = super::oss::oss_config_parse(props.clone())?;
+            Ok(OpenDalStorage::Oss {
+                config: Arc::new(config),
+            })
+        }
+        #[cfg(feature = "storage-azdls")]
+        "azdls" => {
+            let config = super::azdls::azdls_config_parse(props.clone())?;
+            Ok(OpenDalStorage::Azdls {
+                config: Arc::new(config),
+            })
+        }
+        #[cfg(feature = "storage-azblob")]
+        "azblob" => {
+            let config = super::azblob::azblob_config_parse(props.clone());
+            Ok(OpenDalStorage::Azblob {
+                config: Arc::new(config),
+            })
+        }
+        #[cfg(feature = "storage-fs")]
+        "file" => Ok(OpenDalStorage::LocalFs),
+        #[cfg(feature = "storage-memory")]
+        "memory" => Ok(OpenDalStorage::Memory(super::memory::memory_config_build()?)),
+
+        unsupported => Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Unsupported storage scheme: {unsupported}"),
+        )),
+    }
+}
+
+/// A resolving storage factory that creates [`OpenDalResolvingStorage`] instances.
+///
+/// This factory accepts paths from any supported storage system and dynamically
+/// delegates operations to the appropriate [`OpenDalStorage`] variant based on
+/// the path scheme.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use crate::io::FileIOBuilder;
+/// use iceberg::io::OpenDalResolvingStorageFactory;
+///
+/// let factory = OpenDalResolvingStorageFactory::new();
+/// let file_io = FileIOBuilder::from_storage_factory(Arc::new(factory))
+///     .with_prop("s3.region", "us-east-1")
+///     .build().unwrap();
+/// ```
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenDalResolvingStorageFactory {
+    /// Operator cache shared by all resolving storages built by this factory.
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: SharedOperatorCache,
+}
+
+impl Default for OpenDalResolvingStorageFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenDalResolvingStorageFactory {
+    /// Create a new resolving storage factory.
+    pub fn new() -> Self {
+        Self {
+            operator_cache: default_operator_cache(),
+        }
+    }
+}
+
+#[typetag::serde]
+impl StorageFactory for OpenDalResolvingStorageFactory {
+    fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(OpenDalResolvingStorage {
+            props: config.props().clone(),
+            storages: RwLock::new(HashMap::new()),
+            operator_cache: self.operator_cache.clone(),
+            credentials: None,
+        }))
+    }
+
+    fn build_with_credentials(
+        &self,
+        config: &StorageConfig,
+        credential_provider: Arc<dyn StorageCredentialProvider>,
+    ) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(OpenDalResolvingStorage {
+            props: config.props().clone(),
+            storages: RwLock::new(HashMap::new()),
+            operator_cache: self.operator_cache.clone(),
+            credentials: Some(CredentialProvider(credential_provider)),
+        }))
+    }
+}
+
+/// A resolving storage that auto-detects the scheme from a path and delegates
+/// to the appropriate [`OpenDalStorage`] variant.
+///
+/// Sub-storages are lazily created on first use for each scheme and cached
+/// for subsequent operations. Scheme aliases like `s3`/`s3a`/`s3n` map to
+/// the same canonical scheme, so they share a storage instance.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpenDalResolvingStorage {
+    /// Configuration properties shared across all backends.
+    props: HashMap<String, String>,
+    #[serde(default)]
+    credentials: Option<CredentialProvider>,
+    /// Cache of canonical scheme to storage mappings.
+    #[serde(skip, default)]
+    storages: RwLock<HashMap<&'static str, Arc<ConfiguredOpenDalStorage>>>,
+    /// Operator cache inherited from the resolving factory.
+    #[serde(skip, default = "default_operator_cache")]
+    operator_cache: SharedOperatorCache,
+}
+
+impl OpenDalResolvingStorage {
+    /// Resolve the storage for the given path by extracting the canonical scheme and
+    /// returning the cached or newly-created [`OpenDalStorage`].
+    fn resolve(&self, path: &str) -> Result<Arc<ConfiguredOpenDalStorage>> {
+        let scheme = extract_scheme(path)?;
+
+        // Fast path: check read lock first.
+        {
+            let cache = self
+                .storages
+                .read()
+                .map_err(|_| Error::new(ErrorKind::Unexpected, "Storage cache lock poisoned"))?;
+            if let Some(storage) = cache.get(&scheme) {
+                return Ok(storage.clone());
+            }
+        }
+
+        // Slow path: build and insert under write lock.
+        let mut cache = self
+            .storages
+            .write()
+            .map_err(|_| Error::new(ErrorKind::Unexpected, "Storage cache lock poisoned"))?;
+
+        // Double-check after acquiring write lock.
+        if let Some(storage) = cache.get(&scheme) {
+            return Ok(storage.clone());
+        }
+
+        let storage = build_storage_for_scheme(scheme, &self.props)?;
+        let config = StorageConfig::from_props(self.props.clone());
+        let mut storage =
+            ConfiguredOpenDalStorage::new(storage, &config, self.operator_cache.clone())?;
+        storage.storage.provider = self.credentials.clone();
+        let storage = Arc::new(storage);
+        cache.insert(scheme, storage.clone());
+        Ok(storage)
+    }
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for OpenDalResolvingStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        self.resolve(path)?.exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        self.resolve(path)?.metadata(path).await
+    }
+
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        self.resolve(path)?.read(path).await
+    }
+
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        self.resolve(path)?.reader(path).await
+    }
+
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.resolve(path)?.write(path, bs).await
+    }
+
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        self.resolve(path)?.writer(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.resolve(path)?.delete(path).await
+    }
+
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        self.resolve(path)?.delete_prefix(path).await
+    }
+
+    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
+        if self.credentials.is_some() {
+            // Keep memory bounded while delegating scope-local batching to each
+            // backend. Scheme aliases share a configured storage.
+            let mut chunks = paths.chunks(1000);
+            while let Some(paths) = chunks.next().await {
+                let mut grouped: HashMap<&'static str, Vec<String>> = HashMap::new();
+                for path in paths {
+                    grouped
+                        .entry(extract_scheme(&path)?)
+                        .or_default()
+                        .push(path);
+                }
+                for paths in grouped.into_values() {
+                    self.resolve(&paths[0])?
+                        .delete_stream(futures::stream::iter(paths).boxed())
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+        // Group paths by canonical scheme so each resolved storage receives a batch,
+        // avoiding repeated operator creation per path.
+        let mut grouped: HashMap<&'static str, Vec<String>> = HashMap::new();
+        while let Some(path) = paths.next().await {
+            let scheme = extract_scheme(&path)?;
+            grouped.entry(scheme).or_default().push(path);
+        }
+
+        for (_, paths) in grouped {
+            let storage = self.resolve(&paths[0])?;
+            storage
+                .delete_stream(futures::stream::iter(paths).boxed())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        self.resolve(path)?.list(path, recursive).await
+    }
+
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        Ok(InputFile::new(
+            Arc::new(self.resolve(path)?.as_ref().clone()),
+            path.to_string(),
+        ))
+    }
+
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        Ok(OutputFile::new(
+            Arc::new(self.resolve(path)?.as_ref().clone()),
+            path.to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a resolving storage with empty props, suitable for `resolve()`
+    /// calls that don't actually hit any backend.
+    fn empty_resolving_storage() -> OpenDalResolvingStorage {
+        OpenDalResolvingStorage {
+            props: HashMap::new(),
+            credentials: None,
+            storages: RwLock::new(HashMap::new()),
+            operator_cache: default_operator_cache(),
+        }
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn test_resolve_s3_aliases_share_instance() {
+        let storage = empty_resolving_storage();
+
+        // All three S3-family schemes must collapse to a single cached
+        // `Arc<OpenDalStorage>` so that catalogs handing the resolver a mix
+        // of `s3://`, `s3a://`, `s3n://` paths don't rebuild operators.
+        let a = storage.resolve("s3://bucket/key").unwrap();
+        let b = storage.resolve("s3a://bucket/key").unwrap();
+        let c = storage.resolve("s3n://bucket/key").unwrap();
+
+        assert!(Arc::ptr_eq(&a, &b), "s3 and s3a should share one instance");
+        assert!(Arc::ptr_eq(&a, &c), "s3 and s3n should share one instance");
+    }
+
+    #[cfg(feature = "storage-azdls")]
+    #[test]
+    fn test_resolve_azdls_aliases_share_instance() {
+        let storage = empty_resolving_storage();
+
+        let path_for = |scheme: &str| {
+            format!("{scheme}://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
+        };
+
+        // All Azure schemes collapse onto one cached instance.
+        let abfss = storage.resolve(&path_for("abfss")).unwrap();
+        let abfs = storage.resolve(&path_for("abfs")).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&abfss, &abfs),
+            "abfss and abfs should share one instance"
+        );
+    }
+
+    #[cfg(feature = "storage-azblob")]
+    #[test]
+    fn test_resolve_azblob() {
+        let storage = empty_resolving_storage();
+        let resolved = storage
+            .resolve("azblob://container/path/to/file.parquet")
+            .unwrap();
+        assert!(matches!(
+            resolved.storage.backend,
+            OpenDalStorage::Azblob { .. }
+        ));
+    }
+}

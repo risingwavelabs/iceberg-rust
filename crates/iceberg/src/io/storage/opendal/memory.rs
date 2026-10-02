@@ -21,5 +21,5 @@ use opendal::services::MemoryConfig;
 use crate::Result;
 
 pub(crate) fn memory_config_build() -> Result<Operator> {
-    Ok(Operator::from_config(MemoryConfig::default())?.finish())
+    Ok(Operator::from_config(MemoryConfig::default())?)
 }

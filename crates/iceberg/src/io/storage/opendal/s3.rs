@@ -22,20 +22,25 @@ use async_trait::async_trait;
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
 pub use reqsign::{AwsCredential, AwsCredentialLoad};
+use reqsign_core::ProvideCredentialChain;
 use reqwest::Client;
 use url::Url;
 
+use super::credentials::{VendedCredentialSource, VendedS3CredentialProvider};
+use super::utils::{from_opendal_error, is_truthy};
 use crate::io::{
-    CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ASSUME_ROLE_ARN,
+    CLIENT_REGION, CredentialProvider, S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ASSUME_ROLE_ARN,
     S3_ASSUME_ROLE_EXTERNAL_ID, S3_ASSUME_ROLE_SESSION_NAME, S3_DISABLE_CONFIG_LOAD,
     S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
-    S3_SESSION_TOKEN, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE, is_truthy,
+    S3_SESSION_TOKEN, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE,
 };
 use crate::{Error, ErrorKind, Result};
 
 /// Parse iceberg props to s3 config.
 pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
     let mut cfg = S3Config::default();
+    cfg.enable_virtual_host_style = false;
+    // Preserve the release line's path-style default unless explicitly overridden.
     if let Some(endpoint) = m.remove(S3_ENDPOINT) {
         cfg.endpoint = Some(endpoint);
     };
@@ -100,7 +105,7 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
     if let Some(allow_anonymous) = m.remove(S3_ALLOW_ANONYMOUS)
         && is_truthy(allow_anonymous.to_lowercase().as_str())
     {
-        cfg.allow_anonymous = true;
+        cfg.skip_signature = true;
     }
     if let Some(disable_ec2_metadata) = m.remove(S3_DISABLE_EC2_METADATA)
         && is_truthy(disable_ec2_metadata.to_lowercase().as_str())
@@ -119,8 +124,8 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
 /// Build new opendal operator from give path.
 pub(crate) fn s3_config_build(
     cfg: &S3Config,
-    customized_credential_load: &Option<CustomAwsCredentialLoader>,
     path: &str,
+    credentials: Option<&CredentialProvider>,
 ) -> Result<Operator> {
     let url = Url::parse(path)?;
     let bucket = url.host_str().ok_or_else(|| {
@@ -130,18 +135,30 @@ pub(crate) fn s3_config_build(
         )
     })?;
 
+    let mut cfg = cfg.clone();
+    if credentials.is_some() {
+        // Delegated authentication must never bypass its provider.
+        cfg.skip_signature = false;
+        #[allow(deprecated)]
+        {
+            cfg.allow_anonymous = false;
+        }
+    }
     let mut builder = cfg
-        .clone()
         .into_builder()
         // Set bucket name.
         .bucket(bucket);
 
-    if let Some(customized_credential_load) = customized_credential_load {
-        builder = builder
-            .customized_credential_load(customized_credential_load.clone().into_opendal_loader());
+    if let Some(provider) = credentials {
+        builder = builder.credential_provider_chain(ProvideCredentialChain::new().push(
+            VendedS3CredentialProvider(VendedCredentialSource {
+                provider: provider.clone(),
+                location: path.to_string(),
+            }),
+        ));
     }
 
-    Ok(Operator::new(builder)?.finish())
+    Operator::new(builder).map_err(from_opendal_error)
 }
 
 /// Custom AWS credential loader.
@@ -174,5 +191,61 @@ impl CustomAwsCredentialLoader {
 impl AwsCredentialLoad for CustomAwsCredentialLoader {
     async fn load_credential(&self, client: Client) -> anyhow::Result<Option<AwsCredential>> {
         self.0.load_credential(client).await
+    }
+}
+
+#[async_trait]
+impl crate::io::StorageCredentialProvider for CustomAwsCredentialLoader {
+    fn supports_path(&self, path: &str) -> bool {
+        Url::parse(path).is_ok_and(|url| matches!(url.scheme(), "s3" | "s3a" | "s3n"))
+    }
+
+    async fn load_credential_with_minimum_validity(
+        &self,
+        _: &str,
+        _: std::time::Duration,
+    ) -> Result<crate::io::StorageCredential> {
+        let credential = self
+            .0
+            .load_credential(Client::new())
+            .await
+            .map_err(|_| Error::new(ErrorKind::Unexpected, "Custom AWS credential loader failed"))?
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Custom AWS credentials missing"))?;
+        let expiry = credential.expires_in.map(std::time::SystemTime::from);
+        let mut credential = crate::io::StorageCredential::new(
+            crate::io::StorageCredentialKind::S3(crate::io::S3Credential::new(
+                credential.access_key_id,
+                credential.secret_access_key,
+                credential.session_token,
+            )),
+        );
+        if let Some(expiry) = expiry {
+            credential = credential.with_expiration(expiry);
+        }
+        Ok(credential)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::s3_config_parse;
+    use crate::io::S3_PATH_STYLE_ACCESS;
+
+    fn parse_with(prop: Option<&str>) -> bool {
+        let mut props = HashMap::new();
+        if let Some(v) = prop {
+            props.insert(S3_PATH_STYLE_ACCESS.to_string(), v.to_string());
+        }
+        s3_config_parse(props).unwrap().enable_virtual_host_style
+    }
+
+    #[test]
+    fn s3_config_parse_path_style_access() {
+        // Match Iceberg S3FileIOProperties.PATH_STYLE_ACCESS_DEFAULT = false.
+        assert!(!parse_with(None));
+        assert!(parse_with(Some("false")));
+        assert!(!parse_with(Some("true")));
     }
 }

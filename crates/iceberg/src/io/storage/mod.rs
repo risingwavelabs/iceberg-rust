@@ -28,13 +28,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 pub use config::*;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 pub use local_fs::{LocalFsStorage, LocalFsStorageFactory};
 pub use memory::{MemoryStorage, MemoryStorageFactory};
 #[cfg(feature = "storage-s3")]
 pub use opendal::CustomAwsCredentialLoader;
-pub use opendal::{OpenDalStorage, OpenDalStorageFactory};
+pub use opendal::{
+    OpenDalResolvingStorage, OpenDalResolvingStorageFactory, OpenDalStorage, OpenDalStorageFactory,
+};
 
-use super::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile};
+use super::{FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile};
 use crate::Result;
 
 /// Trait for storage operations in Iceberg.
@@ -102,6 +106,22 @@ pub trait Storage: Debug + Send + Sync {
     /// Delete all files with the given prefix
     async fn delete_prefix(&self, path: &str) -> Result<()>;
 
+    /// Delete a stream of absolute file paths.
+    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
+        while let Some(path) = paths.next().await {
+            self.delete(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// List entries under an absolute directory path.
+    async fn list(&self, _: &str, _: bool) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        Err(crate::Error::new(
+            crate::ErrorKind::FeatureUnsupported,
+            "Storage listing unsupported",
+        ))
+    }
+
     /// Create a new input file for reading
     fn new_input(&self, path: &str) -> Result<InputFile>;
 
@@ -149,4 +169,17 @@ pub trait StorageFactory: Debug + Send + Sync {
     /// A `Result` containing an `Arc<dyn Storage>` on success, or an error
     /// if the storage could not be created.
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>>;
+
+    /// Build storage with runtime credentials. Implementations must not silently
+    /// discard the provider or fall back to their default credential chain.
+    fn build_with_credentials(
+        &self,
+        _config: &StorageConfig,
+        _credential_provider: Arc<dyn super::StorageCredentialProvider>,
+    ) -> Result<Arc<dyn Storage>> {
+        Err(crate::Error::new(
+            crate::ErrorKind::FeatureUnsupported,
+            "Storage factory does not support runtime credentials",
+        ))
+    }
 }

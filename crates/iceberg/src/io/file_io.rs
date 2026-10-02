@@ -23,10 +23,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use opendal::Operator;
 use url::Url;
 
-use super::storage::{OpenDalStorage, Storage};
+use super::{CredentialProvider, OpenDalStorageFactory, Storage, StorageConfig, StorageFactory};
 use crate::{Error, ErrorKind, Result};
 
 /// Configuration property for setting the chunk size for IO write operations.
@@ -82,7 +81,7 @@ pub const IO_RETRY_MAX_DELAY_MS: &str = "io.retry.max-delay-ms";
 pub struct FileIO {
     builder: FileIOBuilder,
 
-    inner: Arc<OpenDalStorage>,
+    inner: Arc<dyn Storage>,
 }
 
 impl FileIO {
@@ -117,16 +116,26 @@ impl FileIO {
         Ok(FileIOBuilder::new(url.scheme()))
     }
 
+    /// Get a copy of this FileIO's storage configuration.
+    pub fn config(&self) -> StorageConfig {
+        StorageConfig::from_props(self.builder.props.clone())
+    }
+
+    /// Delete a stream of absolute paths with credential-scoped batching.
+    pub async fn delete_stream(
+        &self,
+        paths: impl futures::Stream<Item = String> + Send + 'static,
+    ) -> Result<()> {
+        self.inner.delete_stream(paths.boxed()).await
+    }
+
     /// Deletes file.
     ///
     /// # Arguments
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn delete(&self, path: impl AsRef<str>) -> Result<()> {
-        let (op, relative_path) = self
-            .inner
-            .create_operator_with_config(&path, &self.builder.props)?;
-        Ok(op.delete(relative_path).await?)
+        self.inner.delete(path.as_ref()).await
     }
 
     /// Remove the path and all nested dirs and files recursively.
@@ -141,15 +150,7 @@ impl FileIO {
     /// - If the path is a empty directory, this function will remove the directory itself.
     /// - If the path is a non-empty directory, this function will remove the directory and all nested files and directories.
     pub async fn delete_prefix(&self, path: impl AsRef<str>) -> Result<()> {
-        let (op, relative_path) = self
-            .inner
-            .create_operator_with_config(&path, &self.builder.props)?;
-        let path = if relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-        Ok(op.remove_all(&path).await?)
+        self.inner.delete_prefix(path.as_ref()).await
     }
 
     /// Check file exists.
@@ -158,10 +159,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn exists(&self, path: impl AsRef<str>) -> Result<bool> {
-        let (op, relative_path) = self
-            .inner
-            .create_operator_with_config(&path, &self.builder.props)?;
-        Ok(op.exists(relative_path).await?)
+        self.inner.exists(path.as_ref()).await
     }
 
     /// Lists files and directories under the given path as a stream.
@@ -175,55 +173,7 @@ impl FileIO {
         path: impl AsRef<str>,
         recursive: bool,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
-        let path_str: Arc<str> = Arc::from(path.as_ref());
-        let (op, relative_path) = self
-            .inner
-            .create_operator_with_config(&path_str, &self.builder.props)?;
-
-        // Calculate the absolute prefix: path_str without the relative_path suffix.
-        let absolute_prefix: Arc<str> =
-            Arc::from(&path_str[..path_str.len() - relative_path.len()]);
-
-        // Ensure path ends with '/' for directory listing
-        let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-
-        // OpenDAL's lister_with returns a Lister that implements Stream
-        let lister = op.lister_with(&list_path).recursive(recursive).await?;
-
-        // Transform the OpenDAL Entry stream into our ListEntry stream
-        let stream = lister
-            .map(move |entry_result| {
-                entry_result
-                    .map_err(|e| {
-                        Error::new(ErrorKind::Unexpected, "Failed to list entry")
-                            .with_context("path", path_str.to_string())
-                            .with_source(e)
-                    })
-                    .map(|entry| {
-                        let meta = entry.metadata();
-                        ListEntry {
-                            path: format!("{}{}", absolute_prefix, entry.path()),
-                            metadata: FileMetadata {
-                                size: meta.content_length(),
-                                last_modified_ms: meta.last_modified().and_then(|dt| {
-                                    let system_time: std::time::SystemTime = dt.into();
-                                    system_time
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .ok()
-                                        .map(|d| d.as_millis() as i64)
-                                }),
-                                is_dir: meta.is_dir(),
-                            },
-                        }
-                    })
-            })
-            .boxed();
-
-        Ok(stream)
+        self.inner.list(path.as_ref(), recursive).await
     }
 
     /// Creates input file.
@@ -241,26 +191,9 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
-        let (op, relative_path) = self
-            .inner
-            .create_operator_with_config(&path, &self.builder.props)?;
-        let path = path.as_ref().to_string();
-        let relative_path_pos = path.len() - relative_path.len();
-
-        // ADLS requires append mode for writes
-        #[cfg(feature = "storage-azdls")]
-        let append_file = matches!(self.inner.as_ref(), OpenDalStorage::Azdls { .. });
-        #[cfg(not(feature = "storage-azdls"))]
-        let append_file = false;
-
-        Ok(OutputFile::new_with_op(
-            self.inner.clone(),
-            path,
-            op,
-            relative_path_pos,
-            self.get_write_chunk_size()?,
-            append_file,
-        ))
+        let mut output = self.inner.new_output(path.as_ref())?;
+        output.chunk_size = self.get_write_chunk_size()?;
+        Ok(output)
     }
 
     fn get_write_chunk_size(&self) -> Result<Option<usize>> {
@@ -315,6 +248,8 @@ pub struct FileIOBuilder {
     props: HashMap<String, String>,
     /// Optional extensions to configure the underlying FileIO behavior.
     extensions: Extensions,
+    factory: Option<Arc<dyn StorageFactory>>,
+    credential_provider: Option<CredentialProvider>,
 }
 
 impl FileIOBuilder {
@@ -325,6 +260,8 @@ impl FileIOBuilder {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
             extensions: Extensions::default(),
+            factory: None,
+            credential_provider: None,
         }
     }
 
@@ -334,6 +271,8 @@ impl FileIOBuilder {
             scheme_str: None,
             props: HashMap::default(),
             extensions: Extensions::default(),
+            factory: None,
+            credential_provider: None,
         }
     }
 
@@ -382,12 +321,45 @@ impl FileIOBuilder {
         self.extensions.get::<T>()
     }
 
+    /// Create a builder using an explicit storage factory.
+    pub fn from_storage_factory(factory: Arc<dyn StorageFactory>) -> Self {
+        Self {
+            factory: Some(factory),
+            ..Self::new_fs_io()
+        }
+    }
+
+    /// Share a runtime credential provider with all derived file handles.
+    pub fn with_credential_provider(
+        mut self,
+        provider: Arc<dyn super::StorageCredentialProvider>,
+    ) -> Self {
+        self.credential_provider = Some(CredentialProvider(provider));
+        self
+    }
+
     /// Builds [`FileIO`].
-    pub fn build(self) -> Result<FileIO> {
-        let storage = OpenDalStorage::build(self.clone())?;
+    pub fn build(mut self) -> Result<FileIO> {
+        let factory = match self.factory.clone() {
+            Some(factory) => factory,
+            None => Arc::new(OpenDalStorageFactory::from_scheme(
+                self.scheme_str.as_deref().unwrap_or_default(),
+            )?) as Arc<dyn StorageFactory>,
+        };
+        #[cfg(feature = "storage-s3")]
+        if self.credential_provider.is_none()
+            && let Some(loader) = self.extensions.get::<super::CustomAwsCredentialLoader>()
+        {
+            self.credential_provider = Some(CredentialProvider(loader));
+        }
+        let config = StorageConfig::from_props(self.props.clone());
+        let storage = match &self.credential_provider {
+            Some(provider) => factory.build_with_credentials(&config, provider.0.clone())?,
+            None => factory.build(&config)?,
+        };
         Ok(FileIO {
             builder: self,
-            inner: Arc::new(storage),
+            inner: storage,
         })
     }
 }
@@ -492,14 +464,8 @@ pub struct OutputFile {
     storage: Arc<dyn Storage>,
     // Absolute path of file.
     path: String,
-    // Relative path of file to uri, starts at [`relative_path_pos`]
-    relative_path_pos: Option<usize>,
-    // Optional direct operator for configuring writer behavior.
-    op: Option<Operator>,
     // Chunk size for write operations to ensure consistent size of multipart chunks
     chunk_size: Option<usize>,
-    // Whether to use append mode for writes (required for some storage backends like AZDLS)
-    append_file: bool,
 }
 
 impl OutputFile {
@@ -508,28 +474,7 @@ impl OutputFile {
         Self {
             storage,
             path,
-            relative_path_pos: None,
-            op: None,
             chunk_size: None,
-            append_file: false,
-        }
-    }
-
-    pub(crate) fn new_with_op(
-        storage: Arc<dyn Storage>,
-        path: String,
-        op: Operator,
-        relative_path_pos: usize,
-        chunk_size: Option<usize>,
-        append_file: bool,
-    ) -> Self {
-        Self {
-            storage,
-            path,
-            relative_path_pos: Some(relative_path_pos),
-            op: Some(op),
-            chunk_size,
-            append_file,
         }
     }
 
@@ -576,16 +521,6 @@ impl OutputFile {
     ///
     /// For one-time writing, use [`Self::write`] instead.
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        if let (Some(op), Some(relative_path_pos)) = (&self.op, self.relative_path_pos) {
-            let mut writer = op
-                .writer_with(&self.path[relative_path_pos..])
-                .append(self.append_file);
-            if let Some(chunk_size) = self.chunk_size {
-                writer = writer.chunk(chunk_size);
-            }
-            return Ok(Box::new(writer.await?));
-        }
-
         self.storage.writer(&self.path).await
     }
 }
