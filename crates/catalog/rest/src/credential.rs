@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use iceberg::io::{
     ADLS_SAS_TOKEN, AzdlsCredential, S3Credential, StorageCredential as IoStorageCredential,
-    StorageCredentialKind, StorageCredentialProvider, storage_prefix_covers,
+    StorageCredentialKind, StorageCredentialProvider, storage_prefix_covers_url,
 };
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::{Method, StatusCode, Url};
@@ -36,6 +36,45 @@ use crate::types::{LoadTableResult, StorageCredential};
 
 const LEASE: Duration = Duration::from_secs(300);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+pub(crate) fn requests_vended_credentials(properties: &HashMap<String, String>) -> bool {
+    properties.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("header.X-Iceberg-Access-Delegation")
+            && value
+                .split(',')
+                .any(|value| value.trim() == "vended-credentials")
+    })
+}
+
+pub(crate) fn has_vended_credentials(
+    config: &HashMap<String, String>,
+    entries: Option<&[StorageCredential]>,
+) -> bool {
+    entries.is_some_and(|entries| !entries.is_empty())
+        || config.keys().any(|key| {
+            key == ADLS_SAS_TOKEN
+                || key.starts_with("adls.sas-token.")
+                || matches!(key.as_str(), "s3.access-key-id" | "s3.secret-access-key")
+        })
+}
+
+/// Other backends retain static authentication, including mixed-table GCS.
+pub(crate) fn separate_storage_properties(properties: &mut HashMap<String, String>) {
+    properties.retain(|key, _| {
+        !(key.starts_with("header.")
+            || (key.starts_with("adls.") && key != "adls.endpoint")
+            || matches!(
+                key.as_str(),
+                "token"
+                    | "credential"
+                    | "s3.access-key-id"
+                    | "s3.secret-access-key"
+                    | "s3.session-token"
+                    | "s3.session-token-expires-at-ms"
+                    | "s3.role-arn"
+            ))
+    });
+}
 
 fn invalid(message: &'static str) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
@@ -184,10 +223,11 @@ impl CredentialSet {
     fn matched_entry(&self, location: &Url) -> Option<&ScopedCredential> {
         self.entries
             .iter()
-            .filter(|entry| storage_prefix_covers(entry.prefix.as_str(), location.as_str()))
+            .filter(|entry| storage_prefix_covers_url(&entry.prefix, location))
             .max_by_key(|entry| entry.prefix_len)
     }
 
+    #[cfg(test)]
     fn select(&self, location: &Url) -> Result<&ParsedCredential> {
         self.matched_entry(location)
             .map(|entry| &entry.properties)
@@ -202,9 +242,12 @@ impl CredentialSet {
         fresh: bool,
         minimum_validity: Duration,
     ) -> Result<IoStorageCredential> {
-        let credential = self.select(location)?;
-        let prefix = self
-            .matched_entry(location)
+        let matched = self.matched_entry(location);
+        let credential = matched
+            .map(|entry| &entry.properties)
+            .unwrap_or(&self.config)
+            .select(location)?;
+        let prefix = matched
             .map(|entry| entry.prefix.to_string())
             .unwrap_or_else(|| {
                 let mut root = location.clone();
@@ -228,20 +271,153 @@ impl CredentialSet {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialEndpoint {
+    Unknown,
+    Supported,
+    Legacy,
+}
+
+// A prefix-only response replaces old grants immediately, even if obtaining
+// the flat table configuration is subsequently cancelled or fails.
+enum Snapshot {
+    Table(CredentialSet),
+    Prefixes {
+        set: CredentialSet,
+        config_retry_after: SystemTime,
+    },
+}
+
+impl Snapshot {
+    fn set(&self) -> &CredentialSet {
+        match self {
+            Self::Table(set) | Self::Prefixes { set, .. } => set,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_mut(&mut self) -> &mut CredentialSet {
+        match self {
+            Self::Table(set) | Self::Prefixes { set, .. } => set,
+        }
+    }
+
+    fn needs_config(&self, location: &Url) -> bool {
+        matches!(self, Self::Prefixes { set, .. } if set.matched_entry(location).is_none())
+    }
+}
+
+enum Refresh {
+    Ready,
+    Backoff {
+        until: SystemTime,
+        status: Option<u16>,
+    },
+}
+
 struct State {
-    set: CredentialSet,
-    retry_after: SystemTime,
-    endpoint: Option<bool>,
+    table_url: String,
+    snapshot: Snapshot,
+    refresh: Refresh,
+    endpoint: CredentialEndpoint,
+    // Written directly by the HTTP client before OAuth retry awaits. Retaining
+    // this observation in the locked state is essential for cancellation safety.
     revoked: bool,
-    last_refresh_status: Option<u16>,
-    prefix_only: bool,
-    config_retry_after: SystemTime,
+}
+
+impl State {
+    fn publish_table(&mut self, set: CredentialSet) {
+        self.snapshot = Snapshot::Table(set);
+        self.revoked = false;
+        if let Refresh::Backoff { status, .. } = &mut self.refresh {
+            *status = None;
+        }
+    }
+
+    fn reset_retry(&mut self) {
+        self.refresh = Refresh::Ready;
+    }
+
+    fn start_refresh(&mut self, now: SystemTime) {
+        self.refresh = Refresh::Backoff {
+            until: now + RETRY_DELAY,
+            status: None,
+        };
+    }
+
+    fn is_backing_off(&self, now: SystemTime) -> bool {
+        matches!(self.refresh, Refresh::Backoff { until, .. } if now < until)
+    }
+
+    fn status(&self) -> Option<u16> {
+        match self.refresh {
+            Refresh::Backoff { status, .. } => status,
+            Refresh::Ready => None,
+        }
+    }
+
+    fn rejected(&mut self, status: StatusCode) {
+        if let Refresh::Backoff { status: last, .. } = &mut self.refresh {
+            *last = Some(status.as_u16());
+        }
+        self.revoked |= matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        );
+    }
+
+    fn publish_prefixes(&mut self, set: CredentialSet) {
+        self.snapshot = Snapshot::Prefixes {
+            set,
+            config_retry_after: UNIX_EPOCH,
+        };
+        self.revoked = false;
+    }
+
+    fn start_config_refresh(&mut self) {
+        if let Snapshot::Prefixes {
+            config_retry_after, ..
+        } = &mut self.snapshot
+        {
+            *config_retry_after = SystemTime::now() + RETRY_DELAY;
+        }
+    }
+
+    fn config_refresh_ready(&self, location: &Url, now: SystemTime) -> bool {
+        !self.revoked
+            && self.snapshot.needs_config(location)
+            && matches!(&self.snapshot, Snapshot::Prefixes { config_retry_after, .. } if now >= *config_retry_after)
+    }
+
+    fn finish_refresh(&mut self) {
+        let until = SystemTime::now() + RETRY_DELAY;
+        self.refresh = Refresh::Backoff {
+            until,
+            status: self.status(),
+        };
+        if let Snapshot::Prefixes {
+            config_retry_after, ..
+        } = &mut self.snapshot
+            && *config_retry_after != UNIX_EPOCH
+        {
+            *config_retry_after = until;
+        }
+    }
 }
 
 pub(crate) struct RestVendedCredentialProvider {
     client: Arc<HttpClient>,
-    table_url: String,
     state: Mutex<State>,
+}
+
+/// Serializes rename with credential refresh without holding the registry lock.
+pub(crate) struct CredentialRenameGuard<'a>(tokio::sync::MutexGuard<'a, State>);
+
+impl CredentialRenameGuard<'_> {
+    pub(crate) fn relocate(&mut self, table_url: String) {
+        self.0.table_url = table_url;
+        self.0.reset_retry();
+    }
 }
 
 impl std::fmt::Debug for RestVendedCredentialProvider {
@@ -255,12 +431,12 @@ impl RestVendedCredentialProvider {
     /// Feed newer load/commit credentials to all existing handles.
     pub(crate) async fn update(&self, set: CredentialSet) {
         let mut state = self.state.lock().await;
-        state.set = set;
-        state.retry_after = UNIX_EPOCH;
-        state.revoked = false;
-        state.last_refresh_status = None;
-        state.prefix_only = false;
-        state.config_retry_after = UNIX_EPOCH;
+        state.publish_table(set);
+        state.reset_retry();
+    }
+
+    pub(crate) async fn begin_rename(&self) -> CredentialRenameGuard<'_> {
+        CredentialRenameGuard(self.state.lock().await)
     }
 
     pub(crate) fn new(
@@ -271,27 +447,27 @@ impl RestVendedCredentialProvider {
     ) -> Self {
         Self {
             client,
-            table_url,
             state: Mutex::new(State {
-                set,
-                endpoint,
-                retry_after: UNIX_EPOCH,
+                table_url,
+                snapshot: Snapshot::Table(set),
+                endpoint: match endpoint {
+                    Some(true) => CredentialEndpoint::Supported,
+                    Some(false) => CredentialEndpoint::Legacy,
+                    None => CredentialEndpoint::Unknown,
+                },
+                refresh: Refresh::Ready,
                 revoked: false,
-                last_refresh_status: None,
-                prefix_only: false,
-                config_retry_after: UNIX_EPOCH,
             }),
         }
     }
 
-    async fn fetch(&self, state: &mut State, location: &Url) -> Result<CredentialSet> {
+    async fn fetch(&self, state: &mut State, location: &Url) -> Result<()> {
         // A recent /credentials response already refreshed the prefix entries.
         // An uncovered location needs only loadTable's missing flat config.
-        let needs_config =
-            !state.revoked && state.prefix_only && state.set.matched_entry(location).is_none();
-        if state.endpoint != Some(false) && !needs_config {
+        let needs_config = !state.revoked && state.snapshot.needs_config(location);
+        if state.endpoint != CredentialEndpoint::Legacy && !needs_config {
             let response = self
-                .request(format!("{}/credentials", self.table_url), state)
+                .request(format!("{}/credentials", state.table_url), state)
                 .await?;
             match response.status() {
                 StatusCode::OK => {
@@ -304,38 +480,35 @@ impl RestVendedCredentialProvider {
                         .json()
                         .await
                         .map_err(|_| invalid("Invalid REST storage credential response"))?;
-                    state.endpoint = Some(true);
+                    state.endpoint = CredentialEndpoint::Supported;
                     let set = CredentialSet::new(HashMap::new(), Some(response.credentials));
-                    state.prefix_only = true;
-                    state.config_retry_after = UNIX_EPOCH;
-                    if set.matched_entry(location).is_some() {
+
+                    let matched = set.matched_entry(location).is_some();
+                    state.publish_prefixes(set);
+                    if matched {
                         // A matched but malformed/expired entry must not fall
                         // back to a broader loadTable config credential.
-                        return Ok(set);
+                        return Ok(());
                     }
-                    // /credentials contains no flat config. Publish the new
-                    // scopes before awaiting loadTable so a failure or cancelled
-                    // fallback cannot resurrect credentials the catalog removed.
-                    state.set = set;
-                    state.revoked = false;
+                    // Published scopes remain authoritative if loadTable fails.
                 }
                 StatusCode::NOT_FOUND
                 | StatusCode::METHOD_NOT_ALLOWED
                 | StatusCode::NOT_IMPLEMENTED
-                    if state.endpoint.is_none() =>
+                    if state.endpoint == CredentialEndpoint::Unknown =>
                 {
                     // Legacy server: confirm access with loadTable. Never fall
                     // back to local credentials based on a 404 alone.
                     // Persist the pending confirmation before awaiting loadTable,
                     // including if that request fails, times out, or is cancelled.
                     state.revoked |= response.status() == StatusCode::NOT_FOUND;
-                    state.endpoint = Some(false);
+                    state.endpoint = CredentialEndpoint::Legacy;
                 }
                 status => return Err(Self::response_error(state, status)),
             }
         }
-        state.config_retry_after = SystemTime::now() + RETRY_DELAY;
-        let response = self.request(self.table_url.clone(), state).await?;
+        state.start_config_refresh();
+        let response = self.request(state.table_url.clone(), state).await?;
         if response.status() != StatusCode::OK {
             return Err(Self::response_error(state, response.status()));
         }
@@ -343,12 +516,11 @@ impl RestVendedCredentialProvider {
             .json()
             .await
             .map_err(|_| invalid("Invalid REST table credential response"))?;
-        state.prefix_only = false;
-        state.config_retry_after = UNIX_EPOCH;
-        Ok(CredentialSet::new(
+        state.publish_table(CredentialSet::new(
             response.config,
             response.storage_credentials,
-        ))
+        ));
+        Ok(())
     }
 
     async fn request(&self, url: String, state: &mut State) -> Result<reqwest::Response> {
@@ -380,14 +552,8 @@ impl RestVendedCredentialProvider {
     }
 
     fn response_error(state: &mut State, status: StatusCode) -> Error {
-        state.last_refresh_status = Some(status.as_u16());
         // Don't expose response bodies, which may contain credential material.
-        if matches!(
-            status,
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-        ) {
-            state.revoked = true;
-        }
+        state.rejected(status);
         Error::new(
             ErrorKind::Unexpected,
             "REST storage credential refresh rejected",
@@ -407,11 +573,6 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
                 "s3" | "s3a" | "s3n" | "abfs" | "abfss" | "wasb" | "wasbs"
             )
         })
-    }
-
-    async fn load_credential(&self, location: &str) -> Result<IoStorageCredential> {
-        self.load_credential_with_minimum_validity(location, Duration::ZERO)
-            .await
     }
 
     async fn load_credential_with_minimum_validity(
@@ -436,26 +597,24 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
         if !state.revoked
             && let Ok(credential) =
                 state
-                    .set
+                    .snapshot
+                    .set()
                     .load_credential(&location, now, true, minimum_validity)
         {
             return Ok(credential);
         }
-        let config_refresh_ready = !state.revoked
-            && state.prefix_only
-            && state.set.matched_entry(&location).is_none()
-            && now >= state.config_retry_after;
-        if now < state.retry_after && !config_refresh_ready {
+        if state.is_backing_off(now) && !state.config_refresh_ready(&location, now) {
             let result = if state.revoked {
                 Err(invalid("Vended storage access was revoked")
                     .with_context("credential_error", "revoked"))
             } else {
                 state
-                    .set
+                    .snapshot
+                    .set()
                     .load_credential(&location, now, false, minimum_validity)
             };
             return result.map_err(|error| {
-                if let Some(status) = state.last_refresh_status {
+                if let Some(status) = state.status() {
                     error
                         .with_context("status", status.to_string())
                         .with_context("credential_error", "refresh_backoff")
@@ -465,26 +624,24 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
                 }
             });
         }
-        state.retry_after = now + RETRY_DELAY;
-        state.last_refresh_status = None;
+        state.start_refresh(now);
         let refreshed = self.fetch(&mut state, &location).await;
-        state.retry_after = SystemTime::now() + RETRY_DELAY;
-        if state.config_retry_after != UNIX_EPOCH {
-            state.config_retry_after = state.retry_after;
-        }
+        state.finish_refresh();
         match refreshed {
-            Ok(set) => {
+            Ok(()) => {
                 // Even an empty/narrower successful response replaces the old
                 // authorization. Never resurrect an old prefix during backoff.
-                state.set = set;
                 state.revoked = false;
-                state
-                    .set
-                    .load_credential(&location, SystemTime::now(), false, minimum_validity)
+                state.snapshot.set().load_credential(
+                    &location,
+                    SystemTime::now(),
+                    false,
+                    minimum_validity,
+                )
             }
             Err(error) => {
                 if !state.revoked
-                    && let Ok(credential) = state.set.load_credential(
+                    && let Ok(credential) = state.snapshot.set().load_credential(
                         &location,
                         SystemTime::now(),
                         false,
@@ -526,7 +683,10 @@ impl TestCredentialExt for ParsedCredential {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::io::{ADLS_ACCOUNT_KEY, ADLS_ENDPOINT, FileIO, FileIOBuilder, StorageFactory};
+    use iceberg::io::{
+        ADLS_ACCOUNT_KEY, ADLS_ENDPOINT, FileIO, FileIOBuilder, StorageFactory,
+        storage_prefix_covers,
+    };
     use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
     use mockito::{Matcher, Server};
     use serde_json::json;
@@ -716,8 +876,9 @@ mod tests {
                 let refresh = if generation > 0 {
                     // Expire the manager's lease deterministically, without sleeps.
                     let mut state = provider.state.lock().await;
-                    state.set.issued_at = SystemTime::now() - LEASE - Duration::from_secs(1);
-                    state.retry_after = UNIX_EPOCH;
+                    state.snapshot.set_mut().issued_at =
+                        SystemTime::now() - LEASE - Duration::from_secs(1);
+                    state.reset_retry();
                     drop(state);
                     Some(catalog.mock("GET", "/table/credentials")
                         .match_header("X-Iceberg-Access-Delegation", "vended-credentials")
@@ -1147,7 +1308,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        provider.state.lock().await.retry_after = UNIX_EPOCH;
+        provider.state.lock().await.reset_retry();
         assert_eq!(
             provider
                 .load_credential(LOCATION)
@@ -1214,7 +1375,8 @@ mod tests {
         let state = provider.state.lock().await;
         assert!(
             state
-                .set
+                .snapshot
+                .set()
                 .load_credential(
                     &Url::parse(LOCATION).unwrap(),
                     SystemTime::now(),
@@ -1311,7 +1473,7 @@ mod tests {
             .await;
         let provider = provider(&server, expiring_set(), Some(true));
         assert!(provider.load_credential(LOCATION).await.is_ok());
-        provider.state.lock().await.set =
+        *provider.state.lock().await.snapshot.set_mut() =
             CredentialSet::new(config("sig=expired&se=2000-01-01T00:00:00Z"), None);
         assert!(provider.load_credential(LOCATION).await.is_err());
         failure.assert_async().await;
@@ -1355,7 +1517,7 @@ mod tests {
                 .await;
             let file = io.new_input(outside).unwrap();
             assert_eq!(file.read().await.unwrap().as_ref(), b"old");
-            provider.state.lock().await.set.issued_at = SystemTime::now() - LEASE;
+            provider.state.lock().await.snapshot.set_mut().issued_at = SystemTime::now() - LEASE;
             let entries = json!([{"prefix": root, "config": config("sig=scoped")}]);
             let refresh = catalog
                 .mock("GET", "/table/credentials")

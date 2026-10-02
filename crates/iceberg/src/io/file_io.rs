@@ -134,7 +134,7 @@ impl FileIO {
         let storage = match &self.credential_provider {
             Some(provider) => self
                 .factory
-                .build_with_credentials(&self.config, Some(provider.0.clone()))?,
+                .build_with_credentials(&self.config, provider.0.clone())?,
             None => self.factory.build(&self.config)?,
         };
 

@@ -147,7 +147,9 @@ fn http_status(value: &str) -> Option<u16> {
 }
 
 #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
-pub(crate) use credential_errors::{clear_credential_failure, credential_provider_error};
+pub(crate) use credential_errors::{
+    clear_credential_failure, credential_discovery_error, credential_provider_error,
+};
 
 #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
 mod credential_errors {
@@ -205,7 +207,7 @@ mod credential_errors {
 
     impl std::error::Error for CredentialFailure {}
 
-    pub(crate) fn credential_provider_error(error: iceberg::Error) -> reqsign_core::Error {
+    fn failure_from_error(error: &iceberg::Error) -> CredentialFailure {
         let status = error
             .context()
             .iter()
@@ -224,12 +226,24 @@ mod credential_errors {
                 _ => None,
             })
             .unwrap_or("provider_failed");
-        let failure = CredentialFailure {
+        CredentialFailure {
             kind: error.kind(),
             status,
             reason,
             retryable: error.retryable(),
-        };
+        }
+    }
+
+    pub(crate) fn credential_discovery_error(error: iceberg::Error) -> iceberg::Error {
+        let failure = failure_from_error(&error);
+        with_failure(
+            iceberg::Error::new(error.kind(), "Unable to obtain storage credentials"),
+            failure,
+        )
+    }
+
+    pub(crate) fn credential_provider_error(error: iceberg::Error) -> reqsign_core::Error {
+        let failure = failure_from_error(&error);
         let _ = FAILURE.try_with(|slot| *slot.borrow_mut() = Some(failure));
         reqsign_core::Error::credential_invalid("Unable to obtain storage credentials")
             .set_retryable(error.retryable())

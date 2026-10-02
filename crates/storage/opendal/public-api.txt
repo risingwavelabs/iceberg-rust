@@ -4,9 +4,6 @@ pub iceberg_storage_opendal::OpenDalStorage::Azblob
 pub iceberg_storage_opendal::OpenDalStorage::Azblob::config: alloc::sync::Arc<opendal_service_azblob::config::AzblobConfig>
 pub iceberg_storage_opendal::OpenDalStorage::Azdls
 pub iceberg_storage_opendal::OpenDalStorage::Azdls::config: alloc::sync::Arc<opendal_service_azdls::config::AzdlsConfig>
-pub iceberg_storage_opendal::OpenDalStorage::Credentialed
-pub iceberg_storage_opendal::OpenDalStorage::Credentialed::provider: iceberg::io::credentials::CredentialProvider
-pub iceberg_storage_opendal::OpenDalStorage::Credentialed::storage: alloc::boxed::Box<iceberg_storage_opendal::OpenDalStorage>
 pub iceberg_storage_opendal::OpenDalStorage::Gcs
 pub iceberg_storage_opendal::OpenDalStorage::Gcs::config: alloc::sync::Arc<opendal_service_gcs::config::GcsConfig>
 pub iceberg_storage_opendal::OpenDalStorage::Hf
@@ -21,19 +18,6 @@ impl core::clone::Clone for iceberg_storage_opendal::OpenDalStorage
 pub fn iceberg_storage_opendal::OpenDalStorage::clone(&self) -> iceberg_storage_opendal::OpenDalStorage
 impl core::fmt::Debug for iceberg_storage_opendal::OpenDalStorage
 pub fn iceberg_storage_opendal::OpenDalStorage::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl iceberg::io::storage::Storage for iceberg_storage_opendal::OpenDalStorage
-pub fn iceberg_storage_opendal::OpenDalStorage::delete<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::delete_prefix<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::delete_stream<'life0, 'async_trait>(&'life0 self, paths: futures_core::stream::BoxStream<'static, alloc::string::String>) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::exists<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<bool>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::list<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str, recursive: bool) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<futures_core::stream::BoxStream<'static, iceberg::error::Result<iceberg::io::file_io::ListEntry>>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::metadata<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<iceberg::io::file_io::FileMetadata>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::new_input(&self, path: &str) -> iceberg::error::Result<iceberg::io::file_io::InputFile>
-pub fn iceberg_storage_opendal::OpenDalStorage::new_output(&self, path: &str) -> iceberg::error::Result<iceberg::io::file_io::OutputFile>
-pub fn iceberg_storage_opendal::OpenDalStorage::read<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<bytes::bytes::Bytes>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::reader<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<alloc::boxed::Box<dyn iceberg::io::file_io::FileRead>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::write<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str, bs: bytes::bytes::Bytes) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
-pub fn iceberg_storage_opendal::OpenDalStorage::writer<'life0, 'life1, 'async_trait>(&'life0 self, path: &'life1 str) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::error::Result<alloc::boxed::Box<dyn iceberg::io::file_io::FileWrite>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalStorage
 pub fn iceberg_storage_opendal::OpenDalStorage::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalStorage
@@ -69,7 +53,7 @@ impl core::fmt::Debug for iceberg_storage_opendal::OpenDalResolvingStorageFactor
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl iceberg::io::storage::StorageFactory for iceberg_storage_opendal::OpenDalResolvingStorageFactory
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::build(&self, config: &iceberg::io::storage::config::StorageConfig) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
-pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::build_with_credentials(&self, config: &iceberg::io::storage::config::StorageConfig, credential_provider: core::option::Option<alloc::sync::Arc<dyn iceberg::io::credentials::StorageCredentialProvider>>) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
+pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::build_with_credentials(&self, config: &iceberg::io::storage::config::StorageConfig, credential_provider: alloc::sync::Arc<dyn iceberg::io::credentials::StorageCredentialProvider>) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
 impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalResolvingStorageFactory
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalResolvingStorageFactory
@@ -90,7 +74,7 @@ impl core::fmt::Debug for iceberg_storage_opendal::OpenDalStorageFactory
 pub fn iceberg_storage_opendal::OpenDalStorageFactory::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl iceberg::io::storage::StorageFactory for iceberg_storage_opendal::OpenDalStorageFactory
 pub fn iceberg_storage_opendal::OpenDalStorageFactory::build(&self, config: &iceberg::io::storage::config::StorageConfig) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
-pub fn iceberg_storage_opendal::OpenDalStorageFactory::build_with_credentials(&self, config: &iceberg::io::storage::config::StorageConfig, credential_provider: core::option::Option<alloc::sync::Arc<dyn iceberg::io::credentials::StorageCredentialProvider>>) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
+pub fn iceberg_storage_opendal::OpenDalStorageFactory::build_with_credentials(&self, config: &iceberg::io::storage::config::StorageConfig, credential_provider: alloc::sync::Arc<dyn iceberg::io::credentials::StorageCredentialProvider>) -> iceberg::error::Result<alloc::sync::Arc<dyn iceberg::io::storage::Storage>>
 impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalStorageFactory
 pub fn iceberg_storage_opendal::OpenDalStorageFactory::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalStorageFactory

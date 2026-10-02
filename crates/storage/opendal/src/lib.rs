@@ -17,10 +17,9 @@
 
 //! OpenDAL-based storage implementation for Apache Iceberg.
 //!
-//! This crate provides [`OpenDalStorage`] and [`OpenDalStorageFactory`],
-//! which implement the [`Storage`](Storage) and
-//! [`StorageFactory`](StorageFactory) traits from the `iceberg` crate
-//! using [OpenDAL](https://opendal.apache.org/) as the backend.
+//! [`OpenDalStorageFactory`] implements Iceberg's [`StorageFactory`] using
+//! [OpenDAL](https://opendal.apache.org/). [`OpenDalStorage`] describes backend
+//! configuration; factories create the configured [`Storage`] instances.
 
 mod utils;
 
@@ -264,6 +263,16 @@ const OPERATOR_CACHE_CAPACITY: usize = 64;
 /// Bound in-flight deletes when credentials must be checked for each file.
 pub(crate) const CREDENTIALED_DELETE_CONCURRENCY: usize = 32;
 
+#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+fn credentialed_delete_batch_size(capability: opendal::Capability) -> usize {
+    // Bound queued paths independently of a service's maximum request size.
+    const CREDENTIALED_DELETE_BUFFER_SIZE: usize = 1024;
+    capability
+        .delete_max_size
+        .unwrap_or(1)
+        .clamp(1, CREDENTIALED_DELETE_BUFFER_SIZE)
+}
+
 /// Keep bulk deletion within one backend resource and selected credential scope.
 #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
 #[derive(PartialEq, Eq, Hash)]
@@ -406,7 +415,7 @@ fn default_operator_cache() -> SharedOperatorCache {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConfiguredOpenDalStorage {
-    storage: OpenDalStorage,
+    storage: RuntimeStorage,
     options: OpenDalStorageOptions,
     /// Shared factory-owned cache for fully configured S3, GCS and ADLS operators.
     #[serde(skip, default = "default_operator_cache")]
@@ -420,7 +429,7 @@ impl ConfiguredOpenDalStorage {
         operator_cache: SharedOperatorCache,
     ) -> Result<Self> {
         Ok(Self {
-            storage,
+            storage: RuntimeStorage::new(storage),
             options: OpenDalStorageOptions::try_from(config)?,
             operator_cache,
         })
@@ -587,15 +596,10 @@ impl StorageFactory for OpenDalStorageFactory {
     fn build_with_credentials(
         &self,
         config: &StorageConfig,
-        credential_provider: Option<Arc<dyn iceberg::io::StorageCredentialProvider>>,
+        credential_provider: Arc<dyn iceberg::io::StorageCredentialProvider>,
     ) -> Result<Arc<dyn Storage>> {
         let mut storage = self.build_configured(config)?;
-        if let Some(provider) = credential_provider {
-            storage.storage = OpenDalStorage::Credentialed {
-                storage: Box::new(storage.storage),
-                provider: CredentialProvider(provider),
-            };
-        }
+        storage.storage.provider = Some(CredentialProvider(credential_provider));
         Ok(Arc::new(storage))
     }
 }
@@ -606,16 +610,9 @@ fn default_memory_operator() -> Operator {
     memory_config_build().expect("Failed to create default memory operator")
 }
 
-/// OpenDAL-based storage implementation.
+/// OpenDAL backend configuration. Create storage through a storage factory.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorage {
-    /// Storage whose authentication is supplied at request time.
-    Credentialed {
-        /// Backend configuration, excluding the runtime credentials.
-        storage: Box<OpenDalStorage>,
-        /// Shared provider. Serialization deliberately fails rather than dropping it.
-        provider: CredentialProvider,
-    },
     /// Memory storage variant.
     #[cfg(feature = "opendal-memory")]
     Memory(#[serde(skip, default = "self::default_memory_operator")] Operator),
@@ -672,13 +669,33 @@ pub enum OpenDalStorage {
     },
 }
 
-impl OpenDalStorage {
+/// Request-time policy keeps backend configuration separate from authentication.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RuntimeStorage {
+    backend: OpenDalStorage,
+    provider: Option<CredentialProvider>,
+}
+
+impl RuntimeStorage {
+    fn new(backend: OpenDalStorage) -> Self {
+        Self {
+            backend,
+            provider: None,
+        }
+    }
+
+    fn provider_for(&self, path: &str) -> Option<&CredentialProvider> {
+        self.provider
+            .as_ref()
+            .filter(|provider| provider.0.supports_path(path))
+    }
+
     fn io_error(&self, error: opendal::Error) -> Error {
-        utils::credential_io_error(error, matches!(self, Self::Credentialed { .. }))
+        utils::credential_io_error(error, self.provider.is_some())
     }
 
     async fn io<T>(&self, future: impl Future<Output = opendal::Result<T>>) -> Result<T> {
-        utils::credential_io(future, matches!(self, Self::Credentialed { .. })).await
+        utils::credential_io(future, self.provider.is_some()).await
     }
 
     #[allow(unreachable_patterns)]
@@ -687,16 +704,7 @@ impl OpenDalStorage {
         path: &str,
         options: &OpenDalStorageOptions,
     ) -> Result<Option<OperatorCacheKey>> {
-        if let Self::Credentialed { storage, provider } = self {
-            if !provider.0.supports_path(path) {
-                return storage.operator_cache_key(path, options);
-            }
-            return Ok(storage.operator_cache_key(path, options)?.map(|mut key| {
-                key.credentials = Some((provider.clone(), path.to_string()));
-                key
-            }));
-        }
-        let backend_config = match self {
+        let backend_config = match &self.backend {
             #[cfg(feature = "opendal-s3")]
             OpenDalStorage::S3 { config, .. } => OperatorBackendConfig::S3(config.clone()),
             #[cfg(feature = "opendal-gcs")]
@@ -734,7 +742,9 @@ impl OpenDalStorage {
             backend_config,
             bucket,
             layer_options: options.into(),
-            credentials: None,
+            credentials: self
+                .provider_for(path)
+                .map(|provider| (provider.clone(), path.to_string())),
         }))
     }
 
@@ -780,29 +790,29 @@ impl OpenDalStorage {
         path: &'a str,
         options: &OpenDalStorageOptions,
     ) -> Result<(Operator, &'a str)> {
-        if let Self::Credentialed { storage, provider } = self
-            && !provider.0.supports_path(path)
-        {
-            return storage.build_operator_with_options(path, options);
-        }
-        let (operator, relative_path): (Operator, &str) = match self {
-            Self::Credentialed { storage, provider } => match storage.as_ref() {
-                #[cfg(feature = "opendal-azdls")]
-                Self::Azdls { config } => {
-                    azdls_create_operator_with_credentials(path, config, Some(provider))?
-                }
-                #[cfg(feature = "opendal-s3")]
-                Self::S3 { config, .. } => {
-                    let operator = s3_config_build(config, path, Some(provider))?;
-                    (operator, storage.relativize_path(path)?)
-                }
-                _ => {
-                    return Err(Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        "Runtime credentials are unsupported for this storage backend",
-                    ));
-                }
-            },
+        let provider = self.provider_for(path);
+        let (operator, relative_path): (Operator, &str) = match &self.backend {
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorage::S3 { config } => {
+                let operator = s3_config_build(config, path, provider)?;
+                (operator, self.relativize_path(path)?)
+            }
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config, provider)?,
+            #[cfg(any(
+                feature = "opendal-memory",
+                feature = "opendal-fs",
+                feature = "opendal-gcs",
+                feature = "opendal-oss",
+                feature = "opendal-azblob",
+                feature = "opendal-hf",
+            ))]
+            _ if provider.is_some() => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "Runtime credentials are unsupported for this storage backend",
+                ));
+            }
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
@@ -818,29 +828,6 @@ impl OpenDalStorage {
                     (op, stripped)
                 } else {
                     (op, &path[1..])
-                }
-            }
-            #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 { config } => {
-                let op = s3_config_build(config, path, None)?;
-                let op_info = op.info();
-
-                // Use the URL scheme in the path for prefix matching. This enables
-                // use of S3-compatible storage backends using custom schemes (e.g., `minio://`, `r2://`).
-                let url = url::Url::parse(path).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid s3 url: {path}: {e}"),
-                    )
-                })?;
-                let prefix = format!("{}://{}/", url.scheme(), op_info.name());
-                if path.starts_with(&prefix) {
-                    (op, &path[prefix.len()..])
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid s3 url: {path}, should start with {prefix}"),
-                    ));
                 }
             }
             #[cfg(feature = "opendal-gcs")]
@@ -869,8 +856,6 @@ impl OpenDalStorage {
                     ));
                 }
             }
-            #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config)?,
             #[cfg(feature = "opendal-azblob")]
             OpenDalStorage::Azblob { config } => {
                 let operator = azblob_config_build(config, path)?;
@@ -886,15 +871,16 @@ impl OpenDalStorage {
             }
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { config } => hf_config_build(config, path)?,
-            #[cfg(all(
-                not(feature = "opendal-s3"),
-                not(feature = "opendal-fs"),
-                not(feature = "opendal-gcs"),
-                not(feature = "opendal-oss"),
-                not(feature = "opendal-azdls"),
-                not(feature = "opendal-azblob"),
-                not(feature = "opendal-hf"),
-            ))]
+            #[cfg(not(any(
+                feature = "opendal-memory",
+                feature = "opendal-fs",
+                feature = "opendal-s3",
+                feature = "opendal-gcs",
+                feature = "opendal-oss",
+                feature = "opendal-azdls",
+                feature = "opendal-azblob",
+                feature = "opendal-hf",
+            )))]
             _ => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
@@ -946,12 +932,9 @@ impl OpenDalStorage {
     }
 
     fn uses_append_mode(&self) -> bool {
-        if let Self::Credentialed { storage, .. } = self {
-            return storage.uses_append_mode();
-        }
         #[cfg(feature = "opendal-azdls")]
         {
-            matches!(self, OpenDalStorage::Azdls { .. })
+            matches!(&self.backend, OpenDalStorage::Azdls { .. })
         }
         #[cfg(not(feature = "opendal-azdls"))]
         {
@@ -964,8 +947,7 @@ impl OpenDalStorage {
     /// For most backends the URL host (bucket name) is sufficient. For HF the host
     /// encodes the repo type, not the repo identity, so a more specific key is used.
     fn batch_key_for_path(&self, path: &str) -> String {
-        match self {
-            Self::Credentialed { .. } => path.to_string(),
+        match &self.backend {
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { .. } => hf_batch_key(path),
             _ => url::Url::parse(path)
@@ -981,8 +963,7 @@ impl OpenDalStorage {
     /// only the relative path is needed, such as for grouped bulk deletes.
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn relativize_path<'a>(&self, path: &'a str) -> Result<&'a str> {
-        match self {
-            Self::Credentialed { storage, .. } => storage.relativize_path(path),
+        match &self.backend {
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-fs")]
@@ -1076,19 +1057,22 @@ impl OpenDalStorage {
                 })?;
                 Ok(&path[path.len() - parsed.path.len()..])
             }
-            #[cfg(all(
-                not(feature = "opendal-s3"),
-                not(feature = "opendal-fs"),
-                not(feature = "opendal-gcs"),
-                not(feature = "opendal-oss"),
-                not(feature = "opendal-azdls"),
-                not(feature = "opendal-azblob"),
-                not(feature = "opendal-hf"),
-            ))]
-            _ => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "No storage service has been enabled",
-            )),
+            #[cfg(not(any(
+                feature = "opendal-memory",
+                feature = "opendal-fs",
+                feature = "opendal-s3",
+                feature = "opendal-gcs",
+                feature = "opendal-oss",
+                feature = "opendal-azdls",
+                feature = "opendal-azblob",
+                feature = "opendal-hf",
+            )))]
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "No storage service has been enabled",
+                ));
+            }
         }
     }
 
@@ -1138,7 +1122,7 @@ impl OpenDalStorage {
             self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(Box::new(OpenDalReader(
             self.io(operator.reader(relative_path)).await?,
-            matches!(self, Self::Credentialed { .. }),
+            self.provider.is_some(),
         )))
     }
 
@@ -1173,7 +1157,7 @@ impl OpenDalStorage {
         }
         Ok(Box::new(OpenDalWriter(
             self.io(async { writer.await }).await?,
-            matches!(self, Self::Credentialed { .. }),
+            self.provider.is_some(),
         )))
     }
 
@@ -1195,7 +1179,7 @@ impl OpenDalStorage {
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
         let path = directory_path(path);
-        if matches!(self, Self::Credentialed { .. }) {
+        if self.provider.is_some() {
             // A parent-directory signer cannot authorize every nested scope.
             // List with the parent's grant, then re-select each deletion path.
             let mut entries = self
@@ -1249,19 +1233,16 @@ impl OpenDalStorage {
         options: &OpenDalStorageOptions,
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
-        if matches!(self, Self::Credentialed { .. }) {
+        if self.provider.is_some() {
             #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
             return self
                 .delete_credentialed_stream(paths, options, operator_cache)
                 .await;
             #[cfg(not(any(feature = "opendal-s3", feature = "opendal-azdls")))]
-            return paths
-                .map(Ok)
-                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
-                    self.delete_with_options(&path, options, operator_cache)
-                        .await
-                })
-                .await;
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Runtime credentials are unsupported for this storage backend",
+            ));
         }
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
@@ -1294,49 +1275,85 @@ impl OpenDalStorage {
     #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
     async fn delete_credentialed_stream(
         &self,
-        paths: BoxStream<'static, String>,
+        mut paths: BoxStream<'static, String>,
         options: &OpenDalStorageOptions,
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
-        let Self::Credentialed { storage, provider } = self else {
-            unreachable!("only credentialed storage uses scoped deletion");
+        let provider = self.provider.as_ref().expect("credentialed deletion");
+        let Some(first) = paths.next().await else {
+            return Ok(());
         };
-        // Bound queued keys, operator count and signer validation work. S3 can
-        // send up to 1000 keys in one request; other backends use their deleter.
-        let batch_size = match storage.as_ref() {
-            #[cfg(feature = "opendal-s3")]
-            Self::S3 { .. } => 1000,
-            _ => CREDENTIALED_DELETE_CONCURRENCY,
+        // Construction binds only the first path and performs no credential
+        // load or HTTP request. Inspect the service capability before attaching
+        // any batch signer; single-file requests must not validate whole batches.
+        let batch_size = {
+            let (operator, _) = self.create_operator_with_options(&first, options, None)?;
+            credentialed_delete_batch_size(operator.info().capability())
         };
+        let paths = futures::stream::iter([first]).chain(paths).boxed();
+        let storage = Self {
+            backend: self.backend.clone(),
+            provider: None,
+        };
+        if batch_size <= 1 {
+            let mut chunks = paths.chunks(CREDENTIALED_DELETE_CONCURRENCY);
+            while let Some(paths) = chunks.next().await {
+                let (delegated, static_paths): (Vec<_>, Vec<_>) = paths
+                    .into_iter()
+                    .partition(|path| provider.0.supports_path(path));
+                if !static_paths.is_empty() {
+                    Box::pin(storage.delete_stream_with_options(
+                        futures::stream::iter(static_paths).boxed(),
+                        options,
+                        operator_cache,
+                    ))
+                    .await?;
+                }
+                futures::stream::iter(delegated.into_iter().map(Ok))
+                    .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
+                        // Do not retain one-use, per-file deletion signers.
+                        self.delete_with_options(&path, options, None).await
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
         let mut chunks = paths.chunks(batch_size);
         while let Some(paths) = chunks.next().await {
             let matched: Vec<_> = futures::stream::iter(paths)
-                .map(|path| async move {
-                    storage.relativize_path(&path)?;
-                    if !provider.0.supports_path(&path) {
-                        return Ok((
-                            storage.batch_key_for_path(&path),
-                            DeleteCredentialScope::Static,
-                            path,
-                        ));
+                .map(|path| {
+                    let storage = &storage;
+                    async move {
+                        storage.relativize_path(&path)?;
+                        if !provider.0.supports_path(&path) {
+                            return Ok((
+                                storage.batch_key_for_path(&path),
+                                DeleteCredentialScope::Static,
+                                path,
+                            ));
+                        }
+                        let credential = provider
+                            .0
+                            .load_credential(&path)
+                            .await
+                            .map_err(utils::credential_discovery_error)?;
+                        if !credential.covers(&path) {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Storage credential does not cover deletion path",
+                            ));
+                        }
+                        let bucket = storage
+                            .operator_cache_key(&path, options)?
+                            .map(|key| key.bucket)
+                            .unwrap_or_else(|| storage.batch_key_for_path(&path));
+                        let scope = credential
+                            .prefix()
+                            .map_or(DeleteCredentialScope::PerPath, |prefix| {
+                                DeleteCredentialScope::Prefix(prefix.to_string())
+                            });
+                        Ok((bucket, scope, path))
                     }
-                    let credential = provider.0.load_credential(&path).await?;
-                    if !credential.covers(&path) {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Storage credential does not cover deletion path",
-                        ));
-                    }
-                    let bucket = storage
-                        .operator_cache_key(&path, options)?
-                        .map(|key| key.bucket)
-                        .unwrap_or_else(|| storage.batch_key_for_path(&path));
-                    let scope = credential
-                        .prefix()
-                        .map_or(DeleteCredentialScope::PerPath, |prefix| {
-                            DeleteCredentialScope::Prefix(prefix.to_string())
-                        });
-                    Ok((bucket, scope, path))
                 })
                 .buffer_unordered(CREDENTIALED_DELETE_CONCURRENCY)
                 .try_collect()
@@ -1374,42 +1391,48 @@ impl OpenDalStorage {
                 })
                 .await?;
             futures::stream::iter(groups.into_iter().map(Ok))
-                .try_for_each_concurrent(
-                    CREDENTIALED_DELETE_CONCURRENCY,
-                    |(key, paths)| async move {
-                        let batch_storage = Self::Credentialed {
-                            storage: storage.clone(),
-                            provider: credentials::BatchCredential::provider(
-                                provider.clone(),
-                                key.credential_location,
-                                paths.clone(),
-                            ),
+                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |(key, paths)| {
+                    let storage = &storage;
+                    async move {
+                        // Capabilities belong to the actual operator, which can
+                        // differ between storage locations. Recheck each group.
+                        let batch_size = {
+                            let (operator, _) =
+                                self.create_operator_with_options(&paths[0], options, None)?;
+                            credentialed_delete_batch_size(operator.info().capability())
                         };
-                        // Do not cache a signer carrying this batch's file list.
-                        // One operator serves the entire bucket/scope group.
-                        let (operator, _) =
-                            batch_storage.create_operator_with_options(&paths[0], options, None)?;
-                        if operator.info().capability().delete_max_size.unwrap_or(1) <= 1 {
-                            // ADLS has no server-side batch delete. Share the
-                            // scope-local operator but bound concurrent requests.
+                        if batch_size <= 1 {
                             return futures::stream::iter(paths.into_iter().map(Ok))
-                                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| {
-                                    let operator = operator.clone();
-                                    async move {
-                                        self.io(operator.delete(storage.relativize_path(&path)?))
-                                            .await
-                                    }
-                                })
+                                .try_for_each_concurrent(
+                                    CREDENTIALED_DELETE_CONCURRENCY,
+                                    |path| async move {
+                                        self.delete_with_options(&path, options, None).await
+                                    },
+                                )
                                 .await;
                         }
-                        let mut deleter = self.io(operator.deleter()).await?;
-                        for path in paths {
-                            self.io(deleter.delete(storage.relativize_path(&path)?.to_string()))
-                                .await?;
+                        for paths in paths.chunks(batch_size) {
+                            let batch_storage = Self {
+                                backend: storage.backend.clone(),
+                                provider: Some(credentials::BatchCredential::provider(
+                                    provider.clone(),
+                                    key.credential_location.clone(),
+                                    paths.to_vec(),
+                                )),
+                            };
+                            // Do not cache a signer carrying this request's file list.
+                            let (operator, _) = batch_storage
+                                .create_operator_with_options(&paths[0], options, None)?;
+                            let mut deleter = self.io(operator.deleter()).await?;
+                            for path in paths {
+                                self.io(deleter.delete(storage.relativize_path(path)?.to_string()))
+                                    .await?;
+                            }
+                            self.io(deleter.close()).await?;
                         }
-                        self.io(deleter.close()).await
-                    },
-                )
+                        Ok(())
+                    }
+                })
                 .await?;
         }
         Ok(())
@@ -1435,7 +1458,7 @@ impl OpenDalStorage {
                     .await
             })
             .await?;
-        let redact = matches!(self, Self::Credentialed { .. });
+        let redact = self.provider.is_some();
 
         Ok(
             futures::stream::try_unfold(lister, move |mut lister| async move {
@@ -1463,74 +1486,6 @@ impl OpenDalStorage {
             })
             .boxed(),
         )
-    }
-}
-
-#[typetag::serde(name = "OpenDalStorage")]
-#[async_trait]
-impl Storage for OpenDalStorage {
-    async fn exists(&self, path: &str) -> Result<bool> {
-        self.exists_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.metadata_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        self.read_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.reader_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.write_with_options(path, bs, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.writer_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        self.delete_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn delete_prefix(&self, path: &str) -> Result<()> {
-        self.delete_prefix_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
-        self.delete_stream_with_options(paths, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn list(
-        &self,
-        path: &str,
-        recursive: bool,
-    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
-        self.list_with_options(path, recursive, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_output(&self, path: &str) -> Result<OutputFile> {
-        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
     }
 }
 
@@ -1694,7 +1649,11 @@ mod tests {
 
         #[async_trait]
         impl StorageCredentialProvider for DirectoryProvider {
-            async fn load_credential(&self, location: &str) -> Result<StorageCredential> {
+            async fn load_credential_with_minimum_validity(
+                &self,
+                location: &str,
+                _minimum_validity: Duration,
+            ) -> Result<StorageCredential> {
                 // A directory grant deliberately does not cover the file of
                 // the same name. Do not trim slashes in credential matching.
                 if location != self.directory {
@@ -1889,25 +1848,23 @@ mod tests {
         struct Provider;
         #[async_trait]
         impl StorageCredentialProvider for Provider {
-            async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
+            async fn load_credential_with_minimum_validity(
+                &self,
+                _: &str,
+                _minimum_validity: Duration,
+            ) -> Result<StorageCredential> {
                 unreachable!("operator construction must not fetch credentials")
             }
         }
         let mut first = test_azdls_storage(None);
-        first.storage = OpenDalStorage::Credentialed {
-            storage: Box::new(first.storage),
-            provider: CredentialProvider(Arc::new(Provider)),
-        };
+        first.storage.provider = Some(CredentialProvider(Arc::new(Provider)));
         let path = "abfss://myfs@myaccount.dfs.core.windows.net/data/0";
         create_cached_operator(&first, path);
         create_cached_operator(&first, path);
         assert_eq!(first.operator_cache.len(), 1);
         let mut second = test_azdls_storage(None);
         second.operator_cache = first.operator_cache.clone();
-        second.storage = OpenDalStorage::Credentialed {
-            storage: Box::new(second.storage),
-            provider: CredentialProvider(Arc::new(Provider)),
-        };
+        second.storage.provider = Some(CredentialProvider(Arc::new(Provider)));
         create_cached_operator(&second, path);
         assert_eq!(first.operator_cache.len(), 2);
         for index in 1..80 {
@@ -2269,7 +2226,9 @@ mod tests {
         let registry = prometheus::Registry::new();
         install_prometheus_metrics(&registry).unwrap();
 
-        let storage = OpenDalStorage::Memory(default_memory_operator());
+        let storage = OpenDalStorageFactory::memory()
+            .build(&StorageConfig::new())
+            .unwrap();
         storage
             .write("memory:/metrics.txt", Bytes::from_static(b"metrics"))
             .await
@@ -2289,12 +2248,16 @@ mod tests {
         let storage = OpenDalStorage::Memory(default_memory_operator());
 
         assert_eq!(
-            storage.relativize_path("memory:/path/to/file").unwrap(),
+            RuntimeStorage::new(storage.clone())
+                .relativize_path("memory:/path/to/file")
+                .unwrap(),
             "path/to/file"
         );
         // Without the scheme prefix, falls back to stripping the leading slash
         assert_eq!(
-            storage.relativize_path("/path/to/file").unwrap(),
+            RuntimeStorage::new(storage.clone())
+                .relativize_path("/path/to/file")
+                .unwrap(),
             "path/to/file"
         );
     }
@@ -2305,13 +2268,15 @@ mod tests {
         let storage = OpenDalStorage::LocalFs;
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("file:/tmp/data/file.parquet")
                 .unwrap(),
             "tmp/data/file.parquet"
         );
         assert_eq!(
-            storage.relativize_path("/tmp/data/file.parquet").unwrap(),
+            RuntimeStorage::new(storage.clone())
+                .relativize_path("/tmp/data/file.parquet")
+                .unwrap(),
             "tmp/data/file.parquet"
         );
     }
@@ -2328,7 +2293,7 @@ mod tests {
         // accepted because the path's scheme is used as-is for prefix matching.
         for scheme in ["s3", "s3a", "s3n", "minio"] {
             assert_eq!(
-                storage
+                RuntimeStorage::new(storage.clone())
                     .relativize_path(&format!("{scheme}://my-bucket/path/to/file.parquet"))
                     .unwrap(),
                 "path/to/file.parquet"
@@ -2344,7 +2309,7 @@ mod tests {
         };
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("gs://my-bucket/path/to/file.parquet")
                 .unwrap(),
             "path/to/file.parquet"
@@ -2359,7 +2324,7 @@ mod tests {
         };
 
         assert!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("s3://my-bucket/path/to/file.parquet")
                 .is_err()
         );
@@ -2373,7 +2338,7 @@ mod tests {
         };
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("oss://my-bucket/path/to/file.parquet")
                 .unwrap(),
             "path/to/file.parquet"
@@ -2388,7 +2353,7 @@ mod tests {
         };
 
         assert!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("s3://my-bucket/path/to/file.parquet")
                 .is_err()
         );
@@ -2406,12 +2371,12 @@ mod tests {
         };
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
                 .unwrap(),
             "path/to/file.parquet"
         );
-        assert!(storage.uses_append_mode());
+        assert!(RuntimeStorage::new(storage.clone()).uses_append_mode());
     }
 
     /// Answers every request with `200`, and `GET` (ADLS `ListPaths`) with `list_body`.
@@ -2486,7 +2451,7 @@ mod tests {
         let dir = "abfs://myfs@myaccount.dfs.core.windows.net/dir";
 
         let paths = vec![format!("{dir}/f0.parquet"), format!("{dir}/f1.parquet")];
-        storage
+        RuntimeStorage::new(storage.clone())
             .delete_stream_with_options(futures::stream::iter(paths).boxed(), &options, None)
             .await
             .unwrap();
@@ -2503,7 +2468,7 @@ mod tests {
             "DELETE /core.windows.net/myfs/dir/f1.parquet HTTP/1.1".to_string(),
         ]);
 
-        let listed: Vec<String> = storage
+        let listed: Vec<String> = RuntimeStorage::new(storage.clone())
             .list_with_options(dir, false, &options, None)
             .await
             .unwrap()
@@ -2527,7 +2492,7 @@ mod tests {
             config: Arc::new(AzblobConfig::default()),
         };
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("azblob://container/path/to/file.parquet")
                 .unwrap(),
             "path/to/file.parquet"
@@ -2539,7 +2504,9 @@ mod tests {
     async fn test_list_memory_storage() {
         use futures::TryStreamExt;
 
-        let storage = OpenDalStorage::Memory(default_memory_operator());
+        let storage = OpenDalStorageFactory::memory()
+            .build(&StorageConfig::new())
+            .unwrap();
         storage
             .write("memory:/root/direct.txt", Bytes::from_static(b"a"))
             .await

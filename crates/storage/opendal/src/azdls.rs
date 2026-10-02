@@ -93,13 +93,6 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
 pub(crate) fn azdls_create_operator<'a>(
     absolute_path: &'a str,
     config: &AzdlsConfig,
-) -> Result<(opendal::Operator, &'a str)> {
-    azdls_create_operator_with_credentials(absolute_path, config, None)
-}
-
-pub(crate) fn azdls_create_operator_with_credentials<'a>(
-    absolute_path: &'a str,
-    config: &AzdlsConfig,
     credentials: Option<&CredentialProvider>,
 ) -> Result<(opendal::Operator, &'a str)> {
     let path = absolute_path.parse::<AzureStoragePath>()?;
@@ -518,7 +511,7 @@ mod tests {
         ];
 
         for (name, input, expected) in test_cases {
-            let result = azdls_create_operator(input.0, &input.1);
+            let result = azdls_create_operator(input.0, &input.1, None);
             match expected {
                 Some((expected_filesystem, expected_path)) => {
                     assert!(result.is_ok(), "Test case {name} failed: {result:?}");

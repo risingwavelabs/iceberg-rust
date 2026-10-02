@@ -26,8 +26,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
-    StorageFactory,
+    CredentialProvider, FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile,
+    Storage, StorageConfig, StorageCredentialProvider, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
@@ -195,13 +195,13 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
     fn build_with_credentials(
         &self,
         config: &StorageConfig,
-        credential_provider: Option<Arc<dyn iceberg::io::StorageCredentialProvider>>,
+        credential_provider: Arc<dyn StorageCredentialProvider>,
     ) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(OpenDalResolvingStorage {
             props: config.props().clone(),
             storages: RwLock::new(HashMap::new()),
             operator_cache: self.operator_cache.clone(),
-            credentials: credential_provider.map(iceberg::io::CredentialProvider),
+            credentials: Some(CredentialProvider(credential_provider)),
         }))
     }
 }
@@ -217,7 +217,7 @@ pub struct OpenDalResolvingStorage {
     /// Configuration properties shared across all backends.
     props: HashMap<String, String>,
     #[serde(default)]
-    credentials: Option<iceberg::io::CredentialProvider>,
+    credentials: Option<CredentialProvider>,
     /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
     storages: RwLock<HashMap<&'static str, Arc<ConfiguredOpenDalStorage>>>,
@@ -255,19 +255,11 @@ impl OpenDalResolvingStorage {
         }
 
         let storage = build_storage_for_scheme(scheme, &self.props)?;
-        let storage = match &self.credentials {
-            Some(provider) => OpenDalStorage::Credentialed {
-                storage: Box::new(storage),
-                provider: provider.clone(),
-            },
-            None => storage,
-        };
         let config = StorageConfig::from_props(self.props.clone());
-        let storage = Arc::new(ConfiguredOpenDalStorage::new(
-            storage,
-            &config,
-            self.operator_cache.clone(),
-        )?);
+        let mut storage =
+            ConfiguredOpenDalStorage::new(storage, &config, self.operator_cache.clone())?;
+        storage.storage.provider = self.credentials.clone();
+        let storage = Arc::new(storage);
         cache.insert(scheme, storage.clone());
         Ok(storage)
     }
@@ -426,6 +418,9 @@ mod tests {
         let resolved = storage
             .resolve("azblob://container/path/to/file.parquet")
             .unwrap();
-        assert!(matches!(resolved.storage, OpenDalStorage::Azblob { .. }));
+        assert!(matches!(
+            resolved.storage.backend,
+            OpenDalStorage::Azblob { .. }
+        ));
     }
 }

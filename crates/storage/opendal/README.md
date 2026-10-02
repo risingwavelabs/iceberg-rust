@@ -99,8 +99,3 @@ fn file_io(provider: impl StorageCredentialProvider + 'static) -> FileIO {
         .build()
 }
 ```
-
-Signers request their required remaining lifetime through
-`load_credential_with_minimum_validity`. Refreshable providers should override
-this method to renew short-lived credentials; the default implementation
-rejects credentials that cannot meet the requirement.

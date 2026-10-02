@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Error, Result};
+use crate::Result;
 
 /// One complete authentication configuration, with optional scope and expiration.
 ///
@@ -112,6 +112,11 @@ pub fn storage_prefix_covers(prefix: &str, location: &str) -> bool {
     let (Ok(prefix), Ok(location)) = (url::Url::parse(prefix), url::Url::parse(location)) else {
         return false;
     };
+    storage_prefix_covers_url(&prefix, &location)
+}
+
+/// Check a declared URI scope without reparsing already validated URLs.
+pub fn storage_prefix_covers_url(prefix: &url::Url, location: &url::Url) -> bool {
     prefix.scheme() == location.scheme()
         && prefix.host_str() == location.host_str()
         && prefix.port() == location.port()
@@ -225,7 +230,7 @@ impl Debug for AzdlsCredential {
 
 /// Supplies credentials for the actual file URI, including for open handles.
 ///
-/// Implementations must cache internally: `load_credential` can run on every
+/// Implementations must cache internally: credential loading can run on every
 /// signing attempt and must not perform network I/O for each cache hit.
 #[async_trait]
 pub trait StorageCredentialProvider: Debug + Send + Sync {
@@ -242,32 +247,23 @@ pub trait StorageCredentialProvider: Debug + Send + Sync {
     /// Providers may declare the selected prefix to enable scope-local bulk
     /// operations. Consumers must revalidate all batch locations on refresh,
     /// since the selected prefixes can change.
-    async fn load_credential(&self, path: &str) -> Result<StorageCredential>;
+    async fn load_credential(&self, path: &str) -> Result<StorageCredential> {
+        self.load_credential_with_minimum_validity(path, Duration::ZERO)
+            .await
+    }
 
     /// Return a credential valid for longer than `minimum_validity` from now.
     ///
-    /// Consumers supply their signing-operation headroom here. Refreshable
-    /// providers should renew credentials that cannot meet it, including when
-    /// considering cached credentials after a failed refresh. The default
-    /// implementation loads once and rejects insufficient remaining validity.
+    /// Consumers supply their signing-operation headroom here. Implementations
+    /// must honor it or return an error. Refreshable providers should renew
+    /// credentials that cannot meet it, including when considering cached
+    /// credentials after a failed refresh. A credential without an expiration
+    /// has no declared validity limit.
     async fn load_credential_with_minimum_validity(
         &self,
         path: &str,
         minimum_validity: Duration,
-    ) -> Result<StorageCredential> {
-        let credential = self.load_credential(path).await?;
-        if credential.expires_at().is_some_and(|expiry| {
-            expiry
-                .duration_since(SystemTime::now())
-                .map_or(true, |remaining| remaining <= minimum_validity)
-        }) {
-            return Err(Error::new(
-                crate::ErrorKind::DataInvalid,
-                "Storage credential does not meet required validity",
-            ));
-        }
-        Ok(credential)
-    }
+    ) -> Result<StorageCredential>;
 }
 
 /// An identity-bearing, redacted runtime provider.
@@ -311,6 +307,40 @@ impl<'de> Deserialize<'de> for CredentialProvider {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn default_load_forwards_the_path_with_zero_minimum_validity() {
+        #[derive(Debug, Default)]
+        struct Provider(std::sync::Mutex<Vec<(String, Duration)>>);
+        #[async_trait]
+        impl StorageCredentialProvider for Provider {
+            async fn load_credential_with_minimum_validity(
+                &self,
+                path: &str,
+                minimum_validity: Duration,
+            ) -> Result<StorageCredential> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), minimum_validity));
+                Ok(StorageCredential::new(StorageCredentialKind::S3(
+                    S3Credential::new("key", "dummy-secret", None),
+                )))
+            }
+        }
+        let provider = Provider::default();
+        let dynamic: &dyn StorageCredentialProvider = &provider;
+        let path = "s3://bucket/table/file";
+        dynamic.load_credential(path).await.unwrap();
+        dynamic
+            .load_credential_with_minimum_validity(path, Duration::from_secs(17))
+            .await
+            .unwrap();
+        assert_eq!(*provider.0.lock().unwrap(), vec![
+            (path.to_string(), Duration::ZERO),
+            (path.to_string(), Duration::from_secs(17)),
+        ]);
+    }
+
     #[test]
     fn typed_credentials_round_trip_and_redact_debug() {
         for kind in [
@@ -347,25 +377,25 @@ mod tests {
     }
 
     #[test]
-    fn default_factory_accepts_no_provider_but_rejects_a_supplied_provider() {
+    fn default_factory_builds_static_storage_but_rejects_runtime_credentials() {
         use crate::io::{MemoryStorageFactory, StorageConfig, StorageFactory};
 
         #[derive(Debug)]
         struct Provider;
         #[async_trait]
         impl StorageCredentialProvider for Provider {
-            async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
+            async fn load_credential_with_minimum_validity(
+                &self,
+                _: &str,
+                _minimum_validity: Duration,
+            ) -> Result<StorageCredential> {
                 unreachable!("unsupported factories must not fetch credentials");
             }
         }
         let config = StorageConfig::new();
-        assert!(
-            MemoryStorageFactory
-                .build_with_credentials(&config, None)
-                .is_ok()
-        );
+        assert!(MemoryStorageFactory.build(&config).is_ok());
         let error = MemoryStorageFactory
-            .build_with_credentials(&config, Some(Arc::new(Provider)))
+            .build_with_credentials(&config, Arc::new(Provider))
             .unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
     }

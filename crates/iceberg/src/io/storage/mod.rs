@@ -149,18 +149,11 @@ pub trait StorageFactory: Debug + Send + Sync {
 
     /// Build storage with runtime credentials. Implementations must not silently
     /// discard the provider or fall back to their default credential chain.
-    ///
-    /// [`FileIO`](super::FileIO) calls this method when lazily initializing
-    /// storage with a credential provider. The default implementation rejects
-    /// such providers so unsupported factories fail closed.
     fn build_with_credentials(
         &self,
-        config: &StorageConfig,
-        credential_provider: Option<Arc<dyn super::StorageCredentialProvider>>,
+        _config: &StorageConfig,
+        _credential_provider: Arc<dyn super::StorageCredentialProvider>,
     ) -> Result<Arc<dyn Storage>> {
-        if credential_provider.is_none() {
-            return self.build(config);
-        }
         Err(crate::Error::new(
             crate::ErrorKind::FeatureUnsupported,
             "Storage factory does not support runtime credentials",

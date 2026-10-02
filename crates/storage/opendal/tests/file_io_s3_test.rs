@@ -100,7 +100,11 @@ mod tests {
 
     #[async_trait]
     impl StorageCredentialProvider for TestCredentialProvider {
-        async fn load_credential(&self, location: &str) -> iceberg::Result<StorageCredential> {
+        async fn load_credential_with_minimum_validity(
+            &self,
+            location: &str,
+            _minimum_validity: Duration,
+        ) -> iceberg::Result<StorageCredential> {
             assert!(location.starts_with("s3://bucket1/"));
             Ok(
                 StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
