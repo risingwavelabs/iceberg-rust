@@ -205,6 +205,7 @@ impl CredentialSet {
         location: &Url,
         now: SystemTime,
         fresh: bool,
+        minimum_validity: Duration,
     ) -> Result<IoStorageCredential> {
         let credential = self.select(location)?;
         let prefix = self
@@ -217,8 +218,13 @@ impl CredentialSet {
             });
         let deadline = credential.expiry.unwrap_or(self.issued_at + LEASE);
         let lifetime = deadline.duration_since(self.issued_at).unwrap_or_default();
-        let margin = (lifetime / 5).min(Duration::from_secs(30));
-        if now >= deadline || (fresh && now + margin >= deadline) {
+        let margin = (lifetime / 5)
+            .min(Duration::from_secs(30))
+            .max(minimum_validity);
+        let required_until = now
+            .checked_add(minimum_validity)
+            .ok_or_else(|| invalid("Invalid required credential validity"))?;
+        if required_until >= deadline || (fresh && now + margin >= deadline) {
             return Err(invalid("Vended storage credential requires refresh"));
         }
         // Keep leases below reqsign's cache freshness windows (ADLS: 20s,
@@ -231,7 +237,7 @@ impl CredentialSet {
         };
         Ok(IoStorageCredential::new(credential.kind.clone())
             .with_prefix(prefix)
-            .with_expiration(deadline.min(now + lease)))
+            .with_expiration(deadline.min((now + lease).max(required_until + RETRY_DELAY))))
     }
 }
 
@@ -417,6 +423,15 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
     }
 
     async fn load_credential(&self, location: &str) -> Result<IoStorageCredential> {
+        self.load_credential_with_minimum_validity(location, Duration::ZERO)
+            .await
+    }
+
+    async fn load_credential_with_minimum_validity(
+        &self,
+        location: &str,
+        minimum_validity: Duration,
+    ) -> Result<IoStorageCredential> {
         let location = Url::parse(location).map_err(|_| invalid("Invalid credential location"))?;
         if location.query().is_some()
             || location.fragment().is_some()
@@ -432,7 +447,10 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
         let mut state = self.state.lock().await;
         let now = SystemTime::now();
         if !state.revoked
-            && let Ok(credential) = state.set.load_credential(&location, now, true)
+            && let Ok(credential) =
+                state
+                    .set
+                    .load_credential(&location, now, true, minimum_validity)
         {
             return Ok(credential);
         }
@@ -445,7 +463,9 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
                 Err(invalid("Vended storage access was revoked")
                     .with_context("credential_error", "revoked"))
             } else {
-                state.set.load_credential(&location, now, false)
+                state
+                    .set
+                    .load_credential(&location, now, false, minimum_validity)
             };
             return result.map_err(|error| {
                 if let Some(status) = state.last_refresh_status {
@@ -473,14 +493,16 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
                 state.revoked = false;
                 state
                     .set
-                    .load_credential(&location, SystemTime::now(), false)
+                    .load_credential(&location, SystemTime::now(), false, minimum_validity)
             }
             Err(error) => {
                 if !state.revoked
-                    && let Ok(credential) =
-                        state
-                            .set
-                            .load_credential(&location, SystemTime::now(), false)
+                    && let Ok(credential) = state.set.load_credential(
+                        &location,
+                        SystemTime::now(),
+                        false,
+                        minimum_validity,
+                    )
                 {
                     return Ok(credential);
                 }
@@ -785,14 +807,24 @@ mod tests {
         ];
         let set = CredentialSet::new(config("sig=fallback"), Some(entries));
         let selected = set
-            .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), true)
+            .load_credential(
+                &Url::parse(LOCATION).unwrap(),
+                SystemTime::now(),
+                true,
+                Duration::ZERO,
+            )
             .unwrap();
         assert_eq!(selected.test_sas_token(), "sig=data");
         assert_eq!(selected.prefix(), Some(child.as_str()));
         assert!(selected.covers(LOCATION));
         let outside = "abfss://other@acct.dfs.core.windows.net/outside";
         let credential = set
-            .load_credential(&Url::parse(outside).unwrap(), SystemTime::now(), true)
+            .load_credential(
+                &Url::parse(outside).unwrap(),
+                SystemTime::now(),
+                true,
+                Duration::ZERO,
+            )
             .unwrap();
         assert_eq!(credential.test_sas_token(), "sig=fallback");
         assert_eq!(
@@ -827,8 +859,13 @@ mod tests {
     fn expiry_and_debug_do_not_expose_tokens() {
         let set = CredentialSet::new(config("sig=secret&se=2000-01-01T00%3A00%3A00Z"), None);
         assert!(
-            set.load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
-                .is_err()
+            set.load_credential(
+                &Url::parse(LOCATION).unwrap(),
+                SystemTime::now(),
+                false,
+                Duration::ZERO
+            )
+            .is_err()
         );
         let set = CredentialSet::new(config("sig=secret&se=not-a-date"), None);
         let error = set.select(&Url::parse(LOCATION).unwrap()).err().unwrap();
@@ -904,14 +941,15 @@ mod tests {
             None,
         );
         assert!(
-            set.load_credential(&Url::parse(LOCATION).unwrap(), now, false)
+            set.load_credential(&Url::parse(LOCATION).unwrap(), now, false, Duration::ZERO)
                 .is_err()
         );
         assert!(
             set.load_credential(
                 &Url::parse(&LOCATION.replace("acct.", "other.")).unwrap(),
                 now,
-                false
+                false,
+                Duration::ZERO
             )
             .is_ok()
         );
@@ -935,7 +973,7 @@ mod tests {
             None,
         );
         assert!(
-            set.load_credential(&Url::parse(LOCATION).unwrap(), now, false)
+            set.load_credential(&Url::parse(LOCATION).unwrap(), now, false, Duration::ZERO)
                 .is_err()
         );
     }
@@ -961,15 +999,20 @@ mod tests {
         );
         let metadata = Url::parse(&format!("{ROOT}metadata/file")).unwrap();
         assert_eq!(
-            set.load_credential(&metadata, SystemTime::now(), true)
+            set.load_credential(&metadata, SystemTime::now(), true, Duration::ZERO)
                 .unwrap()
                 .test_sas_token(),
             "sig=root"
         );
         // A selected invalid child must not fall back to a valid parent grant.
         assert!(
-            set.load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
-                .is_err()
+            set.load_credential(
+                &Url::parse(LOCATION).unwrap(),
+                SystemTime::now(),
+                false,
+                Duration::ZERO
+            )
+            .is_err()
         );
 
         let set = CredentialSet::new(
@@ -1094,7 +1137,12 @@ mod tests {
         assert!(
             state
                 .set
-                .load_credential(&Url::parse(LOCATION).unwrap(), SystemTime::now(), false)
+                .load_credential(
+                    &Url::parse(LOCATION).unwrap(),
+                    SystemTime::now(),
+                    false,
+                    Duration::ZERO
+                )
                 .is_ok()
         );
         drop(state);

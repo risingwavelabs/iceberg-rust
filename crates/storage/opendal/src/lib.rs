@@ -1195,6 +1195,48 @@ impl OpenDalStorage {
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
         let path = directory_path(path);
+        if matches!(self, Self::Credentialed { .. }) {
+            // A parent-directory signer cannot authorize every nested scope.
+            // List with the parent's grant, then re-select each deletion path.
+            let mut entries = self
+                .list_with_options(&path, true, options, operator_cache)
+                .await?;
+            let mut files = Vec::new();
+            let mut directories = Vec::new();
+            while let Some(entry) = entries.try_next().await? {
+                if entry.is_dir {
+                    directories.push(entry.path);
+                } else {
+                    files.push(entry.path);
+                }
+                // Bound queued file paths while retaining S3's bulk deletion.
+                if files.len() == 1000 {
+                    self.delete_stream_with_options(
+                        futures::stream::iter(std::mem::take(&mut files)).boxed(),
+                        options,
+                        operator_cache,
+                    )
+                    .await?;
+                }
+            }
+            if !files.is_empty() {
+                self.delete_stream_with_options(
+                    futures::stream::iter(files).boxed(),
+                    options,
+                    operator_cache,
+                )
+                .await?;
+            }
+            // ADLS lists real directories, including the requested directory.
+            // Delete children before parents, without server-side recursion
+            // that would again bypass per-path credential selection.
+            directories.sort_unstable_by_key(|path| std::cmp::Reverse(path.len()));
+            for directory in directories {
+                self.delete_with_options(&directory, options, operator_cache)
+                    .await?;
+            }
+            return Ok(());
+        }
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
         self.io(async { operator.delete_with(relative_path).recursive(true).await })
@@ -1765,15 +1807,15 @@ mod tests {
                     Matcher::UrlEncoded("sig".to_string(), "directory".to_string()),
                 ]))
                 .with_body(r#"{"paths":[]}"#)
-                .expect(2)
+                .expect(4)
                 .create_async()
                 .await;
             let delete = server
                 .mock("DELETE", "/core.windows.net/myfs/table")
-                .match_query(Matcher::AllOf(vec![
-                    Matcher::UrlEncoded("recursive".to_string(), "true".to_string()),
-                    Matcher::UrlEncoded("sig".to_string(), "directory".to_string()),
-                ]))
+                .match_query(Matcher::UrlEncoded(
+                    "sig".to_string(),
+                    "directory".to_string(),
+                ))
                 .with_status(200)
                 .expect(2)
                 .create_async()

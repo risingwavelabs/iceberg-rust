@@ -19,12 +19,12 @@
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// One complete authentication configuration, with optional scope and expiration.
 ///
@@ -243,6 +243,31 @@ pub trait StorageCredentialProvider: Debug + Send + Sync {
     /// operations. Consumers must revalidate all batch locations on refresh,
     /// since the selected prefixes can change.
     async fn load_credential(&self, path: &str) -> Result<StorageCredential>;
+
+    /// Return a credential valid for longer than `minimum_validity` from now.
+    ///
+    /// Consumers supply their signing-operation headroom here. Refreshable
+    /// providers should renew credentials that cannot meet it, including when
+    /// considering cached credentials after a failed refresh. The default
+    /// implementation loads once and rejects insufficient remaining validity.
+    async fn load_credential_with_minimum_validity(
+        &self,
+        path: &str,
+        minimum_validity: Duration,
+    ) -> Result<StorageCredential> {
+        let credential = self.load_credential(path).await?;
+        if credential.expires_at().is_some_and(|expiry| {
+            expiry
+                .duration_since(SystemTime::now())
+                .map_or(true, |remaining| remaining <= minimum_validity)
+        }) {
+            return Err(Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Storage credential does not meet required validity",
+            ));
+        }
+        Ok(credential)
+    }
 }
 
 /// An identity-bearing, redacted runtime provider.

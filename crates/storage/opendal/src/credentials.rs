@@ -64,9 +64,13 @@ impl std::fmt::Debug for VendedCredentialSource {
 }
 
 impl VendedCredentialSource {
-    async fn load(&self) -> Result<StorageCredential> {
+    async fn load(&self, minimum_validity: Duration) -> Result<StorageCredential> {
         crate::utils::clear_credential_failure();
-        let credential = self.provider.0.load_credential(&self.location).await?;
+        let credential = self
+            .provider
+            .0
+            .load_credential_with_minimum_validity(&self.location, minimum_validity)
+            .await?;
         if !credential.covers(&self.location) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -109,10 +113,23 @@ impl BatchCredential {
 
 #[async_trait]
 impl StorageCredentialProvider for BatchCredential {
-    async fn load_credential(&self, _: &str) -> Result<StorageCredential> {
+    async fn load_credential(&self, location: &str) -> Result<StorageCredential> {
+        self.load_credential_with_minimum_validity(location, Duration::ZERO)
+            .await
+    }
+
+    async fn load_credential_with_minimum_validity(
+        &self,
+        _: &str,
+        minimum_validity: Duration,
+    ) -> Result<StorageCredential> {
         let mut selected: Option<StorageCredential> = None;
         for location in &self.locations {
-            let credential = self.provider.0.load_credential(location).await?;
+            let credential = self
+                .provider
+                .0
+                .load_credential_with_minimum_validity(location, minimum_validity)
+                .await?;
             if credential.prefix() != Some(self.prefix.as_str()) || !credential.covers(location) {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -148,10 +165,20 @@ impl StorageCredentialProvider for BatchCredential {
         } else {
             Duration::from_secs(30)
         };
-        let deadline = SystemTime::now() + lease;
+        let now = SystemTime::now();
+        let deadline = now + lease;
         let expiry = selected
             .expires_at()
             .map_or(deadline, |expiry| expiry.min(deadline));
+        if expiry
+            .duration_since(now)
+            .map_or(true, |remaining| remaining <= minimum_validity)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Bulk deletion credential does not meet required validity",
+            ));
+        }
         Ok(selected.with_expiration(expiry))
     }
 }
@@ -170,7 +197,7 @@ impl ProvideCredential for VendedAzdlsCredentialProvider {
     ) -> reqsign_core::Result<Option<Self::Credential>> {
         let credential = self
             .0
-            .load()
+            .load(Duration::ZERO)
             .await
             .map_err(crate::utils::credential_provider_error)?;
         let StorageCredentialKind::Azdls(material) = credential.kind() else {
@@ -207,7 +234,9 @@ impl ProvideCredential for VendedS3CredentialProvider {
     ) -> reqsign_core::Result<Option<Self::Credential>> {
         let credential = self
             .0
-            .load()
+            // reqsign requires 10s for AWS signing; allow another 5s for
+            // credential selection and request construction.
+            .load(Duration::from_secs(15))
             .await
             .map_err(crate::utils::credential_provider_error)?;
         let StorageCredentialKind::S3(material) = credential.kind() else {
