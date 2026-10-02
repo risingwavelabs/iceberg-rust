@@ -301,7 +301,29 @@ impl HttpClient {
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and
     // returns a `Response`.
-    pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
+    pub async fn query_catalog(&self, request: Request) -> Result<Response> {
+        self.query_catalog_inner(request, None).await
+    }
+
+    /// Keep an observed 401 visible to storage credential revocation handling,
+    /// even when the subsequent OAuth exchange itself fails.
+    pub(crate) async fn query_credentials(
+        &self,
+        request: Request,
+        revoked: &mut bool,
+    ) -> Result<Response> {
+        self.query_catalog_inner(request, Some(revoked)).await
+    }
+
+    /// `revoked` is absent for ordinary catalog calls. Credential refresh calls
+    /// pass their persistent revocation flag so an initial 401 remains visible
+    /// if OAuth renewal fails, times out, or is cancelled. Only the credential
+    /// layer clears that flag after successfully fetching new credentials.
+    async fn query_catalog_inner(
+        &self,
+        mut request: Request,
+        revoked: Option<&mut bool>,
+    ) -> Result<Response> {
         let retry_request = request.try_clone();
         let used_token = self.authenticate(&mut request).await?;
         let response = self.execute(request).await?;
@@ -312,8 +334,19 @@ impl HttpClient {
         let (Some(mut retry_request), Some(rejected_token)) = (retry_request, used_token) else {
             return Ok(response);
         };
+        let preserve_unauthorized = revoked.is_some();
+        if let Some(revoked) = revoked {
+            // This survives cancellation or timeout during the OAuth exchange.
+            *revoked = true;
+        }
+        if let Err(error) = self.refresh_after_unauthorized(&rejected_token).await {
+            return if preserve_unauthorized {
+                Ok(response)
+            } else {
+                Err(error)
+            };
+        }
         drop(response);
-        self.refresh_after_unauthorized(&rejected_token).await?;
         self.authenticate(&mut retry_request).await?;
         self.execute(retry_request).await
     }

@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -42,11 +42,12 @@ use typed_builder::TypedBuilder;
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
+use crate::credential::{CredentialSet, RestVendedCredentialProvider};
 use crate::endpoint::{Endpoint, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    NamespaceResponse, RegisterTableRequest, RenameTableRequest, StorageCredential,
 };
 
 /// REST catalog URI
@@ -379,13 +380,19 @@ impl RestCatalogConfig {
 
 #[derive(Debug)]
 struct RestContext {
-    client: HttpClient,
+    client: Arc<HttpClient>,
     /// Runtime config is fetched from rest server and stored here.
     ///
     /// It's could be different from the user config.
     config: RestCatalogConfig,
     /// Capabilities the server advertises (see [`RestCatalog::supports_endpoint`]).
     endpoints: HashSet<Endpoint>,
+    advertised_endpoints: bool,
+}
+
+enum TableResponseKind {
+    Load,
+    Commit,
 }
 
 /// Rest catalog implementation.
@@ -401,6 +408,7 @@ pub struct RestCatalog {
     runtime: Runtime,
     /// Optional KMS client for encrypted tables.
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    credentials: Mutex<HashMap<TableIdent, Weak<RestVendedCredentialProvider>>>,
 }
 
 impl RestCatalog {
@@ -417,6 +425,7 @@ impl RestCatalog {
             storage_factory,
             runtime,
             kms_client,
+            credentials: Default::default(),
         }
     }
 
@@ -455,6 +464,10 @@ impl RestCatalog {
             .get_or_try_init(|| async {
                 let client = HttpClient::new(&self.user_config)?;
                 let catalog_config = RestCatalog::load_config(&client, &self.user_config).await?;
+                let advertised_endpoints = catalog_config
+                    .endpoints
+                    .as_ref()
+                    .is_some_and(|e| !e.is_empty());
                 // Use the advertised endpoints as-is, falling back to
                 // `DEFAULT_ENDPOINTS` when absent or empty.
                 let endpoints = match &catalog_config.endpoints {
@@ -468,8 +481,9 @@ impl RestCatalog {
 
                 Ok(RestContext {
                     config,
-                    client,
+                    client: Arc::new(client),
                     endpoints,
+                    advertised_endpoints,
                 })
             })
             .await
@@ -526,19 +540,15 @@ impl RestCatalog {
         }
     }
 
-    async fn load_file_io(
+    async fn file_io_properties(
         &self,
         metadata_location: Option<&str>,
-        extra_config: Option<HashMap<String, String>>,
-    ) -> Result<FileIO> {
-        let mut props = self.context().await?.config.props.clone();
-        if let Some(config) = extra_config {
-            props.extend(config);
-        }
-
+        table_config: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        let context = self.context().await?;
         // If the warehouse is a logical identifier instead of a URL we don't want
         // to raise an exception
-        let warehouse_path = match self.context().await?.config.warehouse.as_deref() {
+        let warehouse_path = match context.config.warehouse.as_deref() {
             Some(url) if Url::parse(url).is_ok() => Some(url),
             Some(_) => None,
             None => None,
@@ -551,20 +561,85 @@ impl RestCatalog {
             ));
         }
 
-        // Require a StorageFactory to be provided
-        let factory = self
-            .storage_factory
-            .clone()
-            .ok_or_else(|| {
+        let mut props = context.config.props.clone();
+        props.extend(
+            table_config
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        props.extend(self.user_config.props.clone());
+        Ok(props)
+    }
+
+    async fn table_file_io(
+        &self,
+        table: &TableIdent,
+        response_kind: TableResponseKind,
+        metadata_location: Option<&str>,
+        table_location: &str,
+        config: HashMap<String, String>,
+        entries: Option<Vec<StorageCredential>>,
+    ) -> Result<FileIO> {
+        let context = self.context().await?;
+        let directory = format!("{}/", table_location.trim_end_matches('/'));
+        let location = metadata_location.unwrap_or(&directory);
+        let delegated = crate::credential::requests_vended_credentials(&context.config.props);
+        let has_vended = crate::credential::has_vended_credentials(&config, entries.as_deref());
+        let mut properties = self.file_io_properties(Some(location), &config).await?;
+        let factory = self.storage_factory.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "StorageFactory must be provided for RestCatalog. Use `with_storage_factory` to configure it.",
+            )
+        })?;
+        let selected = {
+            let mut providers = self.credentials.lock().map_err(|_| {
                 Error::new(
                     ErrorKind::Unexpected,
-                    "StorageFactory must be provided for RestCatalog. Use `with_storage_factory` to configure it.",
+                    "Credential provider cache lock poisoned",
                 )
             })?;
-
-        let file_io = FileIOBuilder::new(factory).with_props(props).build();
-
-        Ok(file_io)
+            providers.retain(|_, provider| provider.strong_count() > 0);
+            if let Some(provider) = providers.get(table).and_then(|provider| provider.upgrade()) {
+                Some((provider, true))
+            } else if !delegated && !has_vended {
+                None
+            } else {
+                let endpoint = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"
+                    .parse::<Endpoint>()?;
+                let endpoint = context
+                    .advertised_endpoints
+                    .then(|| context.endpoints.contains(&endpoint));
+                let provider = Arc::new(RestVendedCredentialProvider::new(
+                    context.client.clone(),
+                    context.config.table_endpoint(table),
+                    CredentialSet::new(config.clone(), entries.clone()),
+                    endpoint,
+                ));
+                providers.insert(table.clone(), Arc::downgrade(&provider));
+                Some((provider, false))
+            }
+        };
+        let Some((provider, reused)) = selected else {
+            return Ok(FileIOBuilder::new(factory).with_props(properties).build());
+        };
+        // Select or create under one lock so concurrent first loads cannot
+        // skip updating a provider installed by another load.
+        // Load responses replace authorization even when credentials are absent.
+        // Commit responses do not carry credentials and preserve the existing set.
+        if reused && matches!(response_kind, TableResponseKind::Load) {
+            provider.update(CredentialSet::new(config, entries)).await;
+        }
+        // A successful catalog mutation must not become a reported failure
+        // because refreshing storage credentials needs another network request.
+        // Install the provider here; validate and refresh on actual storage I/O.
+        // Credentials live only in the redacted provider, never in FileIO's
+        // serializable/debuggable properties or a competing default auth chain.
+        crate::credential::separate_storage_properties(&mut properties);
+        Ok(FileIOBuilder::new(factory)
+            .with_props(properties)
+            .with_credential_provider(provider)
+            .build())
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -867,14 +942,15 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `create_table` response!",
         ))?;
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
-
         let file_io = self
-            .load_file_io(Some(metadata_location), Some(config))
+            .table_file_io(
+                &table_ident,
+                TableResponseKind::Load,
+                Some(metadata_location),
+                response.metadata.location(),
+                response.config,
+                response.storage_credentials,
+            )
             .await?;
 
         let mut table_builder = Table::builder()
@@ -927,14 +1003,15 @@ impl Catalog for RestCatalog {
             }
         };
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
-
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
+            .table_file_io(
+                table_ident,
+                TableResponseKind::Load,
+                response.metadata_location.as_deref(),
+                response.metadata.location(),
+                response.config,
+                response.storage_credentials,
+            )
             .await?;
 
         let mut table_builder = Table::builder()
@@ -986,6 +1063,25 @@ impl Catalog for RestCatalog {
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
         let context = self.context().await?;
 
+        let provider = self
+            .credentials
+            .lock()
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Credential provider cache lock poisoned",
+                )
+            })?
+            .get(src)
+            .and_then(|provider| provider.upgrade());
+        // Finish any old-name refresh before mutation, then keep refresh blocked
+        // until both the address and registry have moved. No synchronous lock
+        // is held across a network request.
+        let mut rename = match &provider {
+            Some(provider) => Some(provider.begin_rename().await),
+            None => None,
+        };
+
         let request = context
             .client
             .request(Method::POST, context.config.rename_table_endpoint())
@@ -998,7 +1094,19 @@ impl Catalog for RestCatalog {
         let http_response = context.client.query_catalog(request).await?;
 
         match http_response.status() {
-            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            StatusCode::NO_CONTENT | StatusCode::OK => {
+                if let Some(rename) = &mut rename {
+                    rename.relocate(context.config.table_endpoint(dest));
+                }
+                if let Some(provider) = &provider {
+                    // Mutation already succeeded; a poisoned local registry must
+                    // not turn success into failure or leave the handle stale.
+                    let mut providers = self.credentials.lock().unwrap_or_else(|e| e.into_inner());
+                    providers.remove(src);
+                    providers.insert(dest.clone(), Arc::downgrade(provider));
+                }
+                Ok(())
+            }
             StatusCode::NOT_FOUND => Err(Error::new(
                 ErrorKind::TableNotFound,
                 "Tried to rename a table that does not exist (is the namespace correct?)",
@@ -1069,7 +1177,16 @@ impl Catalog for RestCatalog {
             "Metadata location missing in `register_table` response!",
         ))?;
 
-        let file_io = self.load_file_io(Some(metadata_location), None).await?;
+        let file_io = self
+            .table_file_io(
+                table_ident,
+                TableResponseKind::Load,
+                Some(metadata_location),
+                response.metadata.location(),
+                response.config,
+                response.storage_credentials,
+            )
+            .await?;
 
         let mut table_builder = Table::builder()
             .identifier(table_ident.clone())
@@ -1144,7 +1261,14 @@ impl Catalog for RestCatalog {
         };
 
         let file_io = self
-            .load_file_io(Some(&response.metadata_location), None)
+            .table_file_io(
+                commit.identifier(),
+                TableResponseKind::Commit,
+                Some(&response.metadata_location),
+                response.metadata.location(),
+                HashMap::new(),
+                None,
+            )
             .await?;
 
         let mut table_builder = Table::builder()
@@ -1234,6 +1358,25 @@ mod tests {
             )
             .create_async()
             .await
+    }
+
+    fn vended_catalog(server: &ServerGuard, factory: impl StorageFactory + 'static) -> RestCatalog {
+        RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([
+                    (
+                        "header.X-Iceberg-Access-Delegation".into(),
+                        "vended-credentials".into(),
+                    ),
+                    ("s3.region".into(), "us-east-1".into()),
+                    ("io.max-retries".into(), "0".into()),
+                ]))
+                .build(),
+            Some(Arc::new(factory)),
+            Runtime::current(),
+            None,
+        )
     }
 
     /// Config mock that advertises the HEAD table/namespace-exists endpoints, so
@@ -2603,6 +2746,400 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_file_io_properties_preserve_precedence_and_static_authentication() {
+        use iceberg::io::ADLS_SAS_TOKEN;
+
+        let mut server = Server::new_async().await;
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_body(
+                serde_json::json!({
+                    "defaults": {"io.max-retries": "1", "default-only": "default"},
+                    "overrides": {"io.max-retries": "2", "override-only": "override"}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([
+                    ("io.max-retries".into(), "7".into()),
+                    (
+                        "adls.endpoint".into(),
+                        "https://acct.dfs.core.windows.net".into(),
+                    ),
+                    ("adls.account-key".into(), "user-key-secret".into()),
+                    (ADLS_SAS_TOKEN.into(), "sig=user-secret".into()),
+                    (
+                        "header.Authorization".into(),
+                        "Bearer user-header-secret".into(),
+                    ),
+                ]))
+                .build(),
+            Some(Arc::new(
+                iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+            )),
+            Runtime::current(),
+            None,
+        );
+        let table = TableIdent::from_strs(["ns", "table"]).unwrap();
+        let root = "abfss://fs@acct.dfs.core.windows.net/table";
+        let location = format!("{root}/metadata/file");
+        let mut table_config = HashMap::from([
+            ("io.max-retries".into(), "3".into()),
+            ("override-only".into(), "table".into()),
+            ("table-only".into(), "table".into()),
+        ]);
+        let static_io = catalog
+            .table_file_io(
+                &table,
+                TableResponseKind::Load,
+                Some(&location),
+                root,
+                table_config.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let properties = static_io.config().props();
+        assert_eq!(properties["io.max-retries"], "7");
+        assert_eq!(properties["default-only"], "default");
+        assert_eq!(properties["override-only"], "table");
+        assert_eq!(properties["table-only"], "table");
+        assert_eq!(properties["adls.account-key"], "user-key-secret");
+        assert_eq!(properties[ADLS_SAS_TOKEN], "sig=user-secret");
+
+        table_config.insert(ADLS_SAS_TOKEN.into(), "sig=vended-secret".into());
+        let delegated = catalog
+            .table_file_io(
+                &table,
+                TableResponseKind::Load,
+                Some(&location),
+                root,
+                table_config,
+                None,
+            )
+            .await
+            .unwrap();
+        let properties = delegated.config().props();
+        assert_eq!(properties["io.max-retries"], "7");
+        assert_eq!(properties["default-only"], "default");
+        assert_eq!(properties["override-only"], "table");
+        assert_eq!(properties["table-only"], "table");
+        assert_eq!(
+            properties["adls.endpoint"],
+            "https://acct.dfs.core.windows.net"
+        );
+        assert!(!properties.contains_key("adls.account-key"));
+        assert!(!properties.contains_key(ADLS_SAS_TOKEN));
+        assert!(!properties.contains_key("header.Authorization"));
+        assert!(!format!("{delegated:?}").contains("secret"));
+        assert!(
+            catalog
+                .file_io_properties(None, &HashMap::new())
+                .await
+                .is_err()
+        );
+        config_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn successful_mutations_do_not_refresh_expired_storage_credentials() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let mut response: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/create_table_response.json")).unwrap();
+        response["config"] = serde_json::json!({
+            "s3.access-key-id": "EXPIRED",
+            "s3.secret-access-key": "dummy-secret",
+            "s3.session-token-expires-at-ms": "0"
+        });
+        let create = server
+            .mock("POST", "/v1/namespaces/ns1/tables")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let register = server
+            .mock("POST", "/v1/namespaces/ns1/register")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let load = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let commit = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .with_body(include_str!("../testdata/update_table_response.json"))
+            .expect(1)
+            .create_async()
+            .await;
+        let refresh = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1/credentials")
+            .with_status(503)
+            .expect(0)
+            .create_async()
+            .await;
+        let catalog = vended_catalog(
+            &server,
+            iceberg_storage_opendal::OpenDalStorageFactory::s3(),
+        );
+        let loaded: LoadTableResult = serde_json::from_value(response).unwrap();
+        let creation = TableCreation::builder()
+            .name("test1".to_string())
+            .schema(loaded.metadata.current_schema().as_ref().clone())
+            .build();
+        let created = catalog
+            .create_table(&NamespaceIdent::from_strs(["ns1"]).unwrap(), creation)
+            .await
+            .unwrap();
+        let registered = catalog
+            .register_table(
+                created.identifier(),
+                created.metadata_location().unwrap().to_string(),
+            )
+            .await
+            .unwrap();
+        let tx = Transaction::new(&registered);
+        let committed = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V2)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        assert_eq!(committed.metadata().format_version(), FormatVersion::V2);
+        create.assert_async().await;
+        register.assert_async().await;
+        load.assert_async().await;
+        commit.assert_async().await;
+        refresh.assert_async().await;
+        refresh.remove_async().await;
+        // Refresh is deferred, not disabled: the first real storage access fails.
+        let refresh = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1/credentials")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        assert!(
+            committed
+                .file_io()
+                .new_input(committed.metadata_location().unwrap())
+                .unwrap()
+                .read()
+                .await
+                .is_err()
+        );
+        refresh.assert_async().await;
+        config_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_without_credentials_clears_shared_provider() {
+        use iceberg::io::{ADLS_SAS_TOKEN, StorageCredentialProvider};
+
+        for (root, credentials) in [
+            (
+                "abfss://fs@acct.dfs.core.windows.net/table",
+                HashMap::from([(ADLS_SAS_TOKEN.to_string(), "sig=initial".to_string())]),
+            ),
+            (
+                "s3://bucket/table",
+                HashMap::from([
+                    ("s3.access-key-id".to_string(), "initial-key".to_string()),
+                    (
+                        "s3.secret-access-key".to_string(),
+                        "initial-secret".to_string(),
+                    ),
+                ]),
+            ),
+        ] {
+            for scoped in [false, true] {
+                let mut server = Server::new_async().await;
+                let config_mock = create_config_mock(&mut server).await;
+                let catalog = vended_catalog(
+                    &server,
+                    iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+                );
+                let id = TableIdent::from_strs(["ns", "table"]).unwrap();
+                let location = format!("{root}/metadata/file");
+                let mut response: serde_json::Value =
+                    serde_json::from_str(include_str!("../testdata/load_table_response.json"))
+                        .unwrap();
+                response["metadata"]["location"] = root.into();
+                response["metadata-location"] = location.clone().into();
+                response["config"] = serde_json::json!({});
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("storage-credentials");
+                let empty_response = response.to_string();
+                if scoped {
+                    response["storage-credentials"] = serde_json::json!([{
+                        "prefix": format!("{root}/"),
+                        "config": credentials,
+                    }]);
+                } else {
+                    response["config"] = serde_json::json!(credentials);
+                }
+                let load = server
+                    .mock("GET", "/v1/namespaces/ns/tables/table")
+                    .with_body(response.to_string())
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let first = catalog.load_table(&id).await.unwrap();
+                let provider = catalog.credentials.lock().unwrap()[&id].upgrade().unwrap();
+                assert!(provider.load_credential(&location).await.is_ok());
+                load.assert_async().await;
+                load.remove_async().await;
+
+                let reload = server
+                    .mock("GET", "/v1/namespaces/ns/tables/table")
+                    .with_body(empty_response)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let refresh = server
+                    .mock("GET", "/v1/namespaces/ns/tables/table/credentials")
+                    .with_status(403)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let second = catalog.load_table(&id).await.unwrap();
+                let reused = catalog.credentials.lock().unwrap()[&id].upgrade().unwrap();
+                assert!(Arc::ptr_eq(&provider, &reused));
+                assert!(provider.load_credential(&location).await.is_err());
+                for table in [&first, &second] {
+                    assert!(
+                        table
+                            .file_io()
+                            .new_input(&location)
+                            .unwrap()
+                            .read()
+                            .await
+                            .is_err()
+                    );
+                }
+                reload.assert_async().await;
+                refresh.assert_async().await;
+                config_mock.assert_async().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vended_file_io_preserves_provider_across_loads_and_empty_commits() {
+        use iceberg::io::{ADLS_SAS_TOKEN, StorageCredentialProvider};
+
+        use crate::credential::TestCredentialExt;
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(
+                iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+            )),
+            Runtime::current(),
+            None,
+        );
+        let table = TableIdent::from_strs(["ns", "table"]).unwrap();
+        let root = "abfss://fs@acct.dfs.core.windows.net/table";
+        let location = format!("{root}/metadata/file");
+        let credentials =
+            |token: &str| HashMap::from([(ADLS_SAS_TOKEN.to_string(), token.to_string())]);
+        let _first = catalog
+            .table_file_io(
+                &table,
+                TableResponseKind::Load,
+                Some(&location),
+                root,
+                credentials("sig=first"),
+                None,
+            )
+            .await
+            .unwrap();
+        let provider = catalog.credentials.lock().unwrap()[&table]
+            .upgrade()
+            .unwrap();
+        let _second = catalog
+            .table_file_io(
+                &table,
+                TableResponseKind::Load,
+                Some(&location),
+                root,
+                credentials("sig=second"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .load_credential(&location)
+                .await
+                .unwrap()
+                .test_sas_token(),
+            "sig=second"
+        );
+        let _committed = catalog
+            .table_file_io(
+                &table,
+                TableResponseKind::Commit,
+                None,
+                root,
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .load_credential(&location)
+                .await
+                .unwrap()
+                .test_sas_token(),
+            "sig=second"
+        );
+        let created_id = TableIdent::from_strs(["ns", "created"]).unwrap();
+        let _created = catalog
+            .table_file_io(
+                &created_id,
+                TableResponseKind::Load,
+                None,
+                root,
+                HashMap::new(),
+                Some(vec![StorageCredential {
+                    prefix: format!("{root}/metadata/"),
+                    config: credentials("sig=created"),
+                }]),
+            )
+            .await
+            .unwrap();
+        let created_provider = catalog.credentials.lock().unwrap()[&created_id]
+            .upgrade()
+            .unwrap();
+        assert_eq!(
+            created_provider
+                .load_credential(&location)
+                .await
+                .unwrap()
+                .test_sas_token(),
+            "sig=created"
+        );
+        config_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_load_table() {
         let mut server = Server::new_async().await;
 
@@ -3335,5 +3872,212 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog uri is required");
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_gcs_metadata_preserves_static_auth_and_vends_adls_data_credentials() {
+        let mut catalog = Server::new_async().await;
+        let mut storage = Server::new_async().await;
+        let config = catalog
+            .mock("GET", "/v1/config")
+            .with_body(r#"{"defaults":{},"overrides":{}}"#)
+            .create_async()
+            .await;
+        let mut response = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../testdata/load_table_response.json"
+        ))
+        .unwrap();
+        response["metadata-location"] = json!("gs://metadata-bucket/table/metadata.json");
+        response["config"] = json!({
+            "adls.endpoint": format!("{}/core.windows.net", storage.url()),
+            "io.max-retries": "0", "gcs.credentials-json": "static-gcs-config"
+        });
+        response["storage-credentials"] = json!([{
+            "prefix": "abfs://fs@account.dfs.core.windows.net/table/",
+            "config": {"adls.sas-token": "sig=vended-probe"}
+        }]);
+        let load = catalog
+            .mock("GET", "/v1/namespaces/ns/tables/t")
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+        let data = storage
+            .mock("GET", "/core.windows.net/fs/table/data")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "sig".into(),
+                "vended-probe".into(),
+            ))
+            .with_body("data")
+            .expect(1)
+            .create_async()
+            .await;
+        let rest = vended_catalog(
+            &catalog,
+            iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+        );
+        let table = rest
+            .load_table(&TableIdent::from_strs(["ns", "t"]).unwrap())
+            .await
+            .unwrap();
+        let result = table
+            .file_io()
+            .new_input("abfs://fs@account.dfs.core.windows.net/table/data")
+            .unwrap()
+            .read()
+            .await;
+        assert_eq!(result.unwrap().as_ref(), b"data");
+        assert_eq!(
+            table
+                .file_io()
+                .config()
+                .get("gcs.credentials-json")
+                .map(String::as_str),
+            Some("static-gcs-config")
+        );
+        assert!(table.file_io().config().get("adls.sas-token").is_none());
+        config.assert_async().await;
+        load.assert_async().await;
+        data.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn open_handles_refresh_renamed_table_and_registry_reuses_provider() {
+        let mut catalog = Server::new_async().await;
+        let mut storage = Server::new_async().await;
+        let config = catalog
+            .mock("GET", "/v1/config")
+            .with_body(r#"{"defaults":{},"overrides":{}}"#)
+            .create_async()
+            .await;
+        let expiry = (std::time::SystemTime::now() + std::time::Duration::from_secs(8))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        let mut response = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../testdata/load_table_response.json"
+        ))
+        .unwrap();
+        response["metadata-location"] = json!("s3://bucket/table/metadata.json");
+        response["config"] = json!({
+            "s3.region": "us-east-1", "s3.endpoint": storage.url(),
+            "s3.path-style-access": "true", "s3.access-key-id": "OLD",
+            "s3.secret-access-key": "dummy-secret",
+            "s3.session-token-expires-at-ms": expiry,
+            "io.max-retries": "0"
+        });
+        let load = catalog
+            .mock("GET", "/v1/namespaces/ns/tables/t")
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+        let old_refresh = catalog
+            .mock("GET", "/v1/namespaces/ns/tables/t/credentials")
+            .with_status(404)
+            .expect(0)
+            .create_async()
+            .await;
+        let new_refresh = catalog
+            .mock("GET", "/v1/namespaces/ns/tables/renamed/credentials")
+            .with_body(
+                json!({"storage-credentials":[{
+                    "prefix":"s3://bucket/table/","config":{
+                        "s3.access-key-id":"NEW","s3.secret-access-key":"dummy-secret"
+                    }
+                }]})
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let rest = vended_catalog(
+            &catalog,
+            iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+        );
+        let ident = TableIdent::from_strs(["ns", "t"]).unwrap();
+        let table = rest.load_table(&ident).await.unwrap();
+        load.assert_async().await;
+        load.remove_async().await;
+        let old_load = catalog
+            .mock("GET", "/v1/namespaces/ns/tables/t")
+            .with_status(404)
+            .expect(0)
+            .create_async()
+            .await;
+        let file = table.file_io().new_input("s3://bucket/table/data").unwrap();
+        let failed_rename = catalog
+            .mock("POST", "/v1/tables/rename")
+            .with_status(409)
+            .expect(1)
+            .create_async()
+            .await;
+        let original_provider = rest.credentials.lock().unwrap()[&ident].upgrade().unwrap();
+        let renamed = TableIdent::from_strs(["ns", "renamed"]).unwrap();
+        assert_eq!(
+            rest.rename_table(&ident, &renamed)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TableAlreadyExists
+        );
+        assert!(Arc::ptr_eq(
+            &original_provider,
+            &rest.credentials.lock().unwrap()[&ident].upgrade().unwrap()
+        ));
+        assert!(!rest.credentials.lock().unwrap().contains_key(&renamed));
+        failed_rename.assert_async().await;
+        failed_rename.remove_async().await;
+        let rename = catalog
+            .mock("POST", "/v1/tables/rename")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        rest.rename_table(&ident, &TableIdent::from_strs(["ns", "renamed"]).unwrap())
+            .await
+            .unwrap();
+        let request = storage
+            .mock("GET", "/bucket/table/data")
+            .match_header(
+                "authorization",
+                mockito::Matcher::Regex("Credential=NEW/".into()),
+            )
+            .with_body("data")
+            .expect(1)
+            .create_async()
+            .await;
+        assert_eq!(file.read().await.unwrap().as_ref(), b"data");
+        request.assert_async().await;
+        let renamed = TableIdent::from_strs(["ns", "renamed"]).unwrap();
+        let provider = rest.credentials.lock().unwrap()[&renamed]
+            .upgrade()
+            .unwrap();
+        assert!(!rest.credentials.lock().unwrap().contains_key(&ident));
+        response["config"]["s3.session-token-expires-at-ms"] = json!(
+            (std::time::SystemTime::now() + std::time::Duration::from_secs(300))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .to_string()
+        );
+        let dest_load = catalog
+            .mock("GET", "/v1/namespaces/ns/tables/renamed")
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let _new_table = rest.load_table(&renamed).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &provider,
+            &rest.credentials.lock().unwrap()[&renamed]
+                .upgrade()
+                .unwrap()
+        ));
+        dest_load.assert_async().await;
+        config.assert_async().await;
+        old_load.assert_async().await;
+        rename.assert_async().await;
+        old_refresh.assert_async().await;
+        new_refresh.assert_async().await;
     }
 }

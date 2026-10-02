@@ -81,3 +81,21 @@ async fn main() -> iceberg::Result<()> {
     Ok(())
 }
 ```
+
+## Runtime credentials
+
+S3 and ADLS use the same `iceberg::io::StorageCredentialProvider` interface.
+Attach the provider to `FileIOBuilder`, not the storage factory:
+
+```rust
+use std::sync::Arc;
+use iceberg::io::{FileIO, FileIOBuilder, StorageCredentialProvider};
+use iceberg_storage_opendal::OpenDalStorageFactory;
+
+fn file_io(provider: impl StorageCredentialProvider + 'static) -> FileIO {
+    FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
+        .with_prop("s3.region", "us-east-1")
+        .with_credential_provider(Arc::new(provider))
+        .build()
+}
+```
