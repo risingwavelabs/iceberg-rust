@@ -25,6 +25,17 @@ use iceberg::io::{
 use iceberg::{Error, ErrorKind, Result};
 use reqsign_core::{Context, ProvideCredential};
 
+// reqsign's cache freshness windows are 20s for Azure and 120s for AWS.
+// Keep signing leases below those windows so every signing attempt loads the
+// current scopes, without changing the provider's actual credential lifetime.
+#[cfg(feature = "opendal-azdls")]
+const ADLS_SIGNING_LEASE: Duration = Duration::from_secs(5);
+#[cfg(feature = "opendal-s3")]
+const S3_SIGNING_LEASE: Duration = Duration::from_secs(30);
+// AWS signing needs 10s; allow another 5s for selection and request construction.
+#[cfg(feature = "opendal-s3")]
+const S3_MINIMUM_SIGNING_VALIDITY: Duration = Duration::from_secs(15);
+
 #[cfg(test)]
 #[derive(Debug)]
 struct FixedCredentialProvider(StorageCredential);
@@ -46,6 +57,22 @@ fn timestamp(time: SystemTime) -> reqsign_core::Result<reqsign_core::time::Times
             reqsign_core::Error::credential_invalid("Invalid storage credential expiry")
         })?;
     reqsign_core::time::Timestamp::from_millisecond(millis)
+}
+
+fn signing_expiry(
+    credential: &StorageCredential,
+    lease: Duration,
+) -> reqsign_core::Result<reqsign_core::time::Timestamp> {
+    // reqsign checks cache freshness only on cached credentials. A newly
+    // loaded credential needs only the signing operation's exact validity.
+    // Cap this signing copy so reqsign cannot bypass the provider on the
+    // next attempt, including for long-lived or non-expiring credentials.
+    let deadline = SystemTime::now() + lease;
+    timestamp(
+        credential
+            .expires_at()
+            .map_or(deadline, |expiry| expiry.min(deadline)),
+    )
 }
 
 /// Bind to a file, not the prefix selected when the operator was constructed:
@@ -81,7 +108,7 @@ impl VendedCredentialSource {
     }
 }
 
-/// A short-lived signer shared only by paths matched to one credential scope.
+/// Revalidates a batch of paths matched to one credential scope.
 ///
 /// Re-select every location before signing, including on retries. Looking up
 /// only the prefix could miss a newly introduced, more-specific child scope.
@@ -155,31 +182,51 @@ impl StorageCredentialProvider for BatchCredential {
                 selected = Some(credential);
             }
         }
-        let selected =
-            selected.ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Empty credential batch"))?;
-        // Stay below reqsign's cache freshness windows (Azure: 20s, AWS:
-        // 120s), but above AWS's 10s signing headroom. Every signing attempt
-        // must re-select the batch, even if a custom provider uses a long TTL.
-        let lease = if matches!(selected.kind(), StorageCredentialKind::Azdls(_)) {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(30)
-        };
-        let now = SystemTime::now();
-        let deadline = now + lease;
-        let expiry = selected
-            .expires_at()
-            .map_or(deadline, |expiry| expiry.min(deadline));
-        if expiry
-            .duration_since(now)
-            .map_or(true, |remaining| remaining <= minimum_validity)
-        {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Bulk deletion credential does not meet required validity",
-            ));
+        selected.ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Empty credential batch"))
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn batch_preserves_the_earliest_provider_expiry() {
+        #[derive(Debug)]
+        struct Provider([StorageCredential; 2]);
+
+        #[async_trait]
+        impl StorageCredentialProvider for Provider {
+            async fn load_credential(&self, location: &str) -> Result<StorageCredential> {
+                Ok(self.0[usize::from(location.ends_with("/two"))].clone())
+            }
         }
-        Ok(selected.with_expiration(expiry))
+
+        let prefix = "s3://bucket/table/";
+        let expiry = SystemTime::now() + Duration::from_secs(60);
+        for expiries in [
+            [None, None],
+            [Some(expiry + Duration::from_secs(300)), Some(expiry)],
+            [Some(expiry), None],
+        ] {
+            let credentials = expiries.map(|expiry| {
+                let credential = StorageCredential::new(StorageCredentialKind::S3(
+                    iceberg::io::S3Credential::new("key", "dummy-secret", None),
+                ))
+                .with_prefix(prefix);
+                match expiry {
+                    Some(expiry) => credential.with_expiration(expiry),
+                    None => credential,
+                }
+            });
+            let batch = BatchCredential::provider(
+                CredentialProvider(Arc::new(Provider(credentials))),
+                prefix.into(),
+                vec![format!("{prefix}one"), format!("{prefix}two")],
+            );
+            let selected = batch.0.load_credential(prefix).await.unwrap();
+            assert_eq!(selected.expires_at(), expiries.into_iter().flatten().min());
+        }
     }
 }
 
@@ -210,13 +257,12 @@ impl ProvideCredential for VendedAzdlsCredentialProvider {
                 "Missing ADLS SAS credential",
             ));
         }
-        Ok(Some(match credential.expires_at() {
-            Some(expiry) => reqsign_azure_storage::Credential::with_sas_token_expires_at(
+        Ok(Some(
+            reqsign_azure_storage::Credential::with_sas_token_expires_at(
                 material.sas_token(),
-                timestamp(expiry)?,
+                signing_expiry(&credential, ADLS_SIGNING_LEASE)?,
             ),
-            None => reqsign_azure_storage::Credential::with_sas_token(material.sas_token()),
-        }))
+        ))
     }
 }
 
@@ -234,9 +280,7 @@ impl ProvideCredential for VendedS3CredentialProvider {
     ) -> reqsign_core::Result<Option<Self::Credential>> {
         let credential = self
             .0
-            // reqsign requires 10s for AWS signing; allow another 5s for
-            // credential selection and request construction.
-            .load(Duration::from_secs(15))
+            .load(S3_MINIMUM_SIGNING_VALIDITY)
             .await
             .map_err(crate::utils::credential_provider_error)?;
         let StorageCredentialKind::S3(material) = credential.kind() else {
@@ -253,7 +297,7 @@ impl ProvideCredential for VendedS3CredentialProvider {
             access_key_id: material.access_key_id().to_string(),
             secret_access_key: material.secret_access_key().to_string(),
             session_token: material.session_token().map(str::to_string),
-            expires_in: credential.expires_at().map(timestamp).transpose()?,
+            expires_in: Some(signing_expiry(&credential, S3_SIGNING_LEASE)?),
         }))
     }
 }
@@ -271,6 +315,64 @@ mod adls_batch_tests {
 
     #[derive(Debug)]
     struct Provider;
+
+    #[tokio::test]
+    async fn signing_adapter_bypasses_azure_cache_without_extending_provider_expiry() {
+        use reqsign_core::SigningCredential;
+
+        let prefix = "abfss://fs@acct.dfs.core.windows.net/table/";
+        for expiry in [
+            None,
+            Some(SystemTime::now() + Duration::from_secs(3600)),
+            Some(SystemTime::now() + Duration::from_secs(3)),
+        ] {
+            let mut credential = StorageCredential::new(StorageCredentialKind::Azdls(
+                AzdlsCredential::new("sig=test"),
+            ))
+            .with_prefix(prefix);
+            if let Some(expiry) = expiry {
+                credential = credential.with_expiration(expiry);
+            }
+            let provider = CredentialProvider(Arc::new(FixedCredentialProvider(credential)));
+            let adapter = VendedAzdlsCredentialProvider(VendedCredentialSource {
+                provider: provider.clone(),
+                location: format!("{prefix}file"),
+            });
+            let start = SystemTime::now();
+            let signing_credential = adapter
+                .provide_credential(&Context::new())
+                .await
+                .unwrap()
+                .unwrap();
+            let reqsign_azure_storage::Credential::SasToken {
+                expires_at: Some(signing_expiry),
+                ..
+            } = &signing_credential
+            else {
+                panic!("expected an expiring signing copy");
+            };
+            let deadline = start + ADLS_SIGNING_LEASE;
+            assert!(
+                *signing_expiry >= timestamp(expiry.map_or(deadline, |e| e.min(deadline))).unwrap()
+            );
+            assert!(*signing_expiry <= timestamp(SystemTime::now() + ADLS_SIGNING_LEASE).unwrap());
+            if let Some(expiry) = expiry {
+                assert!(*signing_expiry <= timestamp(expiry).unwrap());
+            }
+            // A fresh SAS is usable, but must not be reused from reqsign's cache.
+            assert!(signing_credential.is_valid_at(timestamp(SystemTime::now()).unwrap()));
+            assert!(!signing_credential.is_valid());
+            assert_eq!(
+                provider
+                    .0
+                    .load_credential(prefix)
+                    .await
+                    .unwrap()
+                    .expires_at(),
+                expiry
+            );
+        }
+    }
 
     #[tokio::test]
     async fn adls_typed_credentials_accept_no_expiry_and_reject_wrong_backend() {
@@ -320,7 +422,7 @@ mod adls_batch_tests {
                     format!("sig={filesystem}"),
                 )))
                 .with_prefix(root.to_string())
-                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+                .with_expiration(SystemTime::now() + Duration::from_secs(3600)),
             )
         }
     }
@@ -424,6 +526,7 @@ mod tests {
     use mockito::{Matcher, Server};
     use tokio::sync::Barrier;
 
+    use super::{S3_MINIMUM_SIGNING_VALIDITY, S3_SIGNING_LEASE, timestamp};
     use crate::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
 
     fn s3_factories() -> [Arc<dyn StorageFactory>; 2] {
@@ -534,23 +637,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_non_expiring_credentials_still_receive_a_short_signing_lease() {
-        let credential = StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
-            iceberg::io::S3Credential::new("key", "dummy-secret", None),
-        ))
-        .with_prefix("s3://bucket/table/");
-        let batch = super::BatchCredential::provider(
-            CredentialProvider(Arc::new(super::FixedCredentialProvider(credential))),
-            "s3://bucket/table/".into(),
-            vec![
-                "s3://bucket/table/one".into(),
-                "s3://bucket/table/two".into(),
-            ],
-        );
-        let start = SystemTime::now();
-        let selected = batch.0.load_credential("s3://bucket/table/").await.unwrap();
-        assert!(selected.expires_at().unwrap() >= start);
-        assert!(selected.expires_at().unwrap() <= SystemTime::now() + Duration::from_secs(30));
+    async fn batch_signing_adapter_bypasses_aws_cache_without_extending_provider_expiry() {
+        use reqsign_core::{Context, ProvideCredential, SigningCredential};
+
+        let prefix = "s3://bucket/table/";
+        for expiry in [
+            None,
+            Some(SystemTime::now() + Duration::from_secs(3600)),
+            Some(SystemTime::now() + Duration::from_secs(20)),
+        ] {
+            let mut credential = StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                iceberg::io::S3Credential::new("key", "dummy-secret", None),
+            ))
+            .with_prefix(prefix);
+            if let Some(expiry) = expiry {
+                credential = credential.with_expiration(expiry);
+            }
+            let batch = super::BatchCredential::provider(
+                CredentialProvider(Arc::new(super::FixedCredentialProvider(credential))),
+                prefix.into(),
+                vec![format!("{prefix}one"), format!("{prefix}two")],
+            );
+            let selected = batch
+                .0
+                .load_credential_with_minimum_validity(prefix, S3_MINIMUM_SIGNING_VALIDITY)
+                .await
+                .unwrap();
+            assert_eq!(selected.expires_at(), expiry);
+
+            let adapter = super::VendedS3CredentialProvider(super::VendedCredentialSource {
+                provider: batch,
+                location: format!("{prefix}one"),
+            });
+            let start = SystemTime::now();
+            let signing_credential = adapter
+                .provide_credential(&Context::new())
+                .await
+                .unwrap()
+                .unwrap();
+            let signing_expiry = signing_credential.expires_in.unwrap();
+            let deadline = start + S3_SIGNING_LEASE;
+            assert!(
+                signing_expiry >= timestamp(expiry.map_or(deadline, |e| e.min(deadline))).unwrap()
+            );
+            assert!(signing_expiry <= timestamp(SystemTime::now() + S3_SIGNING_LEASE).unwrap());
+            if let Some(expiry) = expiry {
+                assert!(signing_expiry <= timestamp(expiry).unwrap());
+            }
+            // Allow AWS's signing headroom and our selection margin, but never
+            // reuse a signing copy without checking the current credential scopes.
+            assert!(
+                signing_credential.is_valid_at(
+                    timestamp(SystemTime::now() + S3_MINIMUM_SIGNING_VALIDITY).unwrap()
+                )
+            );
+            assert!(!signing_credential.is_valid());
+        }
     }
 
     #[derive(Debug)]
@@ -569,7 +711,7 @@ mod tests {
                         Some(format!("SESSION{generation}")),
                     ),
                 ))
-                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+                .with_expiration(SystemTime::now() + Duration::from_secs(3600)),
             )
         }
     }

@@ -315,6 +315,10 @@ impl HttpClient {
         self.query_catalog_inner(request, Some(revoked)).await
     }
 
+    /// `revoked` is absent for ordinary catalog calls. Credential refresh calls
+    /// pass their persistent revocation flag so an initial 401 remains visible
+    /// if OAuth renewal fails, times out, or is cancelled. Only the credential
+    /// layer clears that flag after successfully fetching new credentials.
     async fn query_catalog_inner(
         &self,
         mut request: Request,

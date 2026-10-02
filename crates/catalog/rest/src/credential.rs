@@ -41,11 +41,6 @@ fn invalid(message: &'static str) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }
 
-/// Reject URL aliasing and compare directory boundaries, not host suffixes.
-fn matches_prefix(prefix: &Url, location: &Url) -> bool {
-    storage_prefix_covers(prefix.as_str(), location.as_str())
-}
-
 // These types deliberately have no Debug implementation: they contain secrets.
 struct ParsedCredential {
     kind: StorageCredentialKind,
@@ -189,7 +184,7 @@ impl CredentialSet {
     fn matched_entry(&self, location: &Url) -> Option<&ScopedCredential> {
         self.entries
             .iter()
-            .filter(|entry| matches_prefix(&entry.prefix, location))
+            .filter(|entry| storage_prefix_covers(entry.prefix.as_str(), location.as_str()))
             .max_by_key(|entry| entry.prefix_len)
     }
 
@@ -227,17 +222,9 @@ impl CredentialSet {
         if required_until >= deadline || (fresh && now + margin >= deadline) {
             return Err(invalid("Vended storage credential requires refresh"));
         }
-        // Keep leases below reqsign's cache freshness windows (ADLS: 20s,
-        // AWS: 120s), but above AWS's 10s signing-operation headroom.
-        // Every request consults this manager, even on an already-open handle.
-        let lease = if matches!(location.scheme(), "s3" | "s3a" | "s3n") {
-            Duration::from_secs(30)
-        } else {
-            Duration::from_secs(5)
-        };
         Ok(IoStorageCredential::new(credential.kind.clone())
             .with_prefix(prefix)
-            .with_expiration(deadline.min((now + lease).max(required_until + RETRY_DELAY))))
+            .with_expiration(deadline))
     }
 }
 
@@ -595,6 +582,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s3_near_expiry_refreshes_before_signing_and_preserves_the_new_expiry() {
+        use iceberg::io::{S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION};
+
+        for factory in [
+            Arc::new(OpenDalStorageFactory::s3()) as Arc<dyn StorageFactory>,
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ] {
+            let mut catalog = Server::new_async().await;
+            let mut storage = Server::new_async().await;
+            let now = SystemTime::now();
+            let expiry_ms = |time: SystemTime| {
+                time.duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    .to_string()
+            };
+            let initial_config = HashMap::from([
+                ("s3.access-key-id".into(), "OLD".into()),
+                ("s3.secret-access-key".into(), "dummy-secret".into()),
+                (
+                    "s3.session-token-expires-at-ms".into(),
+                    expiry_ms(now + Duration::from_secs(8)),
+                ),
+            ]);
+            let mut fresh_config = initial_config.clone();
+            fresh_config.insert("s3.access-key-id".into(), "NEW".into());
+            let fresh_expiry = expiry_ms(now + Duration::from_secs(300));
+            fresh_config.insert(
+                "s3.session-token-expires-at-ms".into(),
+                fresh_expiry.clone(),
+            );
+            let refresh = catalog
+                .mock("GET", "/table/credentials")
+                .with_body(
+                    json!({"storage-credentials": [{
+                        "prefix": "s3://bucket/table/", "config": fresh_config
+                    }]})
+                    .to_string(),
+                )
+                .expect(1)
+                .create_async()
+                .await;
+            let request = storage
+                .mock("GET", "/bucket/table/file")
+                .match_header("authorization", Matcher::Regex("Credential=NEW/".into()))
+                .with_body("data")
+                .expect(1)
+                .create_async()
+                .await;
+            let provider = provider(
+                &catalog,
+                CredentialSet::new(initial_config, None),
+                Some(true),
+            );
+            let io = FileIOBuilder::new(factory)
+                .with_prop(S3_ENDPOINT, storage.url())
+                .with_prop(S3_REGION, "us-east-1")
+                .with_prop(S3_PATH_STYLE_ACCESS, "true")
+                .with_prop("io.max-retries", "0")
+                .with_credential_provider(provider.clone())
+                .build();
+            assert_eq!(
+                io.new_input("s3://bucket/table/file")
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"data"
+            );
+            assert_eq!(
+                provider
+                    .load_credential("s3://bucket/table/file")
+                    .await
+                    .unwrap()
+                    .expires_at(),
+                Some(parse_expiry(&fresh_expiry, "invalid test expiry").unwrap())
+            );
+            refresh.assert_async().await;
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
     async fn adls_open_handles_use_refreshed_rest_credentials_on_http_requests() {
         for factory in adls_factories() {
             let mut catalog = Server::new_async().await;
@@ -816,6 +887,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected.test_sas_token(), "sig=data");
         assert_eq!(selected.prefix(), Some(child.as_str()));
+        assert_eq!(selected.expires_at(), Some(set.issued_at + LEASE));
         assert!(selected.covers(LOCATION));
         let outside = "abfss://other@acct.dfs.core.windows.net/outside";
         let credential = set
@@ -833,21 +905,21 @@ mod tests {
         );
         assert!(credential.covers(outside));
         assert!(!credential.covers(LOCATION));
-        assert!(!matches_prefix(
-            &Url::parse(ROOT).unwrap(),
-            &Url::parse(&LOCATION.replace("/table/", "/table2/")).unwrap()
+        assert!(!storage_prefix_covers(
+            ROOT,
+            &LOCATION.replace("/table/", "/table2/")
         ));
-        assert!(!matches_prefix(
-            &Url::parse(ROOT).unwrap(),
-            &Url::parse(&LOCATION.replace("acct.", "otheracct.")).unwrap()
+        assert!(!storage_prefix_covers(
+            ROOT,
+            &LOCATION.replace("acct.", "otheracct.")
         ));
-        assert!(!matches_prefix(
-            &Url::parse(ROOT).unwrap(),
-            &Url::parse(&LOCATION.replace("fs@", "otherfs@")).unwrap()
+        assert!(!storage_prefix_covers(
+            ROOT,
+            &LOCATION.replace("fs@", "otherfs@")
         ));
-        assert!(!matches_prefix(
-            &Url::parse(ROOT).unwrap(),
-            &Url::parse(&LOCATION.replace("abfss:", "abfs:")).unwrap()
+        assert!(!storage_prefix_covers(
+            ROOT,
+            &LOCATION.replace("abfss:", "abfs:")
         ));
         assert!(
             set.select(&Url::parse(&LOCATION.replace("acct.", "otheracct.")).unwrap())
@@ -923,6 +995,12 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis()
+        );
+        assert_eq!(
+            set.load_credential(&Url::parse(LOCATION).unwrap(), now, true, Duration::ZERO)
+                .unwrap()
+                .expires_at(),
+            selected.expiry
         );
         assert!(
             set.select(&Url::parse(&LOCATION.replace("acct.", "other.")).unwrap())
