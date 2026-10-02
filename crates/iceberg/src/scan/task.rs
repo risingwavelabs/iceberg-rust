@@ -101,9 +101,13 @@ pub struct FileScanTask {
     #[builder(default)]
     pub predicate: Option<BoundPredicate>,
 
-    /// The list of delete files that may need to be applied to this data file
+    /// Delete files that may apply to this data file.
+    ///
+    /// Shared via [`Arc`] so a delete that matches many data files is interned
+    /// once in the scan's delete-file index instead of cloning the path `String`
+    /// onto every task.
     #[builder(default)]
-    pub deletes: Vec<FileScanTaskDeleteFile>,
+    pub deletes: Vec<Arc<FileScanTaskDeleteFile>>,
 
     /// Data sequence number of the manifest entry that produced this task.
     ///

@@ -450,7 +450,8 @@ mod tests {
                     .with_file_path(delete_file_path)
                     .with_file_type(DataContentType::PositionDeletes)
                     .with_partition_spec_id(0)
-                    .build(),
+                    .build()
+                    .into(),
             ])
             .with_case_sensitive(false)
             .build();
@@ -668,7 +669,8 @@ mod tests {
                     .with_file_path(delete_file_path)
                     .with_file_type(DataContentType::PositionDeletes)
                     .with_partition_spec_id(0)
-                    .build(),
+                    .build()
+                    .into(),
             ])
             .with_case_sensitive(false)
             .build();
@@ -880,7 +882,8 @@ mod tests {
                     .with_file_path(delete_file_path)
                     .with_file_type(DataContentType::PositionDeletes)
                     .with_partition_spec_id(0)
-                    .build(),
+                    .build()
+                    .into(),
             ])
             .with_case_sensitive(false)
             .build();
