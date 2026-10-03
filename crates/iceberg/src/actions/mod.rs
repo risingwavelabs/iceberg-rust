@@ -16,8 +16,13 @@
 // under the License.
 
 //! Table maintenance actions.
+//!
+//! This module provides actions for table maintenance operations, such as
+//! cleaning up orphan files and removing dangling delete file references.
 
 pub(crate) mod maintenance;
+mod remove_dangling_delete_files;
 mod remove_orphan_files;
 
+pub use remove_dangling_delete_files::RemoveDanglingDeleteFilesAction;
 pub use remove_orphan_files::RemoveOrphanFilesAction;

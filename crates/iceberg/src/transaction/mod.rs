@@ -74,6 +74,7 @@ use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWi
 pub use manifest_filter::{ManifestFilterManager, ManifestWriterContext};
 pub use replace_files::{OverwriteFilesAction, RewriteFilesAction};
 pub use rewrite_manifests::RewriteManifestsAction;
+pub(crate) use snapshot::data_file_identity;
 pub use update_schema::AddColumn;
 
 use crate::error::Result;
