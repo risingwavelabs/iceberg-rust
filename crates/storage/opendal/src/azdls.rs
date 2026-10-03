@@ -21,7 +21,7 @@ use std::str::FromStr;
 
 use iceberg::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_AUTHORITY_HOST, ADLS_CLIENT_ID, ADLS_CLIENT_SECRET,
-    ADLS_CONNECTION_STRING, ADLS_SAS_TOKEN, ADLS_TENANT_ID,
+    ADLS_CONNECTION_STRING, ADLS_ENDPOINT, ADLS_SAS_TOKEN, ADLS_TENANT_ID, CredentialProvider,
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Configurator;
@@ -29,6 +29,7 @@ use opendal::services::AzdlsConfig;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::credentials::{VendedAzdlsCredentialProvider, VendedCredentialSource};
 use crate::utils::from_opendal_error;
 
 /// Local version of `ensure_data_valid` macro since the iceberg crate's macro
@@ -80,6 +81,7 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
     if let Some(authority_host) = properties.remove(ADLS_AUTHORITY_HOST) {
         config.authority_host = Some(authority_host);
     }
+    config.endpoint = properties.remove(ADLS_ENDPOINT);
 
     Ok(config)
 }
@@ -91,18 +93,18 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
 pub(crate) fn azdls_create_operator<'a>(
     absolute_path: &'a str,
     config: &AzdlsConfig,
+    credentials: Option<&CredentialProvider>,
 ) -> Result<(opendal::Operator, &'a str)> {
     let path = absolute_path.parse::<AzureStoragePath>()?;
     match_path_with_config(&path, config)?;
 
-    let op = azdls_config_build(config, &path)?;
+    let op = azdls_config_build(config, &path, absolute_path, credentials)?;
 
     // Paths to files in ADLS tend to be written in fully qualified form,
     // including their filesystem and account name.
     // OpenDAL's operator methods expect only the relative path, so we split it
     // off and save it for later use.
-    let relative_path_len = path.path.len();
-    let (_, relative_path) = absolute_path.split_at(absolute_path.len() - relative_path_len);
+    let relative_path = path.relative_path(absolute_path);
 
     Ok((op, relative_path))
 }
@@ -192,7 +194,12 @@ pub(crate) fn match_path_with_config(path: &AzureStoragePath, config: &AzdlsConf
     Ok(())
 }
 
-fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<opendal::Operator> {
+fn azdls_config_build(
+    config: &AzdlsConfig,
+    path: &AzureStoragePath,
+    location: &str,
+    credentials: Option<&CredentialProvider>,
+) -> Result<opendal::Operator> {
     let mut builder = config.clone().into_builder();
 
     if config.endpoint.is_none() {
@@ -200,6 +207,15 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
         builder = builder.endpoint(&path.as_endpoint());
     }
     builder = builder.filesystem(&path.filesystem);
+    if let Some(provider) = credentials {
+        builder =
+            builder.credential_provider_chain(reqsign_core::ProvideCredentialChain::new().push(
+                VendedAzdlsCredentialProvider(VendedCredentialSource {
+                    provider: provider.clone(),
+                    location: location.to_string(),
+                }),
+            ));
+    }
 
     opendal::Operator::new(builder).map_err(from_opendal_error)
 }
@@ -236,6 +252,14 @@ impl AzureStoragePath {
             self.account_name,
             self.endpoint_suffix
         )
+    }
+
+    /// The part of `absolute_path` below the filesystem, without a leading `/`,
+    /// like the relative paths of the other backends. OpenDAL does not strip it
+    /// everywhere: `Deleter::delete` sends `/a` as `<filesystem>//a`.
+    pub(crate) fn relative_path<'a>(&self, absolute_path: &'a str) -> &'a str {
+        let path = &absolute_path[absolute_path.len() - self.path.len()..];
+        path.strip_prefix('/').unwrap_or(path)
     }
 }
 
@@ -327,6 +351,17 @@ mod tests {
     fn test_azdls_config_parse() {
         let test_cases = vec![
             (
+                "custom endpoint",
+                HashMap::from([(
+                    iceberg::io::ADLS_ENDPOINT.to_string(),
+                    "http://localhost:10000".to_string(),
+                )]),
+                Some(AzdlsConfig {
+                    endpoint: Some("http://localhost:10000".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            (
                 "account name and key",
                 HashMap::from([
                     (super::ADLS_ACCOUNT_NAME.to_string(), "test".to_string()),
@@ -395,7 +430,19 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
+            ),
+            (
+                "filesystem root",
+                (
+                    "abfss://myfs@myaccount.dfs.core.windows.net/",
+                    AzdlsConfig {
+                        account_name: Some("myaccount".to_string()),
+                        endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                Some(("myfs", "")),
             ),
             (
                 "different account",
@@ -445,7 +492,7 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
             ),
             (
                 "scheme differs from a previously-configured one is accepted",
@@ -459,12 +506,12 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
             ),
         ];
 
         for (name, input, expected) in test_cases {
-            let result = azdls_create_operator(input.0, &input.1);
+            let result = azdls_create_operator(input.0, &input.1, None);
             match expected {
                 Some((expected_filesystem, expected_path)) => {
                     assert!(result.is_ok(), "Test case {name} failed: {result:?}");
