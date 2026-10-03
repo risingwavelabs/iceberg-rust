@@ -33,16 +33,16 @@ mod tests {
         S3_SECRET_ACCESS_KEY,
     };
     use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
-    use iceberg_test_utils::{get_minio_endpoint, normalize_test_name_with_parts, set_up};
+    use iceberg_test_utils::{get_object_store_endpoint, normalize_test_name_with_parts, set_up};
 
     fn get_resolving_file_io() -> iceberg::io::FileIO {
         set_up();
 
-        let minio_endpoint = get_minio_endpoint();
+        let object_store_endpoint = get_object_store_endpoint();
 
         FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new()))
             .with_props(vec![
-                (S3_ENDPOINT, minio_endpoint),
+                (S3_ENDPOINT, object_store_endpoint),
                 (S3_ACCESS_KEY_ID, "admin".to_string()),
                 (S3_SECRET_ACCESS_KEY, "password".to_string()),
                 (S3_REGION, "us-east-1".to_string()),
@@ -252,50 +252,5 @@ mod tests {
         let file_io = get_resolving_file_io();
         let result = file_io.exists("no-scheme-path").await;
         assert!(result.is_err());
-    }
-
-    #[cfg(feature = "opendal-s3")]
-    #[tokio::test]
-    async fn test_with_custom_credential_loader() {
-        use iceberg_storage_opendal::{
-            AwsCredential, CustomAwsCredentialLoader, ProvideCredential,
-        };
-        use reqsign_core::Context;
-
-        #[derive(Debug)]
-        struct MinioCredentialLoader;
-
-        impl ProvideCredential for MinioCredentialLoader {
-            type Credential = AwsCredential;
-
-            async fn provide_credential(
-                &self,
-                _ctx: &Context,
-            ) -> reqsign_core::Result<Option<AwsCredential>> {
-                Ok(Some(AwsCredential {
-                    access_key_id: "admin".to_string(),
-                    secret_access_key: "password".to_string(),
-                    session_token: None,
-                    expires_in: None,
-                }))
-            }
-        }
-
-        set_up();
-        let minio_endpoint = get_minio_endpoint();
-
-        let factory = OpenDalResolvingStorageFactory::new()
-            .with_s3_credential_loader(CustomAwsCredentialLoader::new(MinioCredentialLoader));
-
-        let file_io = FileIOBuilder::new(Arc::new(factory))
-            .with_props(vec![
-                (S3_ENDPOINT, minio_endpoint),
-                (S3_REGION, "us-east-1".to_string()),
-                (S3_PATH_STYLE_ACCESS, "true".to_string()),
-            ])
-            .build();
-
-        // Should be able to access S3 using the custom credential loader
-        assert!(file_io.exists("s3://bucket1/").await.unwrap());
     }
 }
