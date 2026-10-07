@@ -351,6 +351,7 @@ struct PreparedRewriteFiles {
     /// The exact parent manifests whose contents produced `output_manifests`.
     source_manifests: Vec<ManifestFile>,
     output_manifests: Vec<ManifestFile>,
+    deleted_entries: Vec<ManifestEntry>,
     format_version: FormatVersion,
     last_sequence_number: i64,
 }
@@ -852,6 +853,7 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                 .append_only_delta(table, &prepared, &current_manifests)
                 .await?
         {
+            snapshot_producer.set_actual_deleted_entries(prepared.deleted_entries.clone());
             let summary = snapshot_producer
                 .prepare_summary(&ReplaceFilesOperation::<M>::new())
                 .map_err(|err| {
@@ -868,6 +870,7 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                 state.prepared = Some(PreparedRewriteFiles {
                     source_manifests: current_manifests,
                     output_manifests: output_manifests.clone(),
+                    deleted_entries: prepared.deleted_entries,
                     format_version: table.metadata().format_version(),
                     last_sequence_number: table.metadata().last_sequence_number(),
                 });
@@ -905,6 +908,12 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             affected_manifest_paths,
             self.manifest_load_concurrency,
         );
+        // Manifests must be prepared before summary because `prepare_summary`
+        // requires `actual_deleted_entries` populated by `prepare_manifests` to
+        // accurately record deleted files and row counts (including duplicate entries).
+        let output_manifests = snapshot_producer
+            .prepare_manifests(&operation, &DefaultManifestProcess)
+            .await?;
         let summary = snapshot_producer
             .prepare_summary(&operation)
             .map_err(|err| {
@@ -914,14 +923,15 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                 )
                 .with_source(err)
             })?;
-        let output_manifests = snapshot_producer
-            .prepare_manifests(&operation, &DefaultManifestProcess)
-            .await?;
         {
             let mut state = self.state.lock().expect("rewrite-files state poisoned");
             state.prepared = Some(PreparedRewriteFiles {
                 source_manifests: current_manifests,
                 output_manifests: output_manifests.clone(),
+                deleted_entries: snapshot_producer
+                    .actual_deleted_entries()
+                    .map(|e| e.to_vec())
+                    .unwrap_or_default(),
                 format_version: table.metadata().format_version(),
                 last_sequence_number: table.metadata().last_sequence_number(),
             });
@@ -956,7 +966,7 @@ mod tests {
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
         MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile, ManifestListWriter,
         ManifestStatus, ManifestWriterBuilder, Operation, Snapshot, SnapshotRef, SnapshotReference,
-        SnapshotRetention, Struct, Summary, UnboundPartitionSpec,
+        SnapshotRetention, Struct, Summary, TableProperties, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::test_utils::make_encrypted_table;
@@ -2363,6 +2373,7 @@ mod tests {
         let prepared = PreparedRewriteFiles {
             source_manifests: vec![],
             output_manifests: vec![],
+            deleted_entries: vec![],
             format_version: FormatVersion::V2,
             last_sequence_number: 1,
         };
@@ -2580,7 +2591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rewrite_files_reprepare_rejects_duplicate_removed_identity() {
+    async fn test_rewrite_files_reprepare_handles_duplicate_removed_identity() {
         // Prime the cache with one live occurrence of the selected input file.
         let base = retry_test_table();
         let removed = retry_test_data_file("test/duplicate-retry-input.parquet");
@@ -2634,14 +2645,601 @@ mod tests {
         .await;
         let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
 
-        // Full preparation rejects the invalid duplicate instead of corrupting totals.
-        let err = match Arc::clone(&action).commit(&table_v2).await {
-            Ok(_) => panic!("retry with duplicate rewrite inputs should fail"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(!err.retryable());
-        assert!(err.message().contains("referenced multiple times"));
+        // Full preparation deletes all occurrences and properly decrements totals.
+        let commit = Arc::clone(&action).commit(&table_v2).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+        assert_eq!(
+            summary.additional_properties.get("deleted-data-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("added-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("total-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("deleted-records"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("removed-files-size"),
+            Some(&"200".to_string())
+        );
+
+        let manifest_list = table_v2
+            .manifest_list_reader(&Arc::new(snapshot))
+            .load()
+            .await
+            .unwrap();
+        let delete_manifest = manifest_list
+            .entries()
+            .iter()
+            .find(|m| m.deleted_files_count == Some(2))
+            .expect("should produce delete manifest with 2 deleted files");
+        let loaded = delete_manifest
+            .load_manifest(table_v2.file_io())
+            .await
+            .unwrap();
+        assert_eq!(loaded.entries().len(), 2);
+        for entry in loaded.entries() {
+            assert_eq!(entry.status, ManifestStatus::Deleted);
+            assert_eq!(
+                entry.data_file().file_path,
+                "test/duplicate-retry-input.parquet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_initial_handles_duplicate_file_references() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/duplicate-input.parquet");
+        let manifest_1 = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-m1.avro",
+            801,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let manifest_2 = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-m2.avro",
+            802,
+            2,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-802.avro",
+            802,
+            2,
+            None,
+            vec![manifest_1, manifest_2],
+            2,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+
+        let action = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .set_check_file_existence(true)
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file("test/duplicate-replacement.parquet")]),
+        );
+        let commit = action.commit(&table).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+        assert_eq!(
+            summary.additional_properties.get("deleted-data-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("added-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("total-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("deleted-records"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("removed-files-size"),
+            Some(&"200".to_string())
+        );
+
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot))
+            .load()
+            .await
+            .unwrap();
+        let delete_manifest = manifest_list
+            .entries()
+            .iter()
+            .find(|m| m.deleted_files_count == Some(2))
+            .expect("should produce delete manifest with 2 deleted files");
+        let loaded = delete_manifest
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(loaded.entries().len(), 2);
+        for entry in loaded.entries() {
+            assert_eq!(entry.status, ManifestStatus::Deleted);
+            assert_eq!(entry.data_file().file_path, "test/duplicate-input.parquet");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_files_handles_duplicate_file_references() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/duplicate-overwrite-input.parquet");
+        let manifest_1 = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-ow-m1.avro",
+            811,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let manifest_2 = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-ow-m2.avro",
+            812,
+            2,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-812.avro",
+            812,
+            2,
+            None,
+            vec![manifest_1, manifest_2],
+            2,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+
+        let action = Arc::new(
+            Transaction::new(&table)
+                .overwrite_files()
+                .delete_files([removed.clone()])
+                .add_data_files([retry_test_data_file(
+                    "test/duplicate-overwrite-replacement.parquet",
+                )]),
+        );
+        let commit = action.commit(&table).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+        assert_eq!(
+            summary.additional_properties.get("deleted-data-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("added-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("total-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("deleted-records"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("removed-files-size"),
+            Some(&"200".to_string())
+        );
+
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot))
+            .load()
+            .await
+            .unwrap();
+        let delete_manifest = manifest_list
+            .entries()
+            .iter()
+            .find(|m| m.deleted_files_count == Some(2))
+            .expect("should produce delete manifest with 2 deleted files");
+        let loaded = delete_manifest
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(loaded.entries().len(), 2);
+        for entry in loaded.entries() {
+            assert_eq!(entry.status, ManifestStatus::Deleted);
+            assert_eq!(
+                entry.data_file().file_path,
+                "test/duplicate-overwrite-input.parquet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_handles_duplicate_references_in_same_manifest() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/duplicate-same-manifest.parquet");
+        let same_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/duplicate-same.avro",
+            821,
+            1,
+            vec![removed.clone(), removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-821.avro",
+            821,
+            1,
+            None,
+            vec![same_manifest],
+            2,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+
+        let action = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .set_check_file_existence(true)
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file(
+                    "test/duplicate-same-replacement.parquet",
+                )]),
+        );
+        let commit = action.commit(&table).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+        assert_eq!(
+            summary.additional_properties.get("deleted-data-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("added-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("total-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("deleted-records"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("removed-files-size"),
+            Some(&"200".to_string())
+        );
+
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot))
+            .load()
+            .await
+            .unwrap();
+        let delete_manifest = manifest_list
+            .entries()
+            .iter()
+            .find(|m| m.deleted_files_count == Some(2))
+            .expect("should produce delete manifest with 2 deleted files");
+        let loaded = delete_manifest
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        assert_eq!(loaded.entries().len(), 2);
+        for entry in loaded.entries() {
+            assert_eq!(entry.status, ManifestStatus::Deleted);
+            assert_eq!(
+                entry.data_file().file_path,
+                "test/duplicate-same-manifest.parquet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_fast_retry_retains_duplicate_deleted_entries() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/duplicate-fast-retry.parquet");
+        let manifest_1 = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/fast-retry-m1.avro",
+            831,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let manifest_2 = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/fast-retry-m2.avro",
+            832,
+            2,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot_1 = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-832.avro",
+            832,
+            2,
+            None,
+            vec![manifest_1.clone(), manifest_2.clone()],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot_1);
+
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file("test/fast-retry-replacement.parquet")]),
+        );
+        // First commit call prepares and caches manifests + deleted_entries
+        let first_snapshot =
+            committed_snapshot(Arc::clone(&action).commit(&table_v1).await.unwrap());
+        assert_eq!(
+            first_snapshot
+                .summary()
+                .additional_properties
+                .get("deleted-data-files"),
+            Some(&"2".to_string())
+        );
+
+        // A concurrent fast append adds a new data file
+        let appended_file = retry_test_data_file("test/fast-retry-appended.parquet");
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/fast-retry-appended-m.avro",
+            833,
+            3,
+            appended_file,
+        )
+        .await;
+        let snapshot_2 = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-833.avro",
+            833,
+            3,
+            Some(832),
+            vec![manifest_1, manifest_2, appended_manifest],
+            3,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot_2);
+
+        // Commit against table_v2 exercises append_only_delta fast retry path
+        let commit = Arc::clone(&action).commit(&table_v2).await.unwrap();
+        let second_snapshot = committed_snapshot(commit);
+        let summary = second_snapshot.summary();
+
+        // Must still decrement both duplicates and account for the appended file
+        assert_eq!(
+            summary.additional_properties.get("deleted-data-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("added-data-files"),
+            Some(&"1".to_string())
+        );
+        // Total: 3 (in snapshot_2) - 2 (deleted) + 1 (replacement) = 2
+        assert_eq!(
+            summary.additional_properties.get("total-data-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("deleted-records"),
+            Some(&"20".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("removed-files-size"),
+            Some(&"200".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_handles_duplicate_delete_file_references() {
+        let base = retry_test_table();
+        let data_file = retry_test_data_file("test/duplicate-del-data.parquet");
+        let data_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/dup-del-data.avro",
+            841,
+            1,
+            vec![data_file],
+        )
+        .await;
+
+        let delete_file = retry_test_position_delete_file("test/duplicate-pos-del.parquet", None);
+        let del_manifest_1 = write_retry_test_added_delete_manifest(
+            &base,
+            "memory:///test/location/metadata/dup-del-m1.avro",
+            842,
+            2,
+            delete_file.clone(),
+        )
+        .await;
+        let del_manifest_2 = write_retry_test_added_delete_manifest(
+            &base,
+            "memory:///test/location/metadata/dup-del-m2.avro",
+            843,
+            3,
+            delete_file.clone(),
+        )
+        .await;
+
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-843.avro",
+            843,
+            3,
+            None,
+            vec![data_manifest, del_manifest_1, del_manifest_2],
+            1,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+
+        let action = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .delete_files([delete_file])
+                .add_data_files([retry_test_data_file("test/dup-del-replacement.parquet")]),
+        );
+        let commit = action.commit(&table).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+
+        assert_eq!(
+            summary.additional_properties.get("removed-delete-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary
+                .additional_properties
+                .get("removed-position-delete-files"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary
+                .additional_properties
+                .get("removed-position-deletes"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_partitioned_duplicate_updates_partition_summaries() {
+        let base = retry_test_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT.to_string(),
+                "10".to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata));
+
+        let removed = retry_test_data_file("test/dup-partition-input.parquet");
+        let manifest_1 = write_retry_test_manifest(
+            &table,
+            "memory:///test/location/metadata/dup-part-m1.avro",
+            851,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let manifest_2 = write_retry_test_manifest(
+            &table,
+            "memory:///test/location/metadata/dup-part-m2.avro",
+            852,
+            2,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table,
+            "memory:///test/location/metadata/list-852.avro",
+            852,
+            2,
+            None,
+            vec![manifest_1, manifest_2],
+            2,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&table, snapshot);
+
+        let action = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .set_check_file_existence(true)
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file("test/dup-part-replacement.parquet")]),
+        );
+        let commit = action.commit(&table).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+
+        let partition_prop = summary
+            .additional_properties
+            .iter()
+            .find(|(k, _)| k.starts_with("partitions."))
+            .expect("should produce partition-specific summary");
+        assert!(
+            partition_prop.1.contains("deleted-data-files=2")
+                && partition_prop.1.contains("added-data-files=1")
+                && partition_prop.1.contains("deleted-records=20")
+                && partition_prop.1.contains("removed-files-size=200"),
+            "partition summary should reflect both deleted duplicate files: {}",
+            partition_prop.1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_files_check_existence_false_unmatched_files_no_phantom_subtractions() {
+        let base = retry_test_table();
+        let existing = retry_test_data_file("test/existing-file.parquet");
+        let manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/existing-m.avro",
+            861,
+            1,
+            vec![existing],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-861.avro",
+            861,
+            1,
+            None,
+            vec![manifest],
+            1,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+
+        let nonexistent = retry_test_data_file("test/never-added.parquet");
+        let replacement = retry_test_data_file("test/added-file.parquet");
+
+        let action = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .set_check_file_existence(false)
+                .delete_files([nonexistent])
+                .add_data_files([replacement]),
+        );
+        let commit = action.commit(&table).await.unwrap();
+        let snapshot = committed_snapshot(commit);
+        let summary = snapshot.summary();
+
+        assert_eq!(
+            summary.additional_properties.get("deleted-data-files"),
+            None
+        );
+        assert_eq!(
+            summary.additional_properties.get("added-data-files"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            summary.additional_properties.get("total-data-files"),
+            Some(&"2".to_string())
+        );
     }
 
     /// A logical overwrite may replace only part of a table. Its summary must account for the
