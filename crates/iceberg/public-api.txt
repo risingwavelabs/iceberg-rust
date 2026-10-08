@@ -1,5 +1,10 @@
 pub mod iceberg
 pub mod iceberg::actions
+pub struct iceberg::actions::RemoveDanglingDeleteFilesAction
+impl iceberg::actions::RemoveDanglingDeleteFilesAction
+pub async fn iceberg::actions::RemoveDanglingDeleteFilesAction::execute(self) -> iceberg::Result<usize>
+pub fn iceberg::actions::RemoveDanglingDeleteFilesAction::new(catalog: alloc::sync::Arc<dyn iceberg::Catalog>, table_ident: iceberg::TableIdent) -> Self
+pub fn iceberg::actions::RemoveDanglingDeleteFilesAction::to_branch(self, branch: impl core::convert::Into<alloc::string::String>) -> Self
 pub struct iceberg::actions::RemoveOrphanFilesAction
 impl iceberg::actions::RemoveOrphanFilesAction
 pub fn iceberg::actions::RemoveOrphanFilesAction::dry_run(self, dry_run: bool) -> Self

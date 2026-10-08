@@ -195,6 +195,13 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    pub(crate) fn has_removed_files_for_manifest_type(&self, content: ManifestContentType) -> bool {
+        match content {
+            ManifestContentType::Data => !self.removed_data_file_identities.is_empty(),
+            ManifestContentType::Deletes => !self.removed_delete_file_identities.is_empty(),
+        }
+    }
+
     pub(crate) fn validate_added_files(&self, files: &[DataFile]) -> Result<()> {
         for data_file in files {
             // Check if the data file partition spec id matches the table default partition spec id.

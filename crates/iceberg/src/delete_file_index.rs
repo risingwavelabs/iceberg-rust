@@ -29,7 +29,31 @@ use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
 use crate::spec::{DataContentType, DataFile, Struct};
 
 // Iceberg field ID for the `file_path` column in position delete files.
-const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2147483546;
+pub(crate) const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2147483546;
+
+/// Infers the single data file a position delete file targets from its `file_path` bounds.
+///
+/// Matches Iceberg Java's `DeleteFileUtil.referencedDataFile(DeleteFile)` heuristic: if the lower
+/// and upper bounds for the `file_path` column are present and equal, the delete file targets a
+/// single data file.
+pub(crate) fn try_infer_single_referenced_data_file_from_bounds(
+    delete_file: &DataFile,
+) -> Option<String> {
+    let lower = delete_file
+        .lower_bounds()
+        .get(&POSITION_DELETE_FILE_PATH_FIELD_ID)?;
+    let upper = delete_file
+        .upper_bounds()
+        .get(&POSITION_DELETE_FILE_PATH_FIELD_ID)?;
+
+    if lower != upper {
+        return None;
+    }
+
+    let bytes = lower.to_bytes().ok()?;
+    let path = std::str::from_utf8(bytes.as_ref()).ok()?;
+    Some(path.to_string())
+}
 
 /// Returns whether a position delete file may contain deletes for the data file.
 ///
