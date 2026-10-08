@@ -48,6 +48,35 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
+impl<T> JoinHandle<T> {
+    /// Aborts the task when the returned handle is dropped, for tasks whose output is
+    /// only useful to the caller awaiting it.
+    pub(crate) fn abort_on_drop(self) -> AbortOnDropHandle<T> {
+        AbortOnDropHandle(self)
+    }
+}
+
+/// A [`JoinHandle`] that aborts its task on drop, so an early error or cancellation in
+/// the caller doesn't leave the task running detached. Abort takes effect at the task's
+/// next `.await`.
+pub(crate) struct AbortOnDropHandle<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        self.0.0.abort();
+    }
+}
+
+impl<T> Unpin for AbortOnDropHandle<T> {}
+
+impl<T: Send + 'static> Future for AbortOnDropHandle<T> {
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
 /// Handle to a single tokio runtime.
 ///
 /// Wraps a [`tokio::runtime::Handle`], which is cheap to clone. The caller is
@@ -283,6 +312,32 @@ mod tests {
     fn test_try_current_outside_runtime() {
         let err = Runtime::try_current().expect_err("must fail outside runtime");
         assert_eq!(err.kind(), ErrorKind::Unexpected);
+    }
+
+    // The spawned future owns `_tx`, so `rx` resolving with an error proves the task
+    // was dropped rather than left pending.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_abort_on_drop_cancels_task() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = Runtime::current()
+            .io()
+            .spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await
+            })
+            .abort_on_drop();
+        drop(handle);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("task was not aborted");
+        assert!(closed.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_abort_on_drop_returns_output() {
+        let handle = Runtime::current().io().spawn(async { 9 }).abort_on_drop();
+        assert_eq!(handle.await.unwrap(), 9);
     }
 
     /// Verifies that when the caller drops the underlying tokio runtime, a

@@ -3509,6 +3509,8 @@ pub fn iceberg::transaction::RewriteManifestsAction::set_commit_uuid(self, commi
 pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_id(self, snapshot_id: i64) -> Self
 pub fn iceberg::transaction::RewriteManifestsAction::set_snapshot_properties(self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
 pub fn iceberg::transaction::RewriteManifestsAction::set_target_branch(self, target_branch: alloc::string::String) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::with_load_concurrency(self, load_concurrency: usize) -> Self
+pub fn iceberg::transaction::RewriteManifestsAction::with_write_concurrency(self, write_concurrency: usize) -> Self
 impl core::default::Default for iceberg::transaction::RewriteManifestsAction
 pub fn iceberg::transaction::RewriteManifestsAction::default() -> Self
 pub struct iceberg::transaction::Transaction
