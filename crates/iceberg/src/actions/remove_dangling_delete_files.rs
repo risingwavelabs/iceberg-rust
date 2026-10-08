@@ -24,15 +24,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
 use crate::actions::maintenance::{DEFAULT_LOAD_CONCURRENCY, for_each_manifest};
 use crate::delete_file_index::try_infer_single_referenced_data_file_from_bounds;
-use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, Struct};
+use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, SnapshotRef, Struct};
 use crate::table::Table;
 use crate::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction, data_file_identity,
+    ActionCommit, ApplyTransactionAction, RewriteFilesAction, Transaction, TransactionAction,
+    data_file_identity,
 };
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent, TableRequirement};
 
@@ -78,189 +80,214 @@ impl RemoveDanglingDeleteFilesAction {
     }
 
     /// Executes the action, returning the number of dangling delete files removed.
+    ///
+    /// The dangling set is computed against the branch snapshot the commit is
+    /// actually built on: if a concurrent commit moves the branch, the
+    /// transaction's retry refreshes the table and rescans instead of replaying
+    /// a stale decision.
     pub async fn execute(self) -> Result<usize> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         let Some(snapshot) = table.metadata().snapshot_for_ref(&self.to_branch) else {
             return Ok(0);
         };
 
-        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-
-        let mut data_file_paths: HashSet<String> = HashSet::new();
-        let mut pos_deletes: Vec<(DataFile, Option<i64>)> = Vec::new();
-        let mut eq_deletes: Vec<(DataFile, i64)> = Vec::new();
-        let mut partition_min_seq: HashMap<(i32, Struct), i64> = HashMap::new();
-        let mut global_min_data_seq: Option<i64> = None;
-
-        let manifest_files: Vec<_> = manifest_list.entries().to_vec();
-        for_each_manifest(
-            &table,
-            manifest_files,
-            DEFAULT_LOAD_CONCURRENCY,
-            |_, manifest| {
-                for entry in manifest.entries() {
-                    if !entry.is_alive() {
-                        continue;
-                    }
-
-                    let df = entry.data_file();
-                    let seq = entry.sequence_number();
-
-                    match entry.content_type() {
-                        DataContentType::Data => {
-                            data_file_paths.insert(df.file_path().to_string());
-                            if let Some(s) = seq {
-                                let key = (df.partition_spec_id(), df.partition().clone());
-                                partition_min_seq
-                                    .entry(key)
-                                    .and_modify(|min| *min = (*min).min(s))
-                                    .or_insert(s);
-                                global_min_data_seq =
-                                    Some(global_min_data_seq.map_or(s, |g| g.min(s)));
-                            }
-                        }
-                        DataContentType::PositionDeletes => {
-                            pos_deletes.push((df.clone(), seq));
-                        }
-                        DataContentType::EqualityDeletes => {
-                            if let Some(s) = seq {
-                                eq_deletes.push((df.clone(), s));
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .await?;
-
-        let mut dangling: Vec<DataFile> = Vec::new();
-
-        dangling.extend(
-            pos_deletes
-                .into_iter()
-                .filter(|(df, df_seq)| {
-                    if let Some(ref_path) = df.referenced_data_file() {
-                        // Path-based: dangling if the referenced data file no longer exists
-                        !data_file_paths.contains(&ref_path)
-                    } else if let Some(inferred_path) =
-                        try_infer_single_referenced_data_file_from_bounds(df)
-                    {
-                        // V2 position deletes may omit `referenced_data_file` while their
-                        // `file_path` column's lower/upper bounds still prove a single
-                        // target (the same heuristic the reader uses to scope deletes).
-                        !data_file_paths.contains(&inferred_path)
-                    } else if let Some(s) = df_seq {
-                        // Sequence-based: dangling if seq < min_data_seq in this partition
-                        let key = (df.partition_spec_id(), df.partition().clone());
-                        partition_min_seq
-                            .get(&key)
-                            .is_none_or(|&min_seq| *s < min_seq)
-                    } else {
-                        // No referenced_data_file and no sequence number — cannot determine
-                        false
-                    }
-                })
-                .map(|(df, _)| df),
-        );
-
-        dangling.extend(
-            eq_deletes
-                .into_iter()
-                .filter(|(df, seq)| {
-                    if df.partition().fields().is_empty() {
-                        // Unpartitioned equality deletes are global — they apply to all
-                        // data files regardless of partition. Only remove if seq is <=
-                        // the global minimum data sequence number.
-                        global_min_data_seq.is_none_or(|g| *seq <= g)
-                    } else {
-                        let key = (df.partition_spec_id(), df.partition().clone());
-                        partition_min_seq
-                            .get(&key)
-                            .is_none_or(|&min_seq| *seq <= min_seq)
-                    }
-                })
-                .map(|(df, _)| df),
-        );
-
-        // Dedup by `(file_path, content_offset, content_size_in_bytes)`, not
-        // `file_path` alone: several deletion vectors can share one Puffin
-        // file, so a path-only key would collapse a dangling DV and a
-        // still-live DV in the same file into one entry.
-        let mut seen = HashSet::new();
-        dangling.retain(|df| seen.insert(data_file_identity(df)));
-
+        // Scan once up front so a table with nothing to clean up skips the
+        // commit entirely. The result is reused by the first commit attempt as
+        // long as the branch still points at this snapshot.
+        let dangling = find_dangling_delete_files(&table, snapshot).await?;
         if dangling.is_empty() {
             return Ok(0);
         }
 
-        let dangling_count = dangling.len();
-        let txn = Transaction::new(&table);
-        let branch = self.to_branch.clone();
+        let action = RemoveDanglingDeleteFilesCommit {
+            branch: self.to_branch.clone(),
+            prescan: (snapshot.snapshot_id(), dangling),
+            removed_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let removed_count = Arc::clone(&action.removed_count);
 
-        // Fail the whole commit if `branch` has moved since the snapshot we just
-        // scanned, instead of silently re-applying our dangling-file decision
-        // against a structurally different (refreshed) snapshot. See
-        // `RequireScannedSnapshotAction` for why this must be the first action applied.
-        let txn = RequireScannedSnapshotAction {
-            branch: branch.clone(),
-            snapshot_id: snapshot.snapshot_id(),
-        }
-        .apply(txn)
-        .map_err(|e| {
+        let txn = action.apply(Transaction::new(&table)).map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
-                format!("Failed to build snapshot-guard action: {e}"),
+                format!("Failed to build remove-dangling-deletes action: {e}"),
             )
         })?;
-
-        let action = txn
-            .rewrite_files()
-            .delete_files(dangling)
-            .set_target_branch(branch);
-
-        let txn = action.apply(txn).map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("Failed to build rewrite action: {e}"),
-            )
-        })?;
-
         txn.commit(self.catalog.as_ref()).await?;
 
-        Ok(dangling_count)
+        Ok(removed_count.load(Ordering::SeqCst))
     }
 }
 
-/// A no-op [`TransactionAction`] that only carries a [`TableRequirement`]: `branch` must
-/// still point at `snapshot_id` at commit time.
+/// Collects the delete files in `snapshot` that no longer apply to any live
+/// data file, deduplicated by delete-file identity.
+async fn find_dangling_delete_files(
+    table: &Table,
+    snapshot: &SnapshotRef,
+) -> Result<Vec<DataFile>> {
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+
+    let mut data_file_paths: HashSet<String> = HashSet::new();
+    let mut pos_deletes: Vec<(DataFile, Option<i64>)> = Vec::new();
+    let mut eq_deletes: Vec<(DataFile, i64)> = Vec::new();
+    let mut partition_min_seq: HashMap<(i32, Struct), i64> = HashMap::new();
+    let mut global_min_data_seq: Option<i64> = None;
+
+    let manifest_files: Vec<_> = manifest_list.entries().to_vec();
+    for_each_manifest(
+        table,
+        manifest_files,
+        DEFAULT_LOAD_CONCURRENCY,
+        |_, manifest| {
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+
+                let df = entry.data_file();
+                let seq = entry.sequence_number();
+
+                match entry.content_type() {
+                    DataContentType::Data => {
+                        data_file_paths.insert(df.file_path().to_string());
+                        if let Some(s) = seq {
+                            let key = (df.partition_spec_id(), df.partition().clone());
+                            partition_min_seq
+                                .entry(key)
+                                .and_modify(|min| *min = (*min).min(s))
+                                .or_insert(s);
+                            global_min_data_seq = Some(global_min_data_seq.map_or(s, |g| g.min(s)));
+                        }
+                    }
+                    DataContentType::PositionDeletes => {
+                        pos_deletes.push((df.clone(), seq));
+                    }
+                    DataContentType::EqualityDeletes => {
+                        if let Some(s) = seq {
+                            eq_deletes.push((df.clone(), s));
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .await?;
+
+    let mut dangling: Vec<DataFile> = Vec::new();
+
+    dangling.extend(
+        pos_deletes
+            .into_iter()
+            .filter(|(df, df_seq)| {
+                if let Some(ref_path) = df.referenced_data_file() {
+                    // Path-based: dangling if the referenced data file no longer exists
+                    !data_file_paths.contains(&ref_path)
+                } else if let Some(inferred_path) =
+                    try_infer_single_referenced_data_file_from_bounds(df)
+                {
+                    // V2 position deletes may omit `referenced_data_file` while their
+                    // `file_path` column's lower/upper bounds still prove a single
+                    // target (the same heuristic the reader uses to scope deletes).
+                    !data_file_paths.contains(&inferred_path)
+                } else if let Some(s) = df_seq {
+                    // Sequence-based: dangling if seq < min_data_seq in this partition
+                    let key = (df.partition_spec_id(), df.partition().clone());
+                    partition_min_seq
+                        .get(&key)
+                        .is_none_or(|&min_seq| *s < min_seq)
+                } else {
+                    // No referenced_data_file and no sequence number — cannot determine
+                    false
+                }
+            })
+            .map(|(df, _)| df),
+    );
+
+    dangling.extend(
+        eq_deletes
+            .into_iter()
+            .filter(|(df, seq)| {
+                if df.partition().fields().is_empty() {
+                    // Unpartitioned equality deletes are global — they apply to all
+                    // data files regardless of partition. Only remove if seq is <=
+                    // the global minimum data sequence number.
+                    global_min_data_seq.is_none_or(|g| *seq <= g)
+                } else {
+                    let key = (df.partition_spec_id(), df.partition().clone());
+                    partition_min_seq
+                        .get(&key)
+                        .is_none_or(|&min_seq| *seq <= min_seq)
+                }
+            })
+            .map(|(df, _)| df),
+    );
+
+    // Dedup by `(file_path, content_offset, content_size_in_bytes)`, not
+    // `file_path` alone: several deletion vectors can share one Puffin
+    // file, so a path-only key would collapse a dangling DV and a
+    // still-live DV in the same file into one entry.
+    let mut seen = HashSet::new();
+    dangling.retain(|df| seen.insert(data_file_identity(df)));
+
+    Ok(dangling)
+}
+
+/// [`TransactionAction`] that computes the dangling set against the table state
+/// it is committed on, then removes it with a [`RewriteFilesAction`].
 ///
-/// [`Transaction::commit`] unconditionally refreshes to the table's latest state on
-/// every attempt (not just retries) before re-applying its actions. Without this guard,
-/// a dangling-file decision computed against the snapshot scanned by
-/// [`RemoveDanglingDeleteFilesAction::execute`] could silently be replayed against a
-/// newer, structurally different snapshot — e.g. one where a concurrent commit made a
-/// previously-dangling delete applicable again. Chaining this action turns that into a
-/// hard, retryable-but-never-silent commit failure instead: the caller must re-invoke
-/// `execute()` to rescan.
-///
-/// This must be applied to the transaction *before* the real rewrite action: requirement
-/// checks run against the table state accumulated from all earlier actions in the same
-/// commit, so if this ran after the rewrite, it would be checking against the branch
-/// pointer the rewrite itself just moved (which never equals the scanned snapshot id).
-struct RequireScannedSnapshotAction {
+/// [`Transaction::commit`] refreshes the table before every attempt and
+/// re-applies its actions, so computing the dangling set here (rather than
+/// once before the transaction) means a retry after a concurrent commit
+/// rescans the refreshed snapshot instead of replaying a stale decision. The
+/// rewrite's snapshot producer is built on the same `table` and requires the
+/// branch to still point at its parent snapshot, so the scan and the commit
+/// can never diverge: a commit that races in between fails the requirement
+/// check with a retryable conflict and triggers a rescan.
+struct RemoveDanglingDeleteFilesCommit {
     branch: String,
-    snapshot_id: i64,
+    /// Snapshot id and dangling set computed by `execute()`, reused when the
+    /// branch has not moved since, to avoid scanning twice.
+    prescan: (i64, Vec<DataFile>),
+    /// Number of delete files removed by the most recent commit attempt.
+    removed_count: Arc<AtomicUsize>,
 }
 
 #[async_trait]
-impl TransactionAction for RequireScannedSnapshotAction {
-    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
-        Ok(ActionCommit::new(vec![], vec![
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: self.branch.clone(),
-                snapshot_id: Some(self.snapshot_id),
-            },
-        ]))
+impl TransactionAction for RemoveDanglingDeleteFilesCommit {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        let Some(snapshot) = table.metadata().snapshot_for_ref(&self.branch) else {
+            // The branch was removed concurrently; nothing left to clean up.
+            self.removed_count.store(0, Ordering::SeqCst);
+            return Ok(ActionCommit::new(vec![], vec![
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: self.branch.clone(),
+                    snapshot_id: None,
+                },
+            ]));
+        };
+
+        let (prescan_snapshot_id, prescan_dangling) = &self.prescan;
+        let dangling = if snapshot.snapshot_id() == *prescan_snapshot_id {
+            prescan_dangling.clone()
+        } else {
+            find_dangling_delete_files(table, snapshot).await?
+        };
+        self.removed_count.store(dangling.len(), Ordering::SeqCst);
+
+        if dangling.is_empty() {
+            // The rescan found nothing: commit no updates, only pin the branch
+            // to the snapshot that was just checked.
+            return Ok(ActionCommit::new(vec![], vec![
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: self.branch.clone(),
+                    snapshot_id: Some(snapshot.snapshot_id()),
+                },
+            ]));
+        }
+
+        let rewrite = RewriteFilesAction::new()
+            .delete_files(dangling)
+            .set_target_branch(self.branch.clone());
+        Arc::new(rewrite).commit(table).await
     }
 }
 
@@ -268,8 +295,12 @@ impl TransactionAction for RequireScannedSnapshotAction {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{RemoveDanglingDeleteFilesAction, RequireScannedSnapshotAction};
+    use super::{
+        RemoveDanglingDeleteFilesAction, RemoveDanglingDeleteFilesCommit,
+        find_dangling_delete_files,
+    };
     use crate::catalog::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::catalog::{Catalog, CatalogBuilder};
     use crate::spec::{
@@ -1089,55 +1120,117 @@ mod tests {
         );
     }
 
-    /// Regression test for review of #168 point 1: a stale scan must not be silently
-    /// replayed against a table that moved concurrently.
-    ///
-    /// `Transaction::commit` unconditionally refreshes to the table's latest state
-    /// before re-applying its actions -- on every attempt, not just retries. Without a
-    /// guard, a dangling-file decision computed against an older snapshot could be
-    /// committed against a newer one where that decision may no longer hold.
-    /// `RequireScannedSnapshotAction` turns this into a hard, immediate commit failure
-    /// instead of a silent misapplication.
-    #[tokio::test]
-    async fn test_stale_scan_fails_instead_of_reapplying() {
-        let catalog = build_catalog().await;
-        let (table_ident, table) = create_test_table(&catalog, "test_stale_scan").await;
-        let table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+    /// Commits a position delete that references `referenced_data_file`.
+    async fn commit_pos_delete(
+        catalog: &Arc<dyn Catalog>,
+        table: &Table,
+        file_path: &str,
+        referenced_data_file: &str,
+    ) -> Table {
+        let pos_delete = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(file_path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .referenced_data_file(Some(referenced_data_file.to_string()))
+            .build()
+            .unwrap();
 
-        // Simulate what `execute()` does: load and scan the table at snapshot A.
-        let table_at_scan = catalog.load_table(&table_ident).await.unwrap();
-        let scanned_snapshot_id = table_at_scan
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .snapshot_id();
+        let txn = Transaction::new(table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![pos_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap()
+    }
 
-        // A concurrent writer commits on top of the same snapshot A, advancing the
-        // branch to a new snapshot B before our (simulated) commit lands.
-        let _ = commit_data_file(&catalog, &table, "memory://test/data-2.parquet").await;
+    /// Simulates `execute()` racing a concurrent commit: the dangling set is
+    /// scanned at `table_at_scan`, then `concurrent` moves the branch before the
+    /// transaction commits. Returns the number of files the commit removed.
+    async fn commit_with_stale_prescan(catalog: &Arc<dyn Catalog>, table_at_scan: &Table) -> usize {
+        let snapshot = table_at_scan.metadata().current_snapshot().unwrap();
+        let dangling = find_dangling_delete_files(table_at_scan, snapshot)
+            .await
+            .unwrap();
+        assert_eq!(dangling.len(), 1, "the delete is dangling at scan time");
 
-        // Build a transaction from the now-stale `table_at_scan`, guarded to require
-        // the branch is still at the snapshot we scanned -- exactly what
-        // `RemoveDanglingDeleteFilesAction::execute` does before its rewrite action.
-        let txn = Transaction::new(&table_at_scan);
-        let txn = RequireScannedSnapshotAction {
+        let action = RemoveDanglingDeleteFilesCommit {
             branch: MAIN_BRANCH.to_string(),
-            snapshot_id: scanned_snapshot_id,
-        }
-        .apply(txn)
-        .unwrap();
+            prescan: (snapshot.snapshot_id(), dangling),
+            removed_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let removed_count = Arc::clone(&action.removed_count);
+        let txn = action.apply(Transaction::new(table_at_scan)).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+        removed_count.load(Ordering::SeqCst)
+    }
 
-        let result = txn.commit(catalog.as_ref()).await;
+    /// Regression test for review of #168: a dangling-file decision computed
+    /// against snapshot A must not be replayed against snapshot B when a
+    /// concurrent commit made the delete applicable again. The commit rescans B
+    /// and keeps the delete.
+    #[tokio::test]
+    async fn test_concurrent_commit_reviving_delete_is_rescanned() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_revived").await;
+        let table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+        let table_at_scan = commit_pos_delete(
+            &catalog,
+            &table,
+            "memory://test/pos-del-2.parquet",
+            "memory://test/data-2.parquet",
+        )
+        .await;
 
+        // Concurrently, the data file the delete targets appears.
+        let _ = commit_data_file(&catalog, &table_at_scan, "memory://test/data-2.parquet").await;
+
+        let removed = commit_with_stale_prescan(&catalog, &table_at_scan).await;
+        assert_eq!(removed, 0, "the rescan sees data-2, so nothing is dangling");
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
         assert!(
-            result.is_err(),
-            "commit must fail when the branch moved since the scan, not silently succeed \
-             against the newer snapshot"
+            delete_file_is_live(&table, "memory://test/pos-del-2.parquet").await,
+            "a delete revived by a concurrent commit must be kept"
         );
-        assert!(
-            result.unwrap_err().retryable(),
-            "the failure should be flagged retryable so callers know a fresh execute() call \
-             (rescan) may succeed"
+    }
+
+    /// A concurrent commit that does not affect the dangling set no longer
+    /// fails the action: the commit rescans the refreshed snapshot and still
+    /// removes the dangling delete.
+    #[tokio::test]
+    async fn test_concurrent_unrelated_commit_still_removes_dangling() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_unrelated").await;
+        let table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+        let table_at_scan = commit_pos_delete(
+            &catalog,
+            &table,
+            "memory://test/pos-del-2.parquet",
+            "memory://test/data-2.parquet",
+        )
+        .await;
+
+        // Concurrently, an unrelated data file is committed.
+        let concurrent =
+            commit_data_file(&catalog, &table_at_scan, "memory://test/data-3.parquet").await;
+        let concurrent_snapshot_id = concurrent.metadata().current_snapshot_id();
+
+        let removed = commit_with_stale_prescan(&catalog, &table_at_scan).await;
+        assert_eq!(removed, 1);
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        assert!(!delete_file_is_live(&table, "memory://test/pos-del-2.parquet").await);
+        assert_eq!(
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            concurrent_snapshot_id,
+            "the removal is committed on top of the concurrent snapshot"
         );
     }
 }
