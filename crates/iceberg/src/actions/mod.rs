@@ -20,4 +20,4 @@
 pub(crate) mod maintenance;
 mod remove_orphan_files;
 
-pub use remove_orphan_files::RemoveOrphanFilesAction;
+pub use remove_orphan_files::{OrphanFile, RemoveOrphanFilesAction};
