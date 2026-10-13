@@ -4072,6 +4072,7 @@ dependencies = [
  "reqsign-aws-v4",
  "reqsign-azure-storage",
  "reqsign-core",
+ "reqsign-google",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

@@ -392,6 +392,15 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &c), "s3 and s3n should share one instance");
     }
 
+    #[cfg(feature = "opendal-gcs")]
+    #[test]
+    fn test_resolve_gcs_aliases_share_instance() {
+        let storage = empty_resolving_storage();
+        let gs = storage.resolve("gs://bucket/key").unwrap();
+        let gcs = storage.resolve("gcs://bucket/key").unwrap();
+        assert!(Arc::ptr_eq(&gs, &gcs));
+    }
+
     #[cfg(feature = "opendal-azdls")]
     #[test]
     fn test_resolve_azdls_aliases_share_instance() {

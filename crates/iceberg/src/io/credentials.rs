@@ -142,6 +142,39 @@ pub enum StorageCredentialKind {
     S3(S3Credential),
     /// Azure Data Lake Storage credentials.
     Azdls(AzdlsCredential),
+    /// Google Cloud Storage credentials.
+    Gcs(GcsCredential),
+}
+
+/// Google Cloud Storage OAuth2 access token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsCredential {
+    token: String,
+}
+
+impl GcsCredential {
+    /// Create Google Cloud Storage credentials.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+        }
+    }
+
+    /// Return the OAuth2 access token.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Consume the credential and return its OAuth2 access token.
+    pub fn into_token(self) -> String {
+        self.token
+    }
+}
+
+impl Debug for GcsCredential {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsCredential").finish_non_exhaustive()
+    }
 }
 
 /// Amazon S3 access keys and an optional session token.
@@ -351,6 +384,7 @@ mod tests {
                 Some("secret-session".into()),
             )),
             StorageCredentialKind::Azdls(AzdlsCredential::new("sig=secret-token")),
+            StorageCredentialKind::Gcs(GcsCredential::new("secret-gcs-token")),
         ] {
             let credential = StorageCredential::new(kind);
             assert_eq!(credential.prefix(), None);
@@ -372,6 +406,9 @@ mod tests {
                 ),
                 StorageCredentialKind::Azdls(material) => {
                     assert_eq!(material.into_sas_token(), "sig=secret-token");
+                }
+                StorageCredentialKind::Gcs(material) => {
+                    assert_eq!(material.into_token(), "secret-gcs-token");
                 }
             }
         }

@@ -41,6 +41,8 @@ pub const GCS_NO_AUTH: &str = "gcs.no-auth";
 pub const GCS_CREDENTIALS_JSON: &str = "gcs.credentials-json";
 /// Google Cloud Storage token.
 pub const GCS_TOKEN: &str = "gcs.oauth2.token";
+/// Google Cloud Storage OAuth2 token expiration, in milliseconds since the Unix epoch.
+pub const GCS_TOKEN_EXPIRES_AT: &str = "gcs.oauth2.token-expires-at";
 /// Option to skip signing requests (e.g. for public buckets/folders).
 pub const GCS_ALLOW_ANONYMOUS: &str = "gcs.allow-anonymous";
 /// Option to skip loading the credential from GCE metadata server.

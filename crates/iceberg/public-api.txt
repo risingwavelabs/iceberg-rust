@@ -822,6 +822,7 @@ impl core::fmt::Debug for iceberg::io::object_cache::ObjectCache
 pub fn iceberg::io::object_cache::ObjectCache::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum iceberg::io::StorageCredentialKind
 pub iceberg::io::StorageCredentialKind::Azdls(iceberg::io::AzdlsCredential)
+pub iceberg::io::StorageCredentialKind::Gcs(iceberg::io::GcsCredential)
 pub iceberg::io::StorageCredentialKind::S3(iceberg::io::S3Credential)
 impl core::clone::Clone for iceberg::io::StorageCredentialKind
 pub fn iceberg::io::StorageCredentialKind::clone(&self) -> iceberg::io::StorageCredentialKind
@@ -967,6 +968,19 @@ impl serde_core::ser::Serialize for iceberg::io::GcsConfig
 pub fn iceberg::io::GcsConfig::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::io::GcsConfig
 pub fn iceberg::io::GcsConfig::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub struct iceberg::io::GcsCredential
+impl iceberg::io::GcsCredential
+pub fn iceberg::io::GcsCredential::into_token(self) -> alloc::string::String
+pub fn iceberg::io::GcsCredential::new(token: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn iceberg::io::GcsCredential::token(&self) -> &str
+impl core::clone::Clone for iceberg::io::GcsCredential
+pub fn iceberg::io::GcsCredential::clone(&self) -> iceberg::io::GcsCredential
+impl core::cmp::Eq for iceberg::io::GcsCredential
+impl core::cmp::PartialEq for iceberg::io::GcsCredential
+pub fn iceberg::io::GcsCredential::eq(&self, other: &iceberg::io::GcsCredential) -> bool
+impl core::fmt::Debug for iceberg::io::GcsCredential
+pub fn iceberg::io::GcsCredential::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::io::GcsCredential
 pub struct iceberg::io::HfConfig
 pub iceberg::io::HfConfig::endpoint: core::option::Option<alloc::string::String>
 pub iceberg::io::HfConfig::revision: core::option::Option<alloc::string::String>
@@ -1254,6 +1268,7 @@ pub const iceberg::io::GCS_NO_AUTH: &str
 pub const iceberg::io::GCS_PROJECT_ID: &str
 pub const iceberg::io::GCS_SERVICE_PATH: &str
 pub const iceberg::io::GCS_TOKEN: &str
+pub const iceberg::io::GCS_TOKEN_EXPIRES_AT: &str
 pub const iceberg::io::GCS_USER_PROJECT: &str
 pub const iceberg::io::HF_ENDPOINT: &str
 pub const iceberg::io::HF_REVISION: &str

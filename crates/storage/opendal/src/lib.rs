@@ -114,7 +114,11 @@ cfg_if! {
     }
 }
 
-#[cfg(any(feature = "opendal-azdls", feature = "opendal-s3"))]
+#[cfg(any(
+    feature = "opendal-azdls",
+    feature = "opendal-s3",
+    feature = "opendal-gcs"
+))]
 mod credentials;
 mod resolving;
 pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
@@ -263,7 +267,11 @@ const OPERATOR_CACHE_CAPACITY: usize = 64;
 /// Bound in-flight deletes when credentials must be checked for each file.
 pub(crate) const CREDENTIALED_DELETE_CONCURRENCY: usize = 32;
 
-#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
 fn credentialed_delete_batch_size(capability: opendal::Capability) -> usize {
     // Bound queued paths independently of a service's maximum request size.
     const CREDENTIALED_DELETE_BUFFER_SIZE: usize = 1024;
@@ -274,14 +282,22 @@ fn credentialed_delete_batch_size(capability: opendal::Capability) -> usize {
 }
 
 /// Keep bulk deletion within one backend resource and selected credential scope.
-#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
 #[derive(PartialEq, Eq, Hash)]
 struct DeleteBatchKey {
     storage: String,
     credential_location: String,
 }
 
-#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
 enum DeleteCredentialScope {
     Static,
     PerPath,
@@ -799,10 +815,14 @@ impl RuntimeStorage {
             }
             #[cfg(feature = "opendal-azdls")]
             OpenDalStorage::Azdls { config } => azdls_create_operator(path, config, provider)?,
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorage::Gcs { config } => {
+                let operator = gcs_config_build(config, path, provider)?;
+                (operator, self.relativize_path(path)?)
+            }
             #[cfg(any(
                 feature = "opendal-memory",
                 feature = "opendal-fs",
-                feature = "opendal-gcs",
                 feature = "opendal-oss",
                 feature = "opendal-azblob",
                 feature = "opendal-hf",
@@ -828,19 +848,6 @@ impl RuntimeStorage {
                     (op, stripped)
                 } else {
                     (op, &path[1..])
-                }
-            }
-            #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { config } => {
-                let operator = gcs_config_build(config, path)?;
-                let prefix = format!("gs://{}/", operator.info().name());
-                if path.starts_with(&prefix) {
-                    (operator, &path[prefix.len()..])
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid gcs url: {path}, should start with {prefix}"),
-                    ));
                 }
             }
             #[cfg(feature = "opendal-oss")]
@@ -996,7 +1003,10 @@ impl RuntimeStorage {
                         format!("Invalid gcs url: {path}, missing bucket"),
                     )
                 })?;
-                let prefix = format!("gs://{}/", bucket);
+                if !matches!(url.scheme(), "gs" | "gcs") {
+                    return Err(Error::new(ErrorKind::DataInvalid, "Invalid GCS URL scheme"));
+                }
+                let prefix = format!("{}://{}/", url.scheme(), bucket);
                 if path.starts_with(&prefix) {
                     Ok(&path[prefix.len()..])
                 } else {
@@ -1234,11 +1244,19 @@ impl RuntimeStorage {
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
         if self.provider.is_some() {
-            #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+            #[cfg(any(
+                feature = "opendal-s3",
+                feature = "opendal-azdls",
+                feature = "opendal-gcs"
+            ))]
             return self
                 .delete_credentialed_stream(paths, options, operator_cache)
                 .await;
-            #[cfg(not(any(feature = "opendal-s3", feature = "opendal-azdls")))]
+            #[cfg(not(any(
+                feature = "opendal-s3",
+                feature = "opendal-azdls",
+                feature = "opendal-gcs"
+            )))]
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 "Runtime credentials are unsupported for this storage backend",
@@ -1272,7 +1290,11 @@ impl RuntimeStorage {
         Ok(())
     }
 
-    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+    #[cfg(any(
+        feature = "opendal-s3",
+        feature = "opendal-azdls",
+        feature = "opendal-gcs"
+    ))]
     async fn delete_credentialed_stream(
         &self,
         mut paths: BoxStream<'static, String>,
@@ -2282,12 +2304,14 @@ mod tests {
             config: Arc::new(GcsConfig::default()),
         };
 
-        assert_eq!(
-            RuntimeStorage::new(storage.clone())
-                .relativize_path("gs://my-bucket/path/to/file.parquet")
-                .unwrap(),
-            "path/to/file.parquet"
-        );
+        for scheme in ["gs", "gcs"] {
+            assert_eq!(
+                RuntimeStorage::new(storage.clone())
+                    .relativize_path(&format!("{scheme}://my-bucket/path/to/file.parquet"))
+                    .unwrap(),
+                "path/to/file.parquet"
+            );
+        }
     }
 
     #[cfg(feature = "opendal-gcs")]
