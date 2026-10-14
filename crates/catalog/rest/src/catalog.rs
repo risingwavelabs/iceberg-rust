@@ -56,7 +56,8 @@ pub const REST_CATALOG_PROP_URI: &str = "uri";
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 /// Disable header redaction in error logs (defaults to false for security)
 pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-redaction";
-/// Set to `google` to authenticate using Google Application Default Credentials.
+/// Set to `google` (case-insensitive) or `org.apache.iceberg.gcp.auth.GoogleAuthManager`
+/// in user configuration to authenticate using Google Application Default Credentials.
 pub const REST_CATALOG_PROP_AUTH_TYPE: &str = "rest.auth.type";
 /// Comma-separated OAuth2 scopes for Google authentication.
 pub const REST_CATALOG_PROP_GCP_AUTH_SCOPES: &str = "gcp.auth.scopes";
@@ -196,7 +197,10 @@ impl RestCatalogConfig {
     pub(crate) fn google_auth(&self) -> bool {
         self.props
             .get(REST_CATALOG_PROP_AUTH_TYPE)
-            .is_some_and(|value| value == "google")
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("google")
+                    || value == "org.apache.iceberg.gcp.auth.GoogleAuthManager"
+            })
     }
 
     pub(crate) fn gcp_auth_scopes(&self) -> Result<Option<Vec<String>>> {
@@ -1646,6 +1650,50 @@ mod tests {
                 .props(HashMap::from([(GCS_CREDENTIALS_JSON.to_string(), value)]))
                 .build();
             assert_eq!(config.gcp_credential().as_deref(), Some(json));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_config_cannot_enable_google_adc() {
+        for source in ["defaults", "overrides"] {
+            for auth_type in [
+                "google",
+                "GOOGLE",
+                "org.apache.iceberg.gcp.auth.GoogleAuthManager",
+            ] {
+                let mut server = Server::new_async().await;
+                let mut config = json!({"defaults": {}, "overrides": {}});
+                config[source] = json!({"rest.auth.type": auth_type});
+                let config_mock = server
+                    .mock("GET", "/v1/config")
+                    .match_header("authorization", mockito::Matcher::Missing)
+                    .with_body(config.to_string())
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let namespaces_mock = server
+                    .mock("GET", "/v1/namespaces")
+                    .match_header("authorization", mockito::Matcher::Missing)
+                    .with_body(r#"{"namespaces":[["default"]]}"#)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let catalog = RestCatalog::new(
+                    RestCatalogConfig::builder().uri(server.url()).build(),
+                    Some(Arc::new(LocalFsStorageFactory)),
+                    Runtime::current(),
+                    None,
+                );
+
+                assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
+                    NamespaceIdent::new("default".to_string())
+                ]);
+                let context = catalog.context().await.unwrap();
+                assert_eq!(context.config.props[REST_CATALOG_PROP_AUTH_TYPE], auth_type);
+                assert_eq!(context.client.token().await, None);
+                config_mock.assert_async().await;
+                namespaces_mock.assert_async().await;
+            }
         }
     }
 

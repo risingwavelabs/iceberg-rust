@@ -110,7 +110,8 @@ impl HttpClient {
             },
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
-            google_auth: cfg.google_auth() || self.google_auth,
+            // Catalog responses must not enable access to the host's ADC.
+            google_auth: self.google_auth,
             gcp_auth_scopes,
         })
     }
@@ -195,23 +196,22 @@ impl HttpClient {
     }
 
     async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
-        let provider: Arc<dyn TokenProvider> =
-            if let Some(credential) = &self.gcp_credential {
-                Arc::new(
-                    gcp_auth::CustomServiceAccount::from_json(credential).map_err(|error| {
-                        Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
-                            .with_source(error)
-                    })?,
+        let provider: Arc<dyn TokenProvider> = if let Some(credential) = &self.gcp_credential {
+            Arc::new(
+                gcp_auth::CustomServiceAccount::from_json(credential).map_err(|error| {
+                    Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
+                        .with_source(error)
+                })?,
+            )
+        } else {
+            gcp_auth::provider().await.map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to load Google Application Default Credentials",
                 )
-            } else {
-                gcp_auth::provider().await.map_err(|error| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to load Google Application Default Credentials",
-                    )
-                    .with_source(error)
-                })?
-            };
+                .with_source(error)
+            })?
+        };
         let scopes: Vec<_> = self.gcp_auth_scopes.iter().map(String::as_str).collect();
         let token = provider.token(&scopes).await.map_err(|error| {
             Error::new(ErrorKind::Unexpected, "Failed to get GCP access token").with_source(error)
@@ -493,6 +493,32 @@ mod tests {
             .unwrap();
         assert!(client.google_auth);
         assert_eq!(client.gcp_auth_scopes, vec!["scope-a", "scope-b"]);
+    }
+
+    #[test]
+    fn google_authentication_accepts_user_aliases_and_preserves_user_selection() {
+        for auth_type in [
+            "google",
+            "GOOGLE",
+            "GoOgLe",
+            "org.apache.iceberg.gcp.auth.GoogleAuthManager",
+        ] {
+            let cfg = RestCatalogConfig::builder()
+                .uri("https://catalog.example".into())
+                .props(HashMap::from([("rest.auth.type".into(), auth_type.into())]))
+                .build();
+            let client = HttpClient::new(&cfg).unwrap();
+            assert!(client.google_auth);
+            assert!(client.can_refresh_token());
+
+            let server_cfg = RestCatalogConfig::builder()
+                .uri("https://catalog.example".into())
+                .props(HashMap::from([("rest.auth.type".into(), "none".into())]))
+                .build();
+            let client = client.update_with(&server_cfg).unwrap();
+            assert!(client.google_auth);
+            assert!(client.can_refresh_token());
+        }
     }
 
     #[test]

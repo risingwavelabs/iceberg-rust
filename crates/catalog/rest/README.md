@@ -55,8 +55,16 @@ Delegated S3 and GCS requests always require signing, even if anonymous access w
 configured. An unadvertised credentials endpoint returning 404 blocks reuse of
 old credentials until the catalog successfully confirms access through loadTable.
 
+This changes delegated GCS behavior: tables that previously used static
+`gcs.credentials-json` in delegated mode now require vended GCS tokens. Catalogs
+that do not vend those tokens must be used without delegation for static storage
+authentication.
+
 For Google-authenticated catalogs, set `rest.auth.type=google` to use Application
 Default Credentials, or supply service-account JSON through `gcs.credentials-json`
 (plain JSON or base64 encoded). `gcp.auth.scopes` accepts comma-separated OAuth2
 scopes and defaults to `https://www.googleapis.com/auth/cloud-platform`.
+The `google` value is case-insensitive; the Java
+`org.apache.iceberg.gcp.auth.GoogleAuthManager` name is also accepted. Ambient ADC
+is enabled only by user configuration; catalog configuration cannot enable it.
 Catalog authentication is separate from vended GCS storage tokens.
