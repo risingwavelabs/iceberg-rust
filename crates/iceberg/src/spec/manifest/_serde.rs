@@ -251,16 +251,11 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             .or_else(|| metadata_columns::get_metadata_field(entry.key).ok());
 
         if let Some(field) = field {
-            let data_type = field
-                .field_type
-                .as_primitive_type()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("field {} is not a primitive type", field.name),
-                    )
-                })?
-                .clone();
+            // The spec only defines bounds for primitive types. A bound keyed on a
+            // nested field carries no usable pruning information, so ignore it.
+            let Some(data_type) = field.field_type.as_primitive_type().cloned() else {
+                continue;
+            };
             if data_type == PrimitiveType::String
                 && std::str::from_utf8(entry.value.as_ref()).is_err()
             {
@@ -656,5 +651,70 @@ mod tests {
 
         assert_eq!(result.get(&1), Some(&Datum::int(42)));
         assert!(!result.contains_key(&2));
+    }
+
+    #[test]
+    fn test_parse_bytes_entry_ignores_non_primitive_field_bounds() {
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
+        use crate::spec::{ListType, MapType};
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "tags",
+                    Type::List(ListType::new(
+                        NestedField::list_element(3, Type::Primitive(PrimitiveType::String), false)
+                            .into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "attrs",
+                    Type::Map(MapType::optional(
+                        5,
+                        Type::Primitive(PrimitiveType::String),
+                        6,
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    7,
+                    "point",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(8, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let entry = |key: i32, value: Vec<u8>| BytesEntry {
+            key,
+            value: serde_bytes::ByteBuf::from(value),
+        };
+        let result = parse_bytes_entry(
+            vec![
+                entry(1, 42_i32.to_le_bytes().to_vec()),
+                entry(2, b"a".to_vec()),
+                entry(3, b"b".to_vec()),
+                entry(4, b"c".to_vec()),
+                entry(7, b"d".to_vec()),
+                entry(8, 7_i64.to_le_bytes().to_vec()),
+            ],
+            &schema,
+        )
+        .unwrap();
+
+        assert_eq!(result.get(&1), Some(&Datum::int(42)));
+        assert_eq!(result.get(&3), Some(&Datum::string("b")));
+        assert_eq!(result.get(&8), Some(&Datum::long(7)));
+        for nested_id in [2, 4, 7] {
+            assert!(!result.contains_key(&nested_id));
+        }
     }
 }
