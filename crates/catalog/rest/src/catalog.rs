@@ -56,6 +56,11 @@ pub const REST_CATALOG_PROP_URI: &str = "uri";
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 /// Disable header redaction in error logs (defaults to false for security)
 pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-redaction";
+/// Set to `google` (case-insensitive) or `org.apache.iceberg.gcp.auth.GoogleAuthManager`
+/// in user configuration to authenticate using Google Application Default Credentials.
+pub const REST_CATALOG_PROP_AUTH_TYPE: &str = "rest.auth.type";
+/// Comma-separated OAuth2 scopes for Google authentication.
+pub const REST_CATALOG_PROP_GCP_AUTH_SCOPES: &str = "gcp.auth.scopes";
 
 /// Google Cloud Storage credentials JSON string, plain or base64 encoded.
 pub use iceberg::io::GCS_CREDENTIALS_JSON;
@@ -189,6 +194,35 @@ pub(crate) struct RestCatalogConfig {
 }
 
 impl RestCatalogConfig {
+    pub(crate) fn google_auth(&self) -> bool {
+        self.props
+            .get(REST_CATALOG_PROP_AUTH_TYPE)
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("google")
+                    || value == "org.apache.iceberg.gcp.auth.GoogleAuthManager"
+            })
+    }
+
+    pub(crate) fn gcp_auth_scopes(&self) -> Result<Option<Vec<String>>> {
+        self.props
+            .get(REST_CATALOG_PROP_GCP_AUTH_SCOPES)
+            .map(|value| {
+                let scopes: Vec<_> = value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect();
+                if scopes.iter().any(String::is_empty) {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Google authentication scopes must not be empty",
+                    ));
+                }
+                Ok(scopes)
+            })
+            .transpose()
+    }
+
     fn url_prefixed(&self, parts: &[&str]) -> String {
         [&self.uri, PATH_V1]
             .into_iter()
@@ -1616,6 +1650,50 @@ mod tests {
                 .props(HashMap::from([(GCS_CREDENTIALS_JSON.to_string(), value)]))
                 .build();
             assert_eq!(config.gcp_credential().as_deref(), Some(json));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_config_cannot_enable_google_adc() {
+        for source in ["defaults", "overrides"] {
+            for auth_type in [
+                "google",
+                "GOOGLE",
+                "org.apache.iceberg.gcp.auth.GoogleAuthManager",
+            ] {
+                let mut server = Server::new_async().await;
+                let mut config = json!({"defaults": {}, "overrides": {}});
+                config[source] = json!({"rest.auth.type": auth_type});
+                let config_mock = server
+                    .mock("GET", "/v1/config")
+                    .match_header("authorization", mockito::Matcher::Missing)
+                    .with_body(config.to_string())
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let namespaces_mock = server
+                    .mock("GET", "/v1/namespaces")
+                    .match_header("authorization", mockito::Matcher::Missing)
+                    .with_body(r#"{"namespaces":[["default"]]}"#)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let catalog = RestCatalog::new(
+                    RestCatalogConfig::builder().uri(server.url()).build(),
+                    Some(Arc::new(LocalFsStorageFactory)),
+                    Runtime::current(),
+                    None,
+                );
+
+                assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
+                    NamespaceIdent::new("default".to_string())
+                ]);
+                let context = catalog.context().await.unwrap();
+                assert_eq!(context.config.props[REST_CATALOG_PROP_AUTH_TYPE], auth_type);
+                assert_eq!(context.client.token().await, None);
+                config_mock.assert_async().await;
+                namespaces_mock.assert_async().await;
+            }
         }
     }
 
@@ -3875,7 +3953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_gcs_metadata_preserves_static_auth_and_vends_adls_data_credentials() {
+    async fn mixed_gcs_metadata_and_adls_data_use_vended_credentials() {
         let mut catalog = Server::new_async().await;
         let mut storage = Server::new_async().await;
         let config = catalog
@@ -3890,12 +3968,19 @@ mod tests {
         response["metadata-location"] = json!("gs://metadata-bucket/table/metadata.json");
         response["config"] = json!({
             "adls.endpoint": format!("{}/core.windows.net", storage.url()),
-            "io.max-retries": "0", "gcs.credentials-json": "static-gcs-config"
+            "io.max-retries": "0", "gcs.credentials-json": "static-gcs-config",
+            "gcs.service.path": storage.url()
         });
-        response["storage-credentials"] = json!([{
-            "prefix": "abfs://fs@account.dfs.core.windows.net/table/",
-            "config": {"adls.sas-token": "sig=vended-probe"}
-        }]);
+        response["storage-credentials"] = json!([
+            {
+                "prefix": "abfs://fs@account.dfs.core.windows.net/table/",
+                "config": {"adls.sas-token": "sig=vended-probe"}
+            },
+            {
+                "prefix": "gs://metadata-bucket/table/",
+                "config": {"gcs.oauth2.token": "vended-gcs-probe"}
+            }
+        ]);
         let load = catalog
             .mock("GET", "/v1/namespaces/ns/tables/t")
             .with_body(response.to_string())
@@ -3908,6 +3993,17 @@ mod tests {
                 "vended-probe".into(),
             ))
             .with_body("data")
+            .expect(1)
+            .create_async()
+            .await;
+        let metadata = storage
+            .mock(
+                "GET",
+                "/storage/v1/b/metadata-bucket/o/table%2Fmetadata.json",
+            )
+            .match_query(mockito::Matcher::UrlEncoded("alt".into(), "media".into()))
+            .match_header("authorization", "Bearer vended-gcs-probe")
+            .with_body("metadata")
             .expect(1)
             .create_async()
             .await;
@@ -3929,15 +4025,27 @@ mod tests {
         assert_eq!(
             table
                 .file_io()
+                .new_input("gs://metadata-bucket/table/metadata.json")
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"metadata"
+        );
+        assert!(
+            table
+                .file_io()
                 .config()
                 .get("gcs.credentials-json")
-                .map(String::as_str),
-            Some("static-gcs-config")
+                .is_none()
         );
+        assert!(table.file_io().config().get("gcs.oauth2.token").is_none());
         assert!(table.file_io().config().get("adls.sas-token").is_none());
         config.assert_async().await;
         load.assert_async().await;
         data.assert_async().await;
+        metadata.assert_async().await;
     }
 
     #[tokio::test]

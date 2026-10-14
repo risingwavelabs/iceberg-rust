@@ -19,14 +19,16 @@
 use std::collections::HashMap;
 
 use iceberg::io::{
-    GCS_ALLOW_ANONYMOUS, GCS_CREDENTIALS_JSON, GCS_DISABLE_CONFIG_LOAD, GCS_DISABLE_VM_METADATA,
-    GCS_NO_AUTH, GCS_SERVICE_PATH, GCS_TOKEN,
+    CredentialProvider, GCS_ALLOW_ANONYMOUS, GCS_CREDENTIALS_JSON, GCS_DISABLE_CONFIG_LOAD,
+    GCS_DISABLE_VM_METADATA, GCS_NO_AUTH, GCS_SERVICE_PATH, GCS_TOKEN,
 };
 use iceberg::{Error, ErrorKind, Result};
-use opendal::Operator;
 use opendal::services::GcsConfig;
+use opendal::{Configurator, Operator};
+use reqsign_core::ProvideCredentialChain;
 use url::Url;
 
+use crate::credentials::{VendedCredentialSource, VendedGcsCredentialProvider};
 use crate::utils::{from_opendal_error, is_truthy};
 
 /// Parse iceberg properties to [`GcsConfig`].
@@ -71,7 +73,11 @@ pub(crate) fn gcs_config_parse(mut m: HashMap<String, String>) -> Result<GcsConf
 }
 
 /// Build a new OpenDAL [`Operator`] based on a provided [`GcsConfig`].
-pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> {
+pub(crate) fn gcs_config_build(
+    cfg: &GcsConfig,
+    path: &str,
+    credentials: Option<&CredentialProvider>,
+) -> Result<Operator> {
     let url = Url::parse(path)?;
     let bucket = url.host_str().ok_or_else(|| {
         Error::new(
@@ -81,6 +87,26 @@ pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> 
     })?;
 
     let mut cfg = cfg.clone();
-    cfg.bucket = bucket.to_string();
-    Operator::from_config(cfg).map_err(from_opendal_error)
+    if credentials.is_some() {
+        cfg.skip_signature = false;
+        #[allow(deprecated)]
+        {
+            cfg.allow_anonymous = false;
+        }
+        cfg.token = None;
+        cfg.credential = None;
+        cfg.credential_path = None;
+        cfg.disable_vm_metadata = true;
+        cfg.disable_config_load = true;
+    }
+    let mut builder = cfg.into_builder().bucket(bucket);
+    if let Some(provider) = credentials {
+        builder = builder.credential_provider_chain(ProvideCredentialChain::new().push(
+            VendedGcsCredentialProvider(VendedCredentialSource {
+                provider: provider.clone(),
+                location: path.to_string(),
+            }),
+        ));
+    }
+    Operator::new(builder).map_err(from_opendal_error)
 }

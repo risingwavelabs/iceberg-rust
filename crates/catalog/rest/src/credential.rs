@@ -23,8 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use iceberg::io::{
-    ADLS_SAS_TOKEN, AzdlsCredential, S3Credential, StorageCredential as IoStorageCredential,
-    StorageCredentialKind, StorageCredentialProvider, storage_prefix_covers_url,
+    ADLS_SAS_TOKEN, AzdlsCredential, GCS_TOKEN, GCS_TOKEN_EXPIRES_AT, GcsCredential, S3Credential,
+    StorageCredential as IoStorageCredential, StorageCredentialKind, StorageCredentialProvider,
+    storage_prefix_covers_url,
 };
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::{Method, StatusCode, Url};
@@ -53,12 +54,13 @@ pub(crate) fn has_vended_credentials(
     entries.is_some_and(|entries| !entries.is_empty())
         || config.keys().any(|key| {
             key == ADLS_SAS_TOKEN
+                || key == GCS_TOKEN
                 || key.starts_with("adls.sas-token.")
                 || matches!(key.as_str(), "s3.access-key-id" | "s3.secret-access-key")
         })
 }
 
-/// Other backends retain static authentication, including mixed-table GCS.
+/// Other backends retain static authentication.
 pub(crate) fn separate_storage_properties(properties: &mut HashMap<String, String>) {
     properties.retain(|key, _| {
         !(key.starts_with("header.")
@@ -72,6 +74,9 @@ pub(crate) fn separate_storage_properties(properties: &mut HashMap<String, Strin
                     | "s3.session-token"
                     | "s3.session-token-expires-at-ms"
                     | "s3.role-arn"
+                    | GCS_TOKEN
+                    | GCS_TOKEN_EXPIRES_AT
+                    | "gcs.credentials-json"
             ))
     });
 }
@@ -92,6 +97,7 @@ struct ParsedProperties {
     adls: HashMap<String, ParsedResult>,
     adls_default: ParsedResult,
     s3: ParsedResult,
+    gcs: ParsedResult,
 }
 
 fn parse_expiry(
@@ -118,6 +124,7 @@ impl ParsedProperties {
             adls,
             adls_default: Self::adls(&properties, None),
             s3: Self::s3(&properties),
+            gcs: Self::gcs(&properties),
         }
     }
 
@@ -171,6 +178,21 @@ impl ParsedProperties {
         })
     }
 
+    fn gcs(properties: &HashMap<String, String>) -> ParsedResult {
+        let token = properties
+            .get(GCS_TOKEN)
+            .filter(|value| !value.is_empty())
+            .ok_or("Missing vended GCS OAuth2 token")?;
+        let expiry = properties
+            .get(GCS_TOKEN_EXPIRES_AT)
+            .map(|value| parse_expiry(value, "Invalid GCS credential expiry"))
+            .transpose()?;
+        Ok(ParsedCredential {
+            kind: StorageCredentialKind::Gcs(GcsCredential::new(token)),
+            expiry,
+        })
+    }
+
     fn select(&self, location: &Url) -> Result<&ParsedCredential> {
         let credential = match location.scheme() {
             "abfs" | "abfss" | "wasb" | "wasbs" => {
@@ -180,6 +202,7 @@ impl ParsedProperties {
                 self.adls.get(host).unwrap_or(&self.adls_default)
             }
             "s3" | "s3a" | "s3n" => &self.s3,
+            "gs" | "gcs" => &self.gcs,
             _ => return Err(invalid("Unsupported vended credential backend")),
         };
         credential.as_ref().map_err(|message| invalid(message))
@@ -570,7 +593,7 @@ impl StorageCredentialProvider for RestVendedCredentialProvider {
         Url::parse(path).is_ok_and(|location| {
             matches!(
                 location.scheme(),
-                "s3" | "s3a" | "s3n" | "abfs" | "abfss" | "wasb" | "wasbs"
+                "s3" | "s3a" | "s3n" | "abfs" | "abfss" | "wasb" | "wasbs" | "gs" | "gcs"
             )
         })
     }
@@ -721,6 +744,240 @@ mod tests {
             Arc::new(OpenDalStorageFactory::azdls()),
             Arc::new(OpenDalResolvingStorageFactory::new()),
         ]
+    }
+
+    fn gcs_factories() -> [Arc<dyn StorageFactory>; 2] {
+        [
+            Arc::new(OpenDalStorageFactory::gcs()),
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ]
+    }
+
+    fn gcs_config(token: &str) -> HashMap<String, String> {
+        HashMap::from([(GCS_TOKEN.into(), token.into())])
+    }
+
+    #[test]
+    fn gcs_prefix_selection_expiry_and_redaction() {
+        assert!(has_vended_credentials(&gcs_config("token"), None));
+        for scheme in ["gs", "gcs"] {
+            let root = format!("{scheme}://bucket/table/");
+            let child = format!("{root}data/");
+            let mut properties = gcs_config("child-secret");
+            properties.insert(GCS_TOKEN_EXPIRES_AT.into(), "4102444800000".into());
+            let set = CredentialSet::new(
+                gcs_config("fallback"),
+                Some(vec![
+                    StorageCredential {
+                        prefix: root.clone(),
+                        config: gcs_config("root"),
+                    },
+                    StorageCredential {
+                        prefix: child.clone(),
+                        config: properties,
+                    },
+                ]),
+            );
+            let location = Url::parse(&format!("{child}file")).unwrap();
+            let selected = set
+                .load_credential(&location, SystemTime::now(), true, Duration::ZERO)
+                .unwrap();
+            let StorageCredentialKind::Gcs(material) = selected.kind() else {
+                panic!("expected GCS credential");
+            };
+            assert_eq!(material.token(), "child-secret");
+            assert_eq!(selected.prefix(), Some(child.as_str()));
+            assert_eq!(
+                selected.expires_at(),
+                Some(UNIX_EPOCH + Duration::from_millis(4102444800000))
+            );
+            assert!(!format!("{selected:?}").contains("child-secret"));
+            assert!(!selected.covers(&format!("{scheme}://other/table/data/file")));
+            assert!(!selected.covers(&format!("{root}data2/file")));
+            assert!(!selected.covers(&location.as_str().replacen(
+                scheme,
+                if scheme == "gs" { "gcs" } else { "gs" },
+                1
+            )));
+            let fallback = set
+                .load_credential(
+                    &Url::parse(&format!("{scheme}://bucket/outside")).unwrap(),
+                    SystemTime::now(),
+                    true,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            assert_eq!(fallback.expires_at(), Some(set.issued_at + LEASE));
+
+            // A matched entry is complete, not merged with the fallback token.
+            for properties in [
+                HashMap::from([(GCS_TOKEN_EXPIRES_AT.into(), "4102444800000".into())]),
+                gcs_config(""),
+                HashMap::from([
+                    (GCS_TOKEN.into(), "secret".into()),
+                    (GCS_TOKEN_EXPIRES_AT.into(), "invalid-secret".into()),
+                ]),
+                HashMap::from([
+                    (GCS_TOKEN.into(), "secret".into()),
+                    (GCS_TOKEN_EXPIRES_AT.into(), "0".into()),
+                ]),
+            ] {
+                let set = CredentialSet::new(
+                    gcs_config("fallback"),
+                    Some(vec![StorageCredential {
+                        prefix: child.clone(),
+                        config: properties,
+                    }]),
+                );
+                let error = set
+                    .load_credential(&location, SystemTime::now(), false, Duration::ZERO)
+                    .unwrap_err();
+                assert!(!format!("{error:?}").contains("secret"));
+            }
+        }
+        let mut properties = gcs_config("secret");
+        properties.insert(GCS_TOKEN_EXPIRES_AT.into(), "4102444800000".into());
+        properties.insert("gcs.credentials-json".into(), "static-secret".into());
+        properties.insert("gcs.service.path".into(), "http://localhost".into());
+        separate_storage_properties(&mut properties);
+        assert_eq!(
+            properties,
+            HashMap::from([("gcs.service.path".into(), "http://localhost".into())])
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_open_handles_refresh_before_signing() {
+        use iceberg::io::{GCS_ALLOW_ANONYMOUS, GCS_NO_AUTH, GCS_SERVICE_PATH};
+
+        for factory in gcs_factories() {
+            let mut catalog = Server::new_async().await;
+            let mut storage = Server::new_async().await;
+            let mut initial = gcs_config("old");
+            initial.insert(
+                GCS_TOKEN_EXPIRES_AT.into(),
+                (SystemTime::now() + Duration::from_secs(8))
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    .to_string(),
+            );
+            let provider = provider(&catalog, CredentialSet::new(initial, None), Some(true));
+            assert!(provider.supports_path("gs://bucket/table/file"));
+            assert!(provider.supports_path("gcs://bucket/table/file"));
+            let io = FileIOBuilder::new(factory)
+                .with_prop(GCS_SERVICE_PATH, storage.url())
+                .with_prop(GCS_TOKEN, "static")
+                .with_prop(GCS_ALLOW_ANONYMOUS, "true")
+                .with_prop(GCS_NO_AUTH, "true")
+                .with_prop("io.max-retries", "0")
+                .with_credential_provider(provider.clone())
+                .build();
+            let reader = io
+                .new_input("gs://bucket/table/file")
+                .unwrap()
+                .reader()
+                .await
+                .unwrap();
+            let mut writer = io
+                .new_output("gs://bucket/table/output")
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
+            writer.write("data".into()).await.unwrap();
+            for generation in 1..=2 {
+                if generation == 2 {
+                    let mut state = provider.state.lock().await;
+                    state.snapshot.set_mut().issued_at =
+                        SystemTime::now() - LEASE - Duration::from_secs(1);
+                    state.reset_retry();
+                }
+                let refresh = catalog.mock("GET", "/table/credentials")
+                    .with_body(json!({"storage-credentials": [{
+                        "prefix": "gs://bucket/table/", "config": gcs_config(&format!("token-{generation}"))
+                    }]}).to_string()).expect(1).create_async().await;
+                let read = storage
+                    .mock("GET", "/storage/v1/b/bucket/o/table%2Ffile")
+                    .match_query(Matcher::UrlEncoded("alt".into(), "media".into()))
+                    .match_header(
+                        "authorization",
+                        format!("Bearer token-{generation}").as_str(),
+                    )
+                    .with_status(206)
+                    .with_header("content-range", "bytes 0-3/4")
+                    .with_body("data")
+                    .expect(1)
+                    .create_async()
+                    .await;
+                if generation == 1 {
+                    assert_eq!(reader.read(0..4).await.unwrap().as_ref(), b"data");
+                } else {
+                    let write = storage
+                        .mock("POST", "/upload/storage/v1/b/bucket/o")
+                        .match_query(Matcher::AllOf(vec![
+                            Matcher::UrlEncoded("uploadType".into(), "media".into()),
+                            Matcher::UrlEncoded("name".into(), "table/output".into()),
+                        ]))
+                        .match_header("authorization", "Bearer token-2")
+                        .match_body("data")
+                        .with_body(r#"{"size":"4"}"#)
+                        .expect(1)
+                        .create_async()
+                        .await;
+                    writer.close().await.unwrap();
+                    write.assert_async().await;
+                    assert_eq!(reader.read(0..4).await.unwrap().as_ref(), b"data");
+                }
+                refresh.assert_async().await;
+                refresh.remove_async().await;
+                read.assert_async().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gcs_refresh_failures_do_not_fall_back() {
+        use iceberg::io::{GCS_NO_AUTH, GCS_SERVICE_PATH};
+
+        for factory in gcs_factories() {
+            for status in [403, 500] {
+                let mut catalog = Server::new_async().await;
+                let mut storage = Server::new_async().await;
+                let mut initial = gcs_config("expired-secret");
+                initial.insert(GCS_TOKEN_EXPIRES_AT.into(), "0".into());
+                let provider = provider(&catalog, CredentialSet::new(initial, None), Some(true));
+                let refresh = catalog
+                    .mock("GET", "/table/credentials")
+                    .with_status(status)
+                    .with_body("secret-response")
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let request = storage
+                    .mock("GET", Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let io = FileIOBuilder::new(factory.clone())
+                    .with_prop(GCS_SERVICE_PATH, storage.url())
+                    .with_prop(GCS_NO_AUTH, "true")
+                    .with_prop(GCS_TOKEN, "static-secret")
+                    .with_prop("io.max-retries", "0")
+                    .with_credential_provider(provider)
+                    .build();
+                let error = io
+                    .new_input("gs://bucket/table/file")
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap_err();
+                assert!(!format!("{error:?}").contains("secret"));
+                assert!(error.context().contains(&("status", status.to_string())));
+                refresh.assert_async().await;
+                request.assert_async().await;
+            }
+        }
     }
 
     fn adls_file_io(

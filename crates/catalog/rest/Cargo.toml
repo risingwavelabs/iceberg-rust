@@ -47,7 +47,10 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
+iceberg-storage-opendal = { workspace = true, features = [
+  "opendal-azdls",
+  "opendal-gcs",
+] }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
 mockito = { workspace = true }
 tokio = { workspace = true }

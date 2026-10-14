@@ -25,7 +25,7 @@ use iceberg::io::{
 use iceberg::{Error, ErrorKind, Result};
 use reqsign_core::{Context, ProvideCredential};
 
-// reqsign's cache freshness windows are 20s for Azure and 120s for AWS.
+// reqsign's cache freshness windows are 20s for Azure and 120s for AWS and Google.
 // Keep signing leases below those windows so every signing attempt loads the
 // current scopes, without changing the provider's actual credential lifetime.
 #[cfg(feature = "opendal-azdls")]
@@ -35,6 +35,11 @@ const S3_SIGNING_LEASE: Duration = Duration::from_secs(30);
 // AWS signing needs 10s; allow another 5s for selection and request construction.
 #[cfg(feature = "opendal-s3")]
 const S3_MINIMUM_SIGNING_VALIDITY: Duration = Duration::from_secs(15);
+#[cfg(feature = "opendal-gcs")]
+const GCS_SIGNING_LEASE: Duration = Duration::from_secs(30);
+// Google token signing needs 10s; allow another 5s for request construction.
+#[cfg(feature = "opendal-gcs")]
+const GCS_MINIMUM_SIGNING_VALIDITY: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 pub(super) struct TestCredentialProvider<F> {
@@ -428,6 +433,224 @@ impl ProvideCredential for VendedS3CredentialProvider {
             session_token: material.session_token().map(str::to_string),
             expires_in: Some(signing_expiry(&credential, S3_SIGNING_LEASE)?),
         }))
+    }
+}
+
+#[cfg(feature = "opendal-gcs")]
+#[derive(Debug)]
+pub(crate) struct VendedGcsCredentialProvider(pub(crate) VendedCredentialSource);
+
+#[cfg(feature = "opendal-gcs")]
+impl ProvideCredential for VendedGcsCredentialProvider {
+    type Credential = reqsign_google::Credential;
+
+    async fn provide_credential(
+        &self,
+        _: &Context,
+    ) -> reqsign_core::Result<Option<Self::Credential>> {
+        let credential = self
+            .0
+            .load(GCS_MINIMUM_SIGNING_VALIDITY)
+            .await
+            .map_err(crate::utils::credential_provider_error)?;
+        let StorageCredentialKind::Gcs(material) = credential.kind() else {
+            return Err(reqsign_core::Error::credential_invalid(
+                "Expected GCS credential",
+            ));
+        };
+        if material.token().is_empty() {
+            return Err(reqsign_core::Error::credential_invalid(
+                "Missing GCS OAuth2 token",
+            ));
+        }
+        Ok(Some(reqsign_google::Credential::with_token(
+            reqsign_google::Token {
+                access_token: material.token().to_string(),
+                expires_at: Some(signing_expiry(&credential, GCS_SIGNING_LEASE)?),
+            },
+        )))
+    }
+}
+
+#[cfg(all(test, feature = "opendal-gcs"))]
+mod gcs_tests {
+    use iceberg::io::{
+        FileIOBuilder, GCS_ALLOW_ANONYMOUS, GCS_CREDENTIALS_JSON, GCS_NO_AUTH, GCS_SERVICE_PATH,
+        GCS_TOKEN, GcsCredential, S3Credential, StorageFactory,
+    };
+    use mockito::{Matcher, Server};
+    use reqsign_core::SigningCredential;
+
+    use super::*;
+    use crate::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
+
+    fn factories() -> [Arc<dyn StorageFactory>; 2] {
+        [
+            Arc::new(OpenDalStorageFactory::gcs()),
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ]
+    }
+
+    fn builder(factory: Arc<dyn StorageFactory>, endpoint: &str) -> FileIOBuilder {
+        FileIOBuilder::new(factory)
+            .with_prop(GCS_SERVICE_PATH, endpoint)
+            .with_prop(GCS_TOKEN, "static-token")
+            .with_prop(GCS_CREDENTIALS_JSON, "static-credential")
+            .with_prop(GCS_ALLOW_ANONYMOUS, "true")
+            .with_prop(GCS_NO_AUTH, "true")
+            .with_prop("io.max-retries", "0")
+    }
+
+    #[tokio::test]
+    async fn signing_copy_bypasses_cache_without_extending_expiry() {
+        for expiry in [
+            None,
+            Some(SystemTime::now() + Duration::from_secs(3600)),
+            Some(SystemTime::now() + Duration::from_secs(20)),
+        ] {
+            let mut credential =
+                StorageCredential::new(StorageCredentialKind::Gcs(GcsCredential::new("vended")));
+            if let Some(expiry) = expiry {
+                credential = credential.with_expiration(expiry);
+            }
+            let provider = CredentialProvider(Arc::new(fixed_provider(credential)));
+            assert_eq!(
+                provider
+                    .0
+                    .load_credential("gs://bucket/file")
+                    .await
+                    .unwrap()
+                    .expires_at(),
+                expiry
+            );
+            let adapter = VendedGcsCredentialProvider(VendedCredentialSource {
+                provider,
+                location: "gs://bucket/file".into(),
+            });
+            let signed = adapter
+                .provide_credential(&Context::new())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!signed.is_valid());
+            assert!(
+                signed.is_valid_at(timestamp(SystemTime::now() + Duration::from_secs(10)).unwrap())
+            );
+            let signing_expiry = signed.token.unwrap().expires_at.unwrap();
+            assert!(signing_expiry <= timestamp(SystemTime::now() + GCS_SIGNING_LEASE).unwrap());
+            if let Some(expiry) = expiry {
+                assert!(signing_expiry <= timestamp(expiry).unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_credentials_never_send_static_or_unsigned_requests() {
+        for factory in factories() {
+            let mut server = Server::new_async().await;
+            let request = server
+                .mock("GET", Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            for credential in [
+                StorageCredential::new(StorageCredentialKind::S3(S3Credential::new(
+                    "key", "secret", None,
+                ))),
+                StorageCredential::new(StorageCredentialKind::Gcs(GcsCredential::new(""))),
+                StorageCredential::new(StorageCredentialKind::Gcs(GcsCredential::new("expired")))
+                    .with_expiration(SystemTime::now() - Duration::from_secs(1)),
+                StorageCredential::new(StorageCredentialKind::Gcs(GcsCredential::new("too-short")))
+                    .with_expiration(SystemTime::now() + Duration::from_secs(5)),
+                StorageCredential::new(StorageCredentialKind::Gcs(GcsCredential::new(
+                    "wrong-scope",
+                )))
+                .with_prefix("gs://other/"),
+            ] {
+                let io = builder(factory.clone(), &server.url())
+                    .with_credential_provider(Arc::new(fixed_provider(credential)))
+                    .build();
+                assert!(
+                    io.new_input("gs://bucket/file")
+                        .unwrap()
+                        .read()
+                        .await
+                        .is_err()
+                );
+            }
+            let io = builder(factory, &server.url())
+                .with_credential_provider(Arc::new(test_provider(|_, minimum| {
+                    assert_eq!(minimum, GCS_MINIMUM_SIGNING_VALIDITY);
+                    Err(
+                        Error::new(ErrorKind::DataInvalid, "secret-provider-message")
+                            .with_context("status", "403"),
+                    )
+                })))
+                .build();
+            let error = io
+                .new_input("gs://bucket/file")
+                .unwrap()
+                .read()
+                .await
+                .unwrap_err();
+            assert!(!format!("{error:?}").contains("secret-provider-message"));
+            assert!(error.context().contains(&("status", "403".into())));
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_deletion_uses_scope_local_tokens() {
+        use futures::StreamExt;
+
+        for factory in factories() {
+            let mut server = Server::new_async().await;
+            let response = concat!(
+                "--response\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n\r\n",
+                "--response\r\nContent-Type: application/http\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n\r\n",
+                "--response--\r\n"
+            );
+            let mut requests = Vec::new();
+            for scope in ["a", "b"] {
+                requests.push(
+                    server
+                        .mock("POST", "/batch/storage/v1")
+                        .match_header("authorization", format!("Bearer {scope}").as_str())
+                        .match_body(Matcher::AllOf(vec![
+                            Matcher::Regex(format!("/o/table%2F{scope}%2Fone")),
+                            Matcher::Regex(format!("/o/table%2F{scope}%2Ftwo")),
+                        ]))
+                        .with_header("content-type", "multipart/mixed; boundary=response")
+                        .with_body(response)
+                        .expect(1)
+                        .create_async()
+                        .await,
+                );
+            }
+            let io = builder(factory, &server.url())
+                .with_credential_provider(Arc::new(test_provider(|path, _| {
+                    let scope = if path.contains("/a/") { "a" } else { "b" };
+                    Ok(
+                        StorageCredential::new(StorageCredentialKind::Gcs(GcsCredential::new(
+                            scope,
+                        )))
+                        .with_prefix(format!("gs://bucket/table/{scope}/")),
+                    )
+                })))
+                .build();
+            io.delete_stream(
+                futures::stream::iter(
+                    ["a/one", "a/two", "b/one", "b/two"]
+                        .map(|file| format!("gs://bucket/table/{file}")),
+                )
+                .boxed(),
+            )
+            .await
+            .unwrap();
+            for request in requests {
+                request.assert_async().await;
+            }
+        }
     }
 }
 

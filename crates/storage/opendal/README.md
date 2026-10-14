@@ -84,7 +84,7 @@ async fn main() -> iceberg::Result<()> {
 
 ## Runtime credentials
 
-S3 and ADLS use the same `iceberg::io::StorageCredentialProvider` interface.
+S3, ADLS and GCS use the same `iceberg::io::StorageCredentialProvider` interface.
 Attach the provider to `FileIOBuilder`, not the storage factory:
 
 ```rust

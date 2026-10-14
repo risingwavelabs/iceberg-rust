@@ -43,7 +43,11 @@ pub(crate) fn credential_io_error(e: opendal::Error, redact: bool) -> iceberg::E
 
     // Only our typed, already-sanitized provider failure can cross the source
     // boundary. Arbitrary provider messages and nested sources may hold secrets.
-    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+    #[cfg(any(
+        feature = "opendal-s3",
+        feature = "opendal-azdls",
+        feature = "opendal-gcs"
+    ))]
     {
         use std::error::Error as _;
 
@@ -129,7 +133,11 @@ pub(crate) async fn credential_io<T>(
     future: impl Future<Output = opendal::Result<T>>,
     redact: bool,
 ) -> iceberg::Result<T> {
-    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+    #[cfg(any(
+        feature = "opendal-s3",
+        feature = "opendal-azdls",
+        feature = "opendal-gcs"
+    ))]
     if redact {
         return credential_errors::scope(async {
             future.await.map_err(|e| credential_io_error(e, true))
@@ -146,12 +154,20 @@ fn http_status(value: &str) -> Option<u16> {
         .filter(|status| (100..600).contains(status))
 }
 
-#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
 pub(crate) use credential_errors::{
     clear_credential_failure, credential_discovery_error, credential_provider_error,
 };
 
-#[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
 mod credential_errors {
     use std::cell::RefCell;
     use std::fmt;
