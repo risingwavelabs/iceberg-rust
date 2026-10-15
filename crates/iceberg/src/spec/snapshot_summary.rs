@@ -48,6 +48,39 @@ const TOTAL_FILE_SIZE: &str = "total-files-size";
 const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
 const CHANGED_PARTITION_PREFIX: &str = "partitions.";
 
+/// Summary keys that snapshot production recomputes for every new snapshot.
+const COMPUTED_SUMMARY_PROPERTIES: [&str; 23] = [
+    ADDED_DATA_FILES,
+    ADDED_DELETE_FILES,
+    ADDED_EQUALITY_DELETES,
+    ADDED_FILE_SIZE,
+    ADDED_POSITION_DELETES,
+    ADDED_POSITION_DELETE_FILES,
+    ADDED_RECORDS,
+    DELETED_DATA_FILES,
+    DELETED_RECORDS,
+    ADDED_EQUALITY_DELETE_FILES,
+    REMOVED_DELETE_FILES,
+    REMOVED_EQUALITY_DELETES,
+    REMOVED_EQUALITY_DELETE_FILES,
+    REMOVED_FILE_SIZE,
+    REMOVED_POSITION_DELETES,
+    REMOVED_POSITION_DELETE_FILES,
+    TOTAL_EQUALITY_DELETES,
+    TOTAL_POSITION_DELETES,
+    TOTAL_DATA_FILES,
+    TOTAL_DELETE_FILES,
+    TOTAL_RECORDS,
+    TOTAL_FILE_SIZE,
+    CHANGED_PARTITION_COUNT_PROP,
+];
+
+/// Returns whether snapshot production computes `key`, so a value copied from
+/// another snapshot's summary would be stale.
+pub(crate) fn is_computed_summary_property(key: &str) -> bool {
+    key.starts_with(CHANGED_PARTITION_PREFIX) || COMPUTED_SUMMARY_PROPERTIES.contains(&key)
+}
+
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
 /// partition-specific updates.
