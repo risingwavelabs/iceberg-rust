@@ -2911,6 +2911,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replace_adds_file_with_non_default_partition_spec_id() {
+        let base = make_v2_minimal_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("memory:///test/location/metadata/v1.json".to_string()))
+            .set_location("memory:///test/location".to_string())
+            .add_partition_spec(UnboundPartitionSpec::builder().with_spec_id(1).build())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata));
+        assert_eq!(table.metadata().default_partition_spec_id(), 1);
+
+        let old_spec = table.metadata().partition_spec_by_id(0).unwrap().clone();
+        let make_old_file = |path: &str| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(0)
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap()
+        };
+        let removed = make_old_file("test/old-spec-removed.parquet");
+        let survivor = make_old_file("test/old-spec-survivor.parquet");
+        let manifest_path = "memory:///test/location/metadata/old-spec-data.avro";
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(manifest_path).unwrap(),
+            Some(PARENT_SNAPSHOT_ID),
+            table.metadata().current_schema().clone(),
+            old_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+        for file in [removed.clone(), survivor.clone()] {
+            manifest_writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(file)
+                        .build(),
+                )
+                .unwrap();
+        }
+        let manifest_file = manifest_writer.write_manifest_file().await.unwrap();
+
+        let manifest_list_path = "memory:///test/location/metadata/old-spec-manifest-list.avro";
+        let output = table
+            .file_io()
+            .new_output(manifest_list_path)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut manifest_list_writer =
+            ManifestListWriter::v2(output, PARENT_SNAPSHOT_ID, None, PARENT_SEQUENCE_NUMBER);
+        manifest_list_writer
+            .add_manifests([manifest_file].into_iter())
+            .unwrap();
+        manifest_list_writer.close().await.unwrap();
+
+        let parent_snapshot = Snapshot::builder()
+            .with_snapshot_id(PARENT_SNAPSHOT_ID)
+            .with_timestamp_ms(table.metadata().last_updated_ms() + 1)
+            .with_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .with_schema_id(table.metadata().current_schema_id())
+            .with_manifest_list(manifest_list_path)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: [
+                    ("total-data-files".to_string(), "2".to_string()),
+                    ("total-records".to_string(), "2".to_string()),
+                    ("total-files-size".to_string(), "200".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .build();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(Some("memory:///test/location/metadata/v2.json".to_string()))
+            .add_snapshot(parent_snapshot)
+            .unwrap()
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(
+                    PARENT_SNAPSHOT_ID,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = table.with_metadata(Arc::new(metadata));
+
+        let compacted = make_old_file("test/old-spec-compacted.parquet");
+        let default_spec_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/default-spec-added.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(1)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        // An unknown spec id is rejected before any manifest is written.
+        let mut unknown_spec_file = compacted.clone();
+        unknown_spec_file.partition_spec_id = 9999;
+        let err = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .add_data_files([unknown_spec_file]),
+        )
+        .commit(&table)
+        .await
+        .err()
+        .expect("unknown partition spec must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Data file references an unknown partition spec"),
+            "{err}"
+        );
+
+        // Partition values are validated against the file's own spec, not the default spec.
+        let mut mismatched_partition_file = compacted.clone();
+        mismatched_partition_file.partition = Struct::empty();
+        let err = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .add_data_files([mismatched_partition_file]),
+        )
+        .commit(&table)
+        .await
+        .err()
+        .expect("partition value not matching the file's spec must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Partition value is not compatible with partition type"),
+            "{err}"
+        );
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files([removed, survivor])
+            .add_data_files([compacted, default_spec_file]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+
+        let mut added = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                assert_eq!(
+                    entry.data_file().partition_spec_id,
+                    manifest_file.partition_spec_id,
+                    "every entry must match its manifest's spec"
+                );
+                if entry.status() == ManifestStatus::Added {
+                    added.push((
+                        manifest_file.partition_spec_id,
+                        entry.file_path().to_string(),
+                    ));
+                }
+            }
+        }
+        added.sort();
+        assert_eq!(added, vec![
+            (0, "test/old-spec-compacted.parquet".to_string()),
+            (1, "test/default-spec-added.parquet".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
     async fn test_replace_existence_validation_rejects_missing_file() {
         let table = make_v2_minimal_table();
         let missing_file = DataFileBuilder::default()
