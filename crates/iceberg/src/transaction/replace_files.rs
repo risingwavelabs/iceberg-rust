@@ -27,7 +27,7 @@ use super::snapshot::{DefaultManifestProcess, SnapshotProducer, data_file_identi
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestStatus, Operation, UNASSIGNED_SEQUENCE_NUMBER,
+    ManifestStatus, Operation, UNASSIGNED_SEQUENCE_NUMBER, is_computed_summary_property,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -356,6 +356,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
+    inherit_parent_snapshot_properties: bool,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
     removed_data_files: Vec<DataFile>,
@@ -387,6 +388,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         Self {
             commit_uuid: None,
             snapshot_properties: HashMap::new(),
+            inherit_parent_snapshot_properties: false,
             added_data_files: Vec::new(),
             added_delete_files: Vec::new(),
             removed_data_files: Vec::new(),
@@ -516,6 +518,33 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             .to_vec())
     }
 
+    /// Summary properties for a snapshot committed on top of `table`'s target branch.
+    fn snapshot_properties(&self, table: &Table) -> HashMap<String, String> {
+        if !self.inherit_parent_snapshot_properties {
+            return self.snapshot_properties.clone();
+        }
+
+        let target_branch = self
+            .target_branch
+            .as_deref()
+            .unwrap_or(crate::spec::MAIN_BRANCH);
+        let mut properties: HashMap<String, String> = table
+            .metadata()
+            .snapshot_for_ref(target_branch)
+            .map(|parent| {
+                parent
+                    .summary()
+                    .additional_properties
+                    .iter()
+                    .filter(|(key, _)| !is_computed_summary_property(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        properties.extend(self.snapshot_properties.clone());
+        properties
+    }
+
     fn new_snapshot_producer<'a>(
         &self,
         table: &'a Table,
@@ -527,7 +556,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             table,
             commit_uuid,
             snapshot_id,
-            self.snapshot_properties.clone(),
+            self.snapshot_properties(table),
             self.added_data_files.clone(),
             self.added_delete_files.clone(),
             self.removed_data_files.clone(),
@@ -662,6 +691,21 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         }
 
         Ok(Some(delta))
+    }
+}
+
+impl ReplaceFilesAction<Rewrite> {
+    /// Copy the custom summary properties of the target branch head onto the new snapshot.
+    ///
+    /// The head is read every time the action is applied, including transaction retries that
+    /// rebase onto a newer head, so the values always come from the snapshot that becomes this
+    /// commit's parent. A rewrite leaves table data unchanged, so writer-owned markers on the
+    /// parent, such as a commit watermark, still describe the new snapshot. Properties computed
+    /// by snapshot production (`added-*`, `total-*`, partition summaries) are not copied, and
+    /// properties from [`Self::set_snapshot_properties`] take precedence.
+    pub fn set_inherit_parent_snapshot_properties(mut self, inherit: bool) -> Self {
+        self.inherit_parent_snapshot_properties = inherit;
+        self
     }
 }
 
@@ -1361,6 +1405,112 @@ mod tests {
                 .additional_properties
                 .get("total-files-size"),
             Some(&"400".to_string())
+        );
+    }
+
+    fn with_summary_properties<const N: usize>(
+        snapshot: Snapshot,
+        properties: [(&str, &str); N],
+    ) -> Snapshot {
+        let mut summary = snapshot.summary().clone();
+        summary
+            .additional_properties
+            .extend(properties.map(|(key, value)| (key.to_string(), value.to_string())));
+        Snapshot::builder()
+            .with_snapshot_id(snapshot.snapshot_id())
+            .with_parent_snapshot_id(snapshot.parent_snapshot_id())
+            .with_timestamp_ms(snapshot.timestamp_ms())
+            .with_sequence_number(snapshot.sequence_number())
+            .with_schema_id(0)
+            .with_manifest_list(snapshot.manifest_list())
+            .with_summary(summary)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_inherits_parent_snapshot_properties_on_rebase() {
+        // S401 holds the planned file and a writer marker plus a stale per-commit metric.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/inherit-removed.parquet");
+        let replacement = retry_test_data_file("test/inherit-replacement.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/inherit-original.avro",
+            401,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/inherit-list-401.avro",
+            401,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            1,
+        )
+        .await;
+        let snapshot = with_summary_properties(snapshot, [
+            ("writer.watermark", "41"),
+            ("added-equality-deletes", "5"),
+        ]);
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+
+        let mut action = Transaction::new(&table_v1)
+            .rewrite_files()
+            .set_inherit_parent_snapshot_properties(true)
+            .delete_files([removed])
+            .add_data_files([replacement]);
+        action.set_snapshot_properties(HashMap::from([(
+            "rewrite.job".to_string(),
+            "j1".to_string(),
+        )]));
+        let action = Arc::new(action);
+
+        let first = committed_snapshot(Arc::clone(&action).commit(&table_v1).await.unwrap());
+        let properties = &first.summary().additional_properties;
+        assert_eq!(
+            properties.get("writer.watermark").map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            properties.get("rewrite.job").map(String::as_str),
+            Some("j1")
+        );
+        assert!(!properties.contains_key("added-equality-deletes"));
+
+        // S402 appends with a newer marker before the commit lands; the retry rebases onto it.
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/inherit-appended.avro",
+            402,
+            2,
+            retry_test_data_file("test/inherit-appended.parquet"),
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/inherit-list-402.avro",
+            402,
+            2,
+            Some(401),
+            vec![original_manifest, appended_manifest],
+            2,
+        )
+        .await;
+        let snapshot = with_summary_properties(snapshot, [("writer.watermark", "42")]);
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        let second = committed_snapshot(Arc::clone(&action).commit(&table_v2).await.unwrap());
+        assert_eq!(second.parent_snapshot_id(), Some(402));
+        assert_eq!(
+            second
+                .summary()
+                .additional_properties
+                .get("writer.watermark")
+                .map(String::as_str),
+            Some("42")
         );
     }
 
