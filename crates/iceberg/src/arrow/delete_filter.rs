@@ -674,7 +674,7 @@ pub(crate) mod tests {
                 .with_data_file_format(DataFileFormat::Parquet)
                 .with_schema(data_file_schema.clone())
                 .with_project_field_ids(vec![])
-                .with_deletes(vec![pos_del_1, pos_del_2.clone()])
+                .with_deletes(vec![pos_del_1.into(), pos_del_2.clone().into()])
                 .with_case_sensitive(false)
                 .build(),
             FileScanTask::builder()
@@ -685,7 +685,7 @@ pub(crate) mod tests {
                 .with_data_file_format(DataFileFormat::Parquet)
                 .with_schema(data_file_schema.clone())
                 .with_project_field_ids(vec![])
-                .with_deletes(vec![pos_del_3])
+                .with_deletes(vec![pos_del_3.into()])
                 .with_case_sensitive(false)
                 .build(),
         ];
@@ -737,7 +737,8 @@ pub(crate) mod tests {
                     .with_file_size_in_bytes(1) // never read; this test fails before opening the file
                     .with_file_type(DataContentType::EqualityDeletes)
                     .with_partition_spec_id(0)
-                    .build(),
+                    .build()
+                    .into(),
             ])
             .with_case_sensitive(true)
             .build();
