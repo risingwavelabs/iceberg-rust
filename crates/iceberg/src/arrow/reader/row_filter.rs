@@ -217,7 +217,7 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        ArrayRef, Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -271,10 +271,9 @@ mod tests {
             .await
             .unwrap();
 
-        result[0].columns()[0]
-            .as_string_opt::<i32>()
-            .unwrap()
+        result
             .iter()
+            .flat_map(|batch| batch.column(0).as_string_opt::<i32>().unwrap().iter())
             .map(|v| v.map(ToOwned::to_owned))
             .collect::<Vec<_>>()
     }
@@ -1294,5 +1293,90 @@ mod tests {
             vec![2, 4, 5],
             "positional deletes must be applied correctly even when page indexes are absent"
         );
+    }
+
+    /// A column the file does not carry must filter exactly like a present
+    /// all-null column.
+    #[tokio::test]
+    async fn test_missing_column_predicates_evaluate_as_null_column() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                    NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let rows: Vec<Option<String>> = ["x", "y", "z"].map(|v| Some(v.to_string())).into();
+        // `setup_kleene_logic` writes `a` only, so `d` and `s` are missing from its file.
+        let (file_io, _, missing, _missing_dir) = setup_kleene_logic(rows.clone(), DataType::Utf8);
+        // A second file carries `d` and `s` as all-null columns.
+        let present_dir = TempDir::new().unwrap();
+        let present = present_dir.path().to_str().unwrap().to_string();
+        let field = |name: &str, data_type: DataType, id: i32| {
+            Field::new(name, data_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                field("a", DataType::Utf8, 1),
+                field("d", DataType::Float64, 2),
+                field("s", DataType::Utf8, 3),
+            ])),
+            vec![
+                Arc::new(StringArray::from(rows.clone())),
+                Arc::new(Float64Array::from(vec![None::<f64>; 3])),
+                Arc::new(StringArray::from(vec![None::<&str>; 3])),
+            ],
+        )
+        .unwrap();
+        let file = File::create(format!("{present}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let d = || Reference::new("d");
+        let s = || Reference::new("s");
+        let cases = vec![
+            (d().is_null(), rows.clone()),
+            (d().is_not_null(), vec![]),
+            (d().is_nan(), vec![]),
+            (d().is_not_nan(), rows.clone()),
+            (d().less_than(Datum::double(1.0)), vec![]),
+            (d().less_than_or_equal_to(Datum::double(1.0)), vec![]),
+            (d().greater_than(Datum::double(1.0)), vec![]),
+            (d().greater_than_or_equal_to(Datum::double(1.0)), vec![]),
+            (d().equal_to(Datum::double(1.0)), vec![]),
+            (d().not_equal_to(Datum::double(1.0)), vec![]),
+            (d().is_in([Datum::double(1.0), Datum::double(2.0)]), vec![]),
+            (d().is_not_in([Datum::double(1.0)]), vec![]),
+            (s().starts_with(Datum::string("f")), vec![]),
+            (s().not_starts_with(Datum::string("f")), vec![]),
+        ];
+        for row_selection in [false, true] {
+            let reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current())
+                .with_row_selection_enabled(row_selection)
+                .build();
+            for (predicate, expected) in &cases {
+                for location in [&missing, &present] {
+                    let got = test_perform_read(
+                        predicate.clone(),
+                        schema.clone(),
+                        location.clone(),
+                        reader.clone(),
+                    )
+                    .await;
+                    assert_eq!(
+                        &got, expected,
+                        "{location} row_selection={row_selection} {predicate}"
+                    );
+                }
+            }
+        }
     }
 }
