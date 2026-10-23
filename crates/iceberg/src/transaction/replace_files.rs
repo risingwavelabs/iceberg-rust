@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -223,6 +223,7 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
         let mut existing_files = Vec::new();
         let mut deleted_entries = Vec::new();
+        let mut delete_survivors: BTreeMap<i32, Vec<ManifestEntry>> = BTreeMap::new();
         let file_io = snapshot_produce.table.file_io().clone();
         let mut manifests =
             futures::stream::iter(current_manifests.into_iter().filter(|manifest| {
@@ -287,7 +288,18 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                         && !found_deleted_files.contains(&data_file_identity(entry.data_file()))
                 };
 
-                if manifest.entries().iter().any(|entry| survives(entry)) {
+                if manifest_file.content == ManifestContentType::Deletes {
+                    delete_survivors
+                        .entry(manifest_file.partition_spec_id)
+                        .or_default()
+                        .extend(
+                            manifest
+                                .entries()
+                                .iter()
+                                .filter(|entry| survives(entry))
+                                .map(|entry| entry.as_ref().clone()),
+                        );
+                } else if manifest.entries().iter().any(|entry| survives(entry)) {
                     let mut manifest_writer = snapshot_produce.new_manifest_writer(
                         manifest_file.content,
                         manifest_file.partition_spec_id,
@@ -305,6 +317,24 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                     existing_files.push(manifest_writer.write_manifest_file().await?);
                 }
             }
+        }
+
+        // Delete manifests are never merged by manifest merging, and a commit that replaces
+        // deletion vectors usually touches many of them. Rewriting each one separately keeps the
+        // delete-manifest count growing with every commit, so every later commit and scan opens
+        // more files. Writing the survivors of all touched delete manifests into one manifest per
+        // spec writes the same entries but shrinks that count.
+        for (partition_spec_id, survivors) in delete_survivors {
+            if survivors.is_empty() {
+                continue;
+            }
+            let mut manifest_writer = snapshot_produce
+                .new_manifest_writer(ManifestContentType::Deletes, partition_spec_id)?;
+            for entry in survivors {
+                // Keep survivors `Existing` with their original sequence numbers.
+                manifest_writer.add_existing_entry(entry)?;
+            }
+            existing_files.push(manifest_writer.write_manifest_file().await?);
         }
 
         *self
@@ -1206,6 +1236,134 @@ mod tests {
             );
         }
         statuses
+    }
+
+    async fn write_retry_test_delete_manifest(
+        table: &Table,
+        path: &str,
+        snapshot_id: i64,
+        sequence_number: i64,
+        files: Vec<DataFile>,
+    ) -> ManifestFile {
+        let mut writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(path).unwrap(),
+            Some(snapshot_id),
+            table.metadata().current_schema().clone(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_deletes();
+        for file in files {
+            writer
+                .add_existing_file(file, snapshot_id, sequence_number, Some(sequence_number))
+                .unwrap();
+        }
+        let mut manifest = writer.write_manifest_file().await.unwrap();
+        manifest.sequence_number = sequence_number;
+        manifest.min_sequence_number = sequence_number;
+        manifest
+    }
+
+    #[tokio::test]
+    async fn test_replace_merges_survivors_of_touched_delete_manifests() {
+        let base = retry_test_table();
+        let mut manifests = Vec::new();
+        let mut removed = Vec::new();
+        for (index, sequence_number) in [(1, 1), (2, 2)] {
+            let replaced = retry_test_position_delete_file(
+                &format!("test/merge-replaced-{index}.parquet"),
+                Some("test/data.parquet"),
+            );
+            let retained = retry_test_position_delete_file(
+                &format!("test/merge-retained-{index}.parquet"),
+                Some("test/data.parquet"),
+            );
+            manifests.push(
+                write_retry_test_delete_manifest(
+                    &base,
+                    &format!("memory:///test/location/metadata/merge-deletes-{index}.avro"),
+                    100 + index,
+                    sequence_number,
+                    vec![replaced.clone(), retained],
+                )
+                .await,
+            );
+            removed.push(replaced);
+        }
+        let untouched = write_retry_test_delete_manifest(
+            &base,
+            "memory:///test/location/metadata/merge-deletes-untouched.avro",
+            103,
+            3,
+            vec![retry_test_position_delete_file(
+                "test/merge-untouched.parquet",
+                Some("test/data.parquet"),
+            )],
+        )
+        .await;
+        manifests.push(untouched.clone());
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/merge-deletes-list.avro",
+            103,
+            3,
+            None,
+            manifests.clone(),
+            0,
+        )
+        .await;
+        let table = retry_test_table_at_snapshot(&base, snapshot);
+        let mut producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![],
+            removed,
+        );
+
+        let existing =
+            ReplaceFilesOperation::<Overwrite>::with_current_manifests(manifests, None, 2)
+                .existing_manifest(&mut producer)
+                .await
+                .unwrap();
+
+        assert_eq!(existing.len(), 2, "touched delete manifests merge into one");
+        assert_eq!(existing[0], untouched);
+        let merged = &existing[1];
+        assert_eq!(merged.content, ManifestContentType::Deletes);
+        assert_eq!(merged.min_sequence_number, 1);
+        let merged = merged.load_manifest(table.file_io()).await.unwrap();
+        let survivors: Vec<_> = merged
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.data_file().file_path(),
+                    entry.status(),
+                    entry.snapshot_id(),
+                    entry.sequence_number(),
+                    entry.file_sequence_number,
+                )
+            })
+            .collect();
+        assert_eq!(survivors, vec![
+            (
+                "test/merge-retained-1.parquet",
+                ManifestStatus::Existing,
+                Some(101),
+                Some(1),
+                Some(1)
+            ),
+            (
+                "test/merge-retained-2.parquet",
+                ManifestStatus::Existing,
+                Some(102),
+                Some(2),
+                Some(2)
+            ),
+        ]);
     }
 
     #[test]
