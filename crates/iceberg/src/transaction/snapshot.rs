@@ -143,6 +143,8 @@ pub(crate) struct SnapshotProducer<'a> {
     pub(crate) removed_delete_file_identities: HashSet<DataFileIdentity>,
     pub(crate) removed_data_files: Vec<DataFile>,
     pub(crate) removed_delete_files: Vec<DataFile>,
+    actual_deleted_entries: Option<Vec<ManifestEntry>>,
+    added_summary_collector: Option<SnapshotSummaryCollector>,
     // A counter used to generate unique manifest file names.
     // It is shared with ManifestWriterContext to avoid naming conflicts.
     manifest_counter: Arc<AtomicU64>,
@@ -187,6 +189,8 @@ impl<'a> SnapshotProducer<'a> {
             removed_delete_file_identities,
             removed_data_files,
             removed_delete_files,
+            actual_deleted_entries: None,
+            added_summary_collector: None,
             manifest_counter: Arc::new(AtomicU64::new(0)),
             new_data_file_sequence_number: None,
             delete_file_cleanup_min_data_sequence_number: None,
@@ -200,6 +204,14 @@ impl<'a> SnapshotProducer<'a> {
             ManifestContentType::Data => !self.removed_data_file_identities.is_empty(),
             ManifestContentType::Deletes => !self.removed_delete_file_identities.is_empty(),
         }
+    }
+
+    pub(crate) fn set_actual_deleted_entries(&mut self, deleted_entries: Vec<ManifestEntry>) {
+        self.actual_deleted_entries = Some(deleted_entries);
+    }
+
+    pub(crate) fn actual_deleted_entries(&self) -> Option<&[ManifestEntry]> {
+        self.actual_deleted_entries.as_deref()
     }
 
     /// Validate added files against the partition spec each file declares.
@@ -341,8 +353,6 @@ impl<'a> SnapshotProducer<'a> {
             })
             .buffer_unordered(concurrency_limit);
         let mut duplicate_files = HashSet::new();
-        let mut found_deletes = HashSet::new();
-        let mut duplicate_deletes = HashSet::new();
         let mut affected_manifests = HashSet::new();
 
         while let Some(manifest) = manifests.next().await {
@@ -352,10 +362,6 @@ impl<'a> SnapshotProducer<'a> {
                 let identity = data_file_identity(entry.data_file());
                 if files_to_add.contains(&identity) {
                     duplicate_files.insert(identity.clone());
-                }
-                if requested_deletes.contains(&identity) && !found_deletes.insert(identity.clone())
-                {
-                    duplicate_deletes.insert(identity.clone());
                 }
                 if files_to_delete.remove(&identity) || requested_deletes.contains(&identity) {
                     manifest_is_affected = true;
@@ -376,21 +382,6 @@ impl<'a> SnapshotProducer<'a> {
                 ErrorKind::DataInvalid,
                 format!(
                     "Cannot add files that are already referenced by table, files: {}",
-                    paths.join(", ")
-                ),
-            ));
-        }
-
-        if !duplicate_deletes.is_empty() {
-            let mut paths = duplicate_deletes
-                .iter()
-                .map(format_data_file_identity)
-                .collect::<Vec<_>>();
-            paths.sort_unstable();
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot delete files referenced multiple times by the table, files: {}",
                     paths.join(", ")
                 ),
             ));
@@ -616,9 +607,9 @@ impl<'a> SnapshotProducer<'a> {
 
     async fn write_delete_manifests(
         &self,
-        deleted_entries: Vec<ManifestEntry>,
+        deleted_entries: &[ManifestEntry],
     ) -> Result<Vec<ManifestFile>> {
-        let mut groups: HashMap<(i32, ManifestContentType), Vec<ManifestEntry>> = HashMap::new();
+        let mut groups: HashMap<(i32, ManifestContentType), Vec<&ManifestEntry>> = HashMap::new();
         for entry in deleted_entries {
             let content = match entry.content_type() {
                 DataContentType::Data => ManifestContentType::Data,
@@ -636,7 +627,7 @@ impl<'a> SnapshotProducer<'a> {
         for ((spec_id, content), entries) in groups {
             let mut writer = self.new_manifest_writer(content, spec_id)?;
             for entry in entries {
-                writer.add_delete_entry(entry)?;
+                writer.add_delete_entry(entry.clone())?;
             }
             manifests.push(writer.write_manifest_file().await?);
         }
@@ -722,6 +713,38 @@ impl<'a> SnapshotProducer<'a> {
             existing_manifests
         };
 
+        let mut added_summary_collector = SnapshotSummaryCollector::default();
+        let table_metadata = self.table.metadata();
+        let partition_spec = |file: &DataFile| {
+            table_metadata
+                .partition_spec_by_id(file.partition_spec_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "File references an unknown partition spec",
+                    )
+                    .with_context("partition spec id", file.partition_spec_id.to_string())
+                    .with_context("file path", file.file_path())
+                })
+        };
+
+        for data_file in &self.added_data_files {
+            added_summary_collector.add_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                partition_spec(data_file)?,
+            );
+        }
+
+        for delete_file in &self.added_delete_files {
+            added_summary_collector.add_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                partition_spec(delete_file)?,
+            );
+        }
+
         if !self.added_data_files.is_empty() {
             let added_files = std::mem::take(&mut self.added_data_files);
             let added_manifests = self
@@ -737,7 +760,9 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
-        manifest_files.extend(self.write_delete_manifests(deleted_entries).await?);
+        manifest_files.extend(self.write_delete_manifests(&deleted_entries).await?);
+        self.actual_deleted_entries = Some(deleted_entries);
+        self.added_summary_collector = Some(added_summary_collector);
 
         if snapshot_produce_operation.operation() == Operation::Overwrite {
             manifest_files = self.merge_data_manifests(manifest_files).await?;
@@ -840,7 +865,6 @@ impl<'a> SnapshotProducer<'a> {
         &self,
         snapshot_produce_operation: &OP,
     ) -> Result<Summary> {
-        let mut summary_collector = SnapshotSummaryCollector::default();
         let table_metadata = self.table.metadata_ref();
 
         let partition_summary_limit = if let Some(limit) = table_metadata
@@ -856,8 +880,6 @@ impl<'a> SnapshotProducer<'a> {
             TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
         };
 
-        summary_collector.set_partition_summary_limit(partition_summary_limit);
-
         let partition_spec = |file: &DataFile| {
             table_metadata
                 .partition_spec_by_id(file.partition_spec_id)
@@ -872,36 +894,54 @@ impl<'a> SnapshotProducer<'a> {
                 })
         };
 
-        for data_file in &self.added_data_files {
-            summary_collector.add_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(data_file)?,
-            );
-        }
+        let mut summary_collector = if let Some(added) = self.added_summary_collector.clone() {
+            added
+        } else {
+            let mut collector = SnapshotSummaryCollector::default();
+            for data_file in &self.added_data_files {
+                collector.add_file(
+                    data_file,
+                    table_metadata.current_schema().clone(),
+                    partition_spec(data_file)?,
+                );
+            }
+            for delete_file in &self.added_delete_files {
+                collector.add_file(
+                    delete_file,
+                    table_metadata.current_schema().clone(),
+                    partition_spec(delete_file)?,
+                );
+            }
+            collector
+        };
 
-        for delete_file in &self.added_delete_files {
-            summary_collector.add_file(
-                delete_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(delete_file)?,
-            );
-        }
+        summary_collector.set_partition_summary_limit(partition_summary_limit);
 
-        for data_file in &self.removed_data_files {
-            summary_collector.remove_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(data_file)?,
-            );
-        }
+        if let Some(deleted_entries) = &self.actual_deleted_entries {
+            for entry in deleted_entries {
+                let data_file = entry.data_file();
+                summary_collector.remove_file(
+                    data_file,
+                    table_metadata.current_schema().clone(),
+                    partition_spec(data_file)?,
+                );
+            }
+        } else {
+            for data_file in &self.removed_data_files {
+                summary_collector.remove_file(
+                    data_file,
+                    table_metadata.current_schema().clone(),
+                    partition_spec(data_file)?,
+                );
+            }
 
-        for delete_file in &self.removed_delete_files {
-            summary_collector.remove_file(
-                delete_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(delete_file)?,
-            );
+            for delete_file in &self.removed_delete_files {
+                summary_collector.remove_file(
+                    delete_file,
+                    table_metadata.current_schema().clone(),
+                    partition_spec(delete_file)?,
+                );
+            }
         }
 
         let previous_snapshot = table_metadata.snapshot_for_ref(&self.target_branch);
@@ -943,17 +983,20 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
-        // Build the summary before `prepare_manifests`, which drains the added
-        // data and delete file vectors.
+        // Manifests must be prepared before summary because `prepare_summary`
+        // requires `actual_deleted_entries` populated by `prepare_manifests` to accurately
+        // record deleted files and row counts (including duplicate entries).
+        // If `prepare_summary` fails (e.g. partition spec lookup for a deleted file
+        // fails), newly written manifest files will remain unreferenced in storage.
+        let manifests = self
+            .prepare_manifests(&snapshot_produce_operation, &process)
+            .await?;
         let summary = self
             .prepare_summary(&snapshot_produce_operation)
             .map_err(|err| {
                 Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.")
                     .with_source(err)
             })?;
-        let manifests = self
-            .prepare_manifests(&snapshot_produce_operation, &process)
-            .await?;
 
         self.commit_prepared(manifests, summary, 0).await
     }

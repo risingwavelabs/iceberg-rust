@@ -84,7 +84,7 @@ pub(crate) fn is_computed_summary_property(key: &str) -> bool {
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
 /// partition-specific updates.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SnapshotSummaryCollector {
     metrics: UpdateMetrics,
     partition_metrics: HashMap<String, UpdateMetrics>,
@@ -202,7 +202,7 @@ impl SnapshotSummaryCollector {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct UpdateMetrics {
     added_file_size: u64,
     removed_file_size: u64,
