@@ -251,8 +251,8 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             .or_else(|| metadata_columns::get_metadata_field(entry.key).ok());
 
         if let Some(field) = field {
-            // The spec only defines bounds for primitive types. A bound keyed on a
-            // nested field carries no usable pruning information, so ignore it.
+            // Bounds we can't decode (nested types, variant) are ignored. Bounds are
+            // optional, so this only costs pruning on those fields.
             let Some(data_type) = field.field_type.as_primitive_type().cloned() else {
                 continue;
             };
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn test_parse_bytes_entry_ignores_non_primitive_field_bounds() {
         use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
-        use crate::spec::{ListType, MapType};
+        use crate::spec::{ListType, MapType, VariantType};
 
         let schema = Schema::builder()
             .with_fields(vec![
@@ -689,6 +689,7 @@ mod tests {
                     ])),
                 )
                 .into(),
+                NestedField::optional(9, "payload", Type::Variant(VariantType)).into(),
             ])
             .build()
             .unwrap();
@@ -705,6 +706,7 @@ mod tests {
                 entry(4, b"c".to_vec()),
                 entry(7, b"d".to_vec()),
                 entry(8, 7_i64.to_le_bytes().to_vec()),
+                entry(9, b"e".to_vec()),
             ],
             &schema,
         )
@@ -713,8 +715,8 @@ mod tests {
         assert_eq!(result.get(&1), Some(&Datum::int(42)));
         assert_eq!(result.get(&3), Some(&Datum::string("b")));
         assert_eq!(result.get(&8), Some(&Datum::long(7)));
-        for nested_id in [2, 4, 7] {
-            assert!(!result.contains_key(&nested_id));
+        for ignored_id in [2, 4, 7, 9] {
+            assert!(!result.contains_key(&ignored_id));
         }
     }
 }
