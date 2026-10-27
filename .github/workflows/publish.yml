@@ -43,10 +43,10 @@ jobs:
 
       - name: Get MSRV
         id: get-msrv
-        uses: ./.github/actions/get-msrv
+        uses: $/.github/actions/get-msrv
 
       - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
+        uses: $/.github/actions/setup-builder
         with:
           rust-version: ${{ steps.get-msrv.outputs.msrv }}
 
@@ -69,6 +69,6 @@ jobs:
     permissions:
       contents: read
       id-token: write # Required for PyPI trusted publishing in the called workflow
-    uses: ./.github/workflows/release_python.yml
+    uses: $/.github/workflows/release_python.yml
     with:
       release_tag: ${{ github.ref_name }}
