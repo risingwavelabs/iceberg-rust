@@ -2791,6 +2791,8 @@ pub fn iceberg::spec::SnapshotSummaryCollector::remove_file(&mut self, data_file
 pub fn iceberg::spec::SnapshotSummaryCollector::set(&mut self, key: &str, value: &str)
 pub fn iceberg::spec::SnapshotSummaryCollector::set_partition_summary_limit(&mut self, limit: u64)
 pub fn iceberg::spec::SnapshotSummaryCollector::update_partition_metrics(&mut self, schema: iceberg::spec::SchemaRef, partition_spec: iceberg::spec::PartitionSpecRef, data_file: &iceberg::spec::DataFile, is_add_file: bool)
+impl core::clone::Clone for iceberg::spec::SnapshotSummaryCollector
+pub fn iceberg::spec::SnapshotSummaryCollector::clone(&self) -> iceberg::spec::SnapshotSummaryCollector
 impl core::default::Default for iceberg::spec::SnapshotSummaryCollector
 pub fn iceberg::spec::SnapshotSummaryCollector::default() -> iceberg::spec::SnapshotSummaryCollector
 pub struct iceberg::spec::SortField
