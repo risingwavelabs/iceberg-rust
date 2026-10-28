@@ -99,3 +99,12 @@ fn file_io(provider: impl StorageCredentialProvider + 'static) -> FileIO {
         .build()
 }
 ```
+
+With a credential provider attached, storage errors are redacted: they keep the
+OpenDAL error kind, HTTP status, operation and an allowlisted service error
+code, but not URIs, headers, bodies or service messages. Set
+`io.credentialed-errors.service-detail=true`
+(`IO_CREDENTIALED_ERROR_SERVICE_DETAIL`) to also keep any service error code
+and, except for signing and credential errors, a truncated service error
+message, so callers can tell apart failures such as a suspended account from
+other `AccessDenied` responses.
