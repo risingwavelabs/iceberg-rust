@@ -28,3 +28,7 @@ When assessing potential vulnerabilities or calibrating automated security
 findings, use [`SECURITY-THREAT-MODEL.md`](SECURITY-THREAT-MODEL.md) as the
 authoritative detailed description of this repository's security boundaries,
 trust assumptions, and non-boundaries.
+
+## Public API Snapshots
+
+Each published crate commits its public API to `<crate>/public-api.txt`, and CI's `check-public-api` job fails on any difference, including additions such as a new `pub fn`. After changing a crate's public items, run `make generate-public-api` and commit the updated snapshots; `make check-public-api` reproduces the CI check locally. Clippy and tests don't catch this. The make output ends in a bare `make: *** [check-public-api] Error 1`, so look further up for the `ERROR: Public API for <crate> has changed` line and its diff.
