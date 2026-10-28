@@ -17,8 +17,10 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+#[cfg(feature = "gcp-auth")]
 use std::sync::Arc;
 
+#[cfg(feature = "gcp-auth")]
 use gcp_auth::TokenProvider;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
@@ -195,6 +197,7 @@ impl HttpClient {
         Ok(auth_res.access_token)
     }
 
+    #[cfg(feature = "gcp-auth")]
     async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
         let provider: Arc<dyn TokenProvider> = if let Some(credential) = &self.gcp_credential {
             Arc::new(
@@ -217,6 +220,14 @@ impl HttpClient {
             Error::new(ErrorKind::Unexpected, "Failed to get GCP access token").with_source(error)
         })?;
         Ok(token.as_str().to_string())
+    }
+
+    #[cfg(not(feature = "gcp-auth"))]
+    async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Google authentication requires the `gcp-auth` feature of iceberg-catalog-rest",
+        ))
     }
 
     async fn exchange_token(&self) -> Result<String> {
@@ -493,6 +504,14 @@ mod tests {
             .unwrap();
         assert!(client.google_auth);
         assert_eq!(client.gcp_auth_scopes, vec!["scope-a", "scope-b"]);
+    }
+
+    #[cfg(not(feature = "gcp-auth"))]
+    #[tokio::test]
+    async fn google_authentication_without_gcp_auth_feature_is_unsupported() {
+        let client = HttpClient::new(&google_config(None)).unwrap();
+        let err = client.exchange_token().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
     }
 
     #[test]
