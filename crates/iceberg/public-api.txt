@@ -3808,6 +3808,7 @@ pub struct iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWri
 impl<B, I, O> iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O> where B: iceberg::writer::IcebergWriterBuilder<I, O>, I: core::marker::Send + 'static, O: core::iter::traits::collect::IntoIterator + core::iter::traits::collect::FromIterator<<O as core::iter::traits::collect::IntoIterator>::Item>, <O as core::iter::traits::collect::IntoIterator>::Item: core::marker::Send + core::clone::Clone
 pub async fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::close(self) -> iceberg::Result<O>
 pub fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::new(inner_builder: B) -> Self
+pub fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::new_with_partition_key(inner_builder: B, partition_key: iceberg::spec::PartitionKey) -> Self
 pub async fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::write(&mut self, input: I) -> iceberg::Result<()>
 pub async fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::write_with_position(&mut self, input: I) -> iceberg::Result<alloc::vec::Vec<iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteInput>>
 pub trait iceberg::writer::partitioning::PartitioningWriter<I, O> where I: core::marker::Send + 'static: core::marker::Send + 'static
