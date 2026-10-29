@@ -446,6 +446,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    #[cfg(feature = "encryption")]
     use crate::encryption::SensitiveBytes;
     use crate::encryption::kms::MemoryKeyManagementClient;
     use crate::spec::TableProperties;
@@ -539,6 +540,7 @@ mod tests {
         Arc::new(kms)
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn table_decrypts_manifest_list_via_object_cache() {
         // The fixture contains a snapshot with key-id, encryption-keys (KEK + wrapped DEK),

@@ -297,6 +297,7 @@ mod test {
 
     use super::{ManifestContentType, ManifestFile};
     use crate::ErrorKind;
+    #[cfg(feature = "encryption")]
     use crate::encryption::{EncryptedOutputFile, StandardKeyMetadata};
     use crate::io::FileIO;
     use crate::spec::{
@@ -348,6 +349,7 @@ mod test {
         writer.write_manifest_file().await.unwrap()
     }
 
+    #[cfg(feature = "encryption")]
     /// Writes a single-entry v3 data manifest to `io` at `path`, encrypting it
     /// with `key_metadata`, and returns the resulting [`ManifestFile`].
     async fn write_encrypted_manifest(
@@ -380,6 +382,7 @@ mod test {
         writer.write_manifest_file().await.unwrap()
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_load_manifest_decrypts_when_key_metadata_present() {
         let key_metadata = StandardKeyMetadata::try_new(b"0123456789abcdef")
@@ -401,6 +404,7 @@ mod test {
         assert_eq!(manifest.entries()[0].data_file.record_count, 100);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_load_manifest_fails_with_wrong_key() {
         let key_metadata = StandardKeyMetadata::try_new(b"0123456789abcdef")
@@ -427,6 +431,7 @@ mod test {
         assert_eq!(err.kind(), ErrorKind::Unexpected);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_load_manifest_fails_with_wrong_aad() {
         let key_metadata = StandardKeyMetadata::try_new(b"0123456789abcdef")

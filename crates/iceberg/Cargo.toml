@@ -30,10 +30,11 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [features]
-default = []
+default = ["encryption"]
+encryption = ["dep:aes-gcm", "parquet/encryption"]
 
 [dependencies]
-aes-gcm = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
 anyhow = { workspace = true }
 apache-avro = { workspace = true }
 array-init = { workspace = true }
@@ -68,7 +69,6 @@ once_cell = { workspace = true }
 ordered-float = { workspace = true }
 parquet = { workspace = true, features = [
   "async",
-  "encryption",
   "variant_experimental",
 ] }
 rand = { workspace = true }

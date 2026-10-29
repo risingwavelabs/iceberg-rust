@@ -71,7 +71,7 @@ pub const GCM_STREAM_MAGIC: [u8; 4] = *b"AGS1";
 pub const GCM_STREAM_HEADER_LENGTH: u32 = 8;
 
 /// Minimum valid AGS1 stream length (header + one empty block).
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 pub const MIN_STREAM_LENGTH: u32 = GCM_STREAM_HEADER_LENGTH + NONCE_LENGTH + GCM_TAG_LENGTH;
 
 /// Constructs the per-block AAD for AGS1 stream encryption.
@@ -533,7 +533,7 @@ impl FileWrite for AesGcmFileWrite {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
 

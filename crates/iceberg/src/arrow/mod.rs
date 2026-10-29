@@ -46,5 +46,5 @@ pub use partition_value_calculator::*;
 pub mod record_batch_partition_splitter;
 pub use record_batch_partition_splitter::*;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 pub(crate) mod test_utils;

@@ -36,7 +36,7 @@ crate-type = ["cdylib"]
 [dependencies]
 arrow = { workspace = true, features = ["pyarrow"] }
 datafusion-ffi = { workspace = true }
-iceberg = { workspace = true }
+iceberg = { workspace = true, features = ["encryption"] }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-all"] }
 pyo3 = { workspace = true, features = ["abi3-py310"] }
