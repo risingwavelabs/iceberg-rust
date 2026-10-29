@@ -230,7 +230,9 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    #[cfg(feature = "encryption")]
     use crate::encryption::kms::MemoryKeyManagementClient;
+    #[cfg(feature = "encryption")]
     use crate::encryption::{SensitiveBytes, StandardKeyMetadata};
     use crate::io::FileIO;
     use crate::spec::{
@@ -240,7 +242,9 @@ mod tests {
         Type, VariantType,
     };
     use crate::table::Table;
-    use crate::test_utils::{make_encrypted_table, test_runtime};
+    #[cfg(feature = "encryption")]
+    use crate::test_utils::make_encrypted_table;
+    use crate::test_utils::test_runtime;
     use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table};
     use crate::transaction::{FastAppendAction, Transaction, TransactionAction};
     use crate::{TableIdent, TableRequirement, TableUpdate};
@@ -457,6 +461,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_fast_append_writes_encrypted_manifest() {
         let table = make_encrypted_table().await;
@@ -642,13 +647,16 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encryption")]
     /// See `testdata/manifests_lists/README.md`.
     const FIXTURE_MASTER_KEY_ID: &str = "master-1";
+    #[cfg(feature = "encryption")]
     const FIXTURE_MASTER_KEY_BYTES: [u8; 16] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f,
     ];
 
+    #[cfg(feature = "encryption")]
     async fn make_v3_encrypted_table() -> Table {
         let json = fs::read_to_string(format!(
             "{}/testdata/table_metadata/TableMetadataV3ValidEncryption.json",
@@ -690,6 +698,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_commit_with_encryption_adds_keys_and_records_snapshot_key_id() {
         let table = make_v3_encrypted_table().await;

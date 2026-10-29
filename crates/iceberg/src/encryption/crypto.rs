@@ -20,14 +20,18 @@
 use std::fmt;
 use std::str::FromStr;
 
+#[cfg(feature = "encryption")]
 use aes_gcm::aead::generic_array::typenum::U12;
-use aes_gcm::aead::rand_core::RngCore;
+#[cfg(feature = "encryption")]
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+#[cfg(feature = "encryption")]
 use aes_gcm::{Aes128Gcm, Aes256Gcm, AesGcm, Nonce};
+use rand::TryRngCore;
 use zeroize::Zeroizing;
 
 /// AES-192-GCM with 96-bit nonce. Not provided by `aes-gcm` but constructible
 /// from the underlying primitives, same as `Aes128Gcm` and `Aes256Gcm`.
+#[cfg(feature = "encryption")]
 type Aes192Gcm = AesGcm<aes_gcm::aes::Aes192, U12>;
 
 use crate::{Error, ErrorKind, Result};
@@ -163,7 +167,9 @@ impl SecureKey {
     /// Generates a new random key for the specified key size.
     pub fn generate(key_size: AesKeySize) -> Self {
         let mut key = vec![0u8; key_size.key_length()];
-        OsRng.fill_bytes(&mut key);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut key)
+            .expect("the operating system random number generator is available");
         Self {
             key: SensitiveBytes::new(key),
             key_size,
@@ -191,6 +197,7 @@ impl TryFrom<SensitiveBytes> for SecureKey {
 }
 
 /// AES-GCM cipher for encrypting and decrypting data.
+#[cfg_attr(not(feature = "encryption"), allow(dead_code))]
 pub struct AesGcmCipher {
     key: SensitiveBytes,
     key_size: AesKeySize,
@@ -220,6 +227,12 @@ impl AesGcmCipher {
     /// The encrypted data in the format: [12-byte nonce][ciphertext][16-byte auth tag]
     /// This matches the Java implementation format for compatibility.
     pub fn encrypt(&self, plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (plaintext, aad);
+            Err(super::encryption_feature_unsupported())
+        }
+        #[cfg(feature = "encryption")]
         match self.key_size {
             AesKeySize::Bits128 => {
                 encrypt_aes_gcm::<Aes128Gcm>(self.key.as_bytes(), plaintext, aad)
@@ -253,6 +266,12 @@ impl AesGcmCipher {
             ));
         }
 
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = aad;
+            Err(super::encryption_feature_unsupported())
+        }
+        #[cfg(feature = "encryption")]
         match self.key_size {
             AesKeySize::Bits128 => {
                 decrypt_aes_gcm::<Aes128Gcm>(self.key.as_bytes(), ciphertext, aad)
@@ -267,6 +286,7 @@ impl AesGcmCipher {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn encrypt_aes_gcm<C>(key_bytes: &[u8], plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>>
 where C: Aead + AeadCore + KeyInit {
     let cipher = C::new_from_slice(key_bytes).map_err(|e| {
@@ -294,6 +314,7 @@ where C: Aead + AeadCore + KeyInit {
     Ok(result)
 }
 
+#[cfg(feature = "encryption")]
 fn decrypt_aes_gcm<C>(key_bytes: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>>
 where C: Aead + AeadCore + KeyInit {
     let cipher = C::new_from_slice(key_bytes).map_err(|e| {
@@ -319,7 +340,7 @@ where C: Aead + AeadCore + KeyInit {
     Ok(plaintext)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
 
@@ -531,5 +552,22 @@ mod tests {
             plaintext.len() + 16,
             "Encrypted portion should be plaintext length + 16-byte tag"
         );
+    }
+}
+
+#[cfg(all(test, not(feature = "encryption")))]
+mod tests_without_encryption_feature {
+    use super::*;
+    use crate::ErrorKind;
+
+    #[test]
+    fn test_cipher_requires_encryption_feature() {
+        let cipher = AesGcmCipher::new(SecureKey::generate(AesKeySize::Bits128));
+
+        let err = cipher.encrypt(b"plaintext", None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+
+        let err = cipher.decrypt(&[0u8; 32], None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
     }
 }

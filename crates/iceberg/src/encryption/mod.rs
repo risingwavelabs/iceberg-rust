@@ -33,3 +33,11 @@ pub use key_metadata::StandardKeyMetadata;
 pub use kms::{GeneratedKey, KeyManagementClient};
 pub use manager::EncryptionManager;
 pub use stream::{AesGcmFileRead, AesGcmFileWrite};
+
+#[cfg(not(feature = "encryption"))]
+pub(crate) fn encryption_feature_unsupported() -> crate::Error {
+    crate::Error::new(
+        crate::ErrorKind::FeatureUnsupported,
+        "Encrypted tables and files require the `encryption` feature of iceberg",
+    )
+}

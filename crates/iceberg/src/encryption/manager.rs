@@ -28,10 +28,9 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use aes_gcm::aead::OsRng;
-use aes_gcm::aead::rand_core::RngCore;
 use chrono::Utc;
 use moka::future::Cache;
+use rand::TryRngCore;
 use uuid::Uuid;
 
 const MILLIS_IN_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -400,7 +399,9 @@ impl EncryptionManager {
     /// Generate a random AAD prefix for file encryption.
     fn generate_aad_prefix() -> Box<[u8]> {
         let mut prefix = vec![0u8; AAD_PREFIX_LENGTH];
-        OsRng.fill_bytes(&mut prefix);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut prefix)
+            .expect("the operating system random number generator is available");
         prefix.into_boxed_slice()
     }
 
@@ -429,7 +430,7 @@ impl EncryptionManager {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
     use crate::encryption::EncryptedInputFile;

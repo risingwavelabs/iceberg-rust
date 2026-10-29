@@ -30,6 +30,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
+#[cfg(feature = "encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
@@ -42,6 +43,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
+#[cfg(feature = "encryption")]
 use crate::encryption::StandardKeyMetadata;
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -768,6 +770,9 @@ impl ArrowReader {
     /// key metadata is present for Parquet Modular Encryption.
     fn build_arrow_reader_options(key_metadata: Option<&[u8]>) -> Result<ArrowReaderOptions> {
         match key_metadata {
+            #[cfg(not(feature = "encryption"))]
+            Some(_) => Err(crate::encryption::encryption_feature_unsupported()),
+            #[cfg(feature = "encryption")]
             Some(km) => {
                 let standard_key_metadata = StandardKeyMetadata::decode(km)?;
                 let mut builder = FileDecryptionProperties::builder(
@@ -810,6 +815,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::Runtime;
+    #[cfg(feature = "encryption")]
+    #[cfg(feature = "encryption")]
     use crate::arrow::test_utils::write_encrypted_parquet;
     use crate::arrow::{ArrowReader, ArrowReaderBuilder, ParquetReadOptions};
     use crate::io::FileIO;
@@ -1024,6 +1031,7 @@ mod tests {
     /// Writes a single-column Parquet file encrypted with `encryption_key`, then reads it
     /// back through `ArrowReader` and asserts the round-tripped values. The key length
     /// selects the AES-GCM variant in arrow-rs (16 -> AES-128, 32 -> AES-256).
+    #[cfg(feature = "encryption")]
     async fn assert_encrypted_parquet_roundtrip(encryption_key: &[u8]) {
         let aad_prefix = b"aad_prefix";
 
@@ -1092,16 +1100,19 @@ mod tests {
         assert_eq!(ids.values(), &[10, 20, 30]);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_read_encrypted_parquet_aes_128() {
         assert_encrypted_parquet_roundtrip(b"0123456789abcdef").await;
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_read_encrypted_parquet_aes_256() {
         assert_encrypted_parquet_roundtrip(b"0123456789abcdef0123456789abcdef").await;
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_read_encrypted_parquet_without_key_metadata_fails() {
         let encryption_key = b"0123456789abcdef";
@@ -2510,6 +2521,7 @@ mod tests {
         assert_row_id_column(&batches, &[Some(100), Some(101), Some(102)]);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_read_encrypted_parquet_with_wrong_key_fails() {
         let encryption_key = b"0123456789abcdef";

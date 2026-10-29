@@ -969,6 +969,7 @@ mod tests {
         SnapshotRetention, Struct, Summary, TableProperties, UnboundPartitionSpec,
     };
     use crate::table::Table;
+    #[cfg(feature = "encryption")]
     use crate::test_utils::make_encrypted_table;
     use crate::transaction::snapshot::{SnapshotProduceOperation, SnapshotProducer};
     use crate::transaction::tests::{
@@ -4099,6 +4100,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_replace_writes_encrypted_manifest_and_manifest_list() {
         let table = make_encrypted_table().await;
