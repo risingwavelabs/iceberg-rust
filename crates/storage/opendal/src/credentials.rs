@@ -1468,6 +1468,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentialed_s3_storage_errors_keep_service_detail_when_enabled() {
+        for factory in s3_factories() {
+            let mut server = Server::new_async().await;
+            let request = server
+                .mock("GET", "/bucket/table/file")
+                .with_status(403)
+                .with_header("x-secret-header", "secret-header")
+                .with_body(
+                    "<Error><Code>AccessDenied</Code><Message>This account is banned.</Message></Error>",
+                )
+                .expect(1)
+                .create_async()
+                .await;
+            let io = anonymous_s3_builder(factory, &server.url())
+                .with_prop(crate::IO_CREDENTIALED_ERROR_SERVICE_DETAIL, "true")
+                .with_credential_provider(Arc::new(RefreshingProvider(AtomicUsize::new(0))))
+                .build();
+            let error = io
+                .new_input("s3://bucket/table/file")
+                .unwrap()
+                .read()
+                .await
+                .unwrap_err();
+            let diagnostic = format!("{error} {error:?} {error:#?}");
+            assert!(diagnostic.contains("status: 403"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("service_error_code: AccessDenied"),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("service_error_message: This account is banned."),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("secret-"));
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
     async fn static_s3_allow_anonymous_still_sends_unsigned_requests() {
         for factory in s3_factories() {
             let mut server = Server::new_async().await;

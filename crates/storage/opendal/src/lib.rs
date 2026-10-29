@@ -49,8 +49,15 @@ use opendal::layers::TimeoutLayer;
 #[cfg(feature = "prometheus")]
 use opendal_layer_prometheus::PrometheusLayer;
 use serde::{Deserialize, Serialize};
+use utils::ErrorRedaction;
 #[cfg(feature = "prometheus")]
 use utils::from_opendal_error;
+
+/// Storage property: when `true` and a credential provider is attached
+/// (vended credentials), redacted storage errors also carry the service error
+/// code (`service_error_code`) and, except for signing and credential errors,
+/// the service error message (`service_error_message`). Defaults to `false`.
+pub const IO_CREDENTIALED_ERROR_SERVICE_DETAIL: &str = "io.credentialed-errors.service-detail";
 
 cfg_if! {
     if #[cfg(feature = "opendal-azdls")] {
@@ -444,8 +451,12 @@ impl ConfiguredOpenDalStorage {
         config: &StorageConfig,
         operator_cache: SharedOperatorCache,
     ) -> Result<Self> {
+        let mut storage = RuntimeStorage::new(storage);
+        storage.keep_service_error_detail = config
+            .get(IO_CREDENTIALED_ERROR_SERVICE_DETAIL)
+            .is_some_and(|value| utils::is_truthy(value));
         Ok(Self {
-            storage: RuntimeStorage::new(storage),
+            storage,
             options: OpenDalStorageOptions::try_from(config)?,
             operator_cache,
         })
@@ -690,6 +701,8 @@ pub enum OpenDalStorage {
 struct RuntimeStorage {
     backend: OpenDalStorage,
     provider: Option<CredentialProvider>,
+    #[serde(default)]
+    keep_service_error_detail: bool,
 }
 
 impl RuntimeStorage {
@@ -697,6 +710,7 @@ impl RuntimeStorage {
         Self {
             backend,
             provider: None,
+            keep_service_error_detail: false,
         }
     }
 
@@ -706,12 +720,16 @@ impl RuntimeStorage {
             .filter(|provider| provider.0.supports_path(path))
     }
 
+    fn redaction(&self) -> ErrorRedaction {
+        ErrorRedaction::new(self.provider.is_some(), self.keep_service_error_detail)
+    }
+
     fn io_error(&self, error: opendal::Error) -> Error {
-        utils::credential_io_error(error, self.provider.is_some())
+        utils::credential_io_error(error, self.redaction())
     }
 
     async fn io<T>(&self, future: impl Future<Output = opendal::Result<T>>) -> Result<T> {
-        utils::credential_io(future, self.provider.is_some()).await
+        utils::credential_io(future, self.redaction()).await
     }
 
     #[allow(unreachable_patterns)]
@@ -1132,7 +1150,7 @@ impl RuntimeStorage {
             self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(Box::new(OpenDalReader(
             self.io(operator.reader(relative_path)).await?,
-            self.provider.is_some(),
+            self.redaction(),
         )))
     }
 
@@ -1167,7 +1185,7 @@ impl RuntimeStorage {
         }
         Ok(Box::new(OpenDalWriter(
             self.io(async { writer.await }).await?,
-            self.provider.is_some(),
+            self.redaction(),
         )))
     }
 
@@ -1316,6 +1334,7 @@ impl RuntimeStorage {
         let storage = Self {
             backend: self.backend.clone(),
             provider: None,
+            keep_service_error_detail: self.keep_service_error_detail,
         };
         if batch_size <= 1 {
             let mut chunks = paths.chunks(CREDENTIALED_DELETE_CONCURRENCY);
@@ -1441,6 +1460,7 @@ impl RuntimeStorage {
                                     key.credential_location.clone(),
                                     paths.to_vec(),
                                 )),
+                                keep_service_error_detail: storage.keep_service_error_detail,
                             };
                             // Do not cache a signer carrying this request's file list.
                             let (operator, _) = batch_storage
@@ -1480,11 +1500,11 @@ impl RuntimeStorage {
                     .await
             })
             .await?;
-        let redact = self.provider.is_some();
+        let redaction = self.redaction();
 
         Ok(
             futures::stream::try_unfold(lister, move |mut lister| async move {
-                utils::credential_io(lister.try_next(), redact)
+                utils::credential_io(lister.try_next(), redaction)
                     .await
                     .map(|entry| entry.map(|entry| (entry, lister)))
             })
@@ -1592,7 +1612,7 @@ impl Storage for ConfiguredOpenDalStorage {
 // Reader/Writer since neither trait nor type is defined in this crate.
 
 /// Wrapper around `opendal::Reader` that implements `FileRead`.
-pub(crate) struct OpenDalReader(pub(crate) opendal::Reader, bool);
+pub(crate) struct OpenDalReader(pub(crate) opendal::Reader, ErrorRedaction);
 
 #[async_trait]
 impl FileRead for OpenDalReader {
@@ -1606,7 +1626,7 @@ impl FileRead for OpenDalReader {
 }
 
 /// Wrapper around `opendal::Writer` that implements `FileWrite`.
-pub(crate) struct OpenDalWriter(pub(crate) opendal::Writer, bool);
+pub(crate) struct OpenDalWriter(pub(crate) opendal::Writer, ErrorRedaction);
 
 #[async_trait]
 impl FileWrite for OpenDalWriter {
