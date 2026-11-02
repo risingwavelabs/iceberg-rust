@@ -2423,6 +2423,7 @@ impl iceberg::spec::ManifestWriter
 pub fn iceberg::spec::ManifestWriter::add_delete_file(&mut self, data_file: iceberg::spec::DataFile, sequence_number: i64, file_sequence_number: core::option::Option<i64>) -> iceberg::Result<()>
 pub fn iceberg::spec::ManifestWriter::add_existing_file(&mut self, data_file: iceberg::spec::DataFile, snapshot_id: i64, sequence_number: i64, file_sequence_number: core::option::Option<i64>) -> iceberg::Result<()>
 pub fn iceberg::spec::ManifestWriter::add_file(&mut self, data_file: iceberg::spec::DataFile, sequence_number: i64) -> iceberg::Result<()>
+pub fn iceberg::spec::ManifestWriter::estimated_manifest_size(&self) -> u64
 pub async fn iceberg::spec::ManifestWriter::write_manifest_file(self) -> iceberg::Result<iceberg::spec::ManifestFile>
 pub struct iceberg::spec::ManifestWriterBuilder
 impl iceberg::spec::ManifestWriterBuilder
