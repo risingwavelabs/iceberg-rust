@@ -2281,4 +2281,86 @@ mod test {
         assert!(fixed_col.is_null(1));
         assert!(fixed_col.is_null(2));
     }
+
+    #[test]
+    fn schema_evolution_adds_list_column_and_preserves_existing_values() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "tags",
+                        Type::List(crate::spec::ListType {
+                            element_field: Arc::new(NestedField::optional(
+                                3,
+                                "element",
+                                Type::Primitive(PrimitiveType::String),
+                            )),
+                        }),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema.clone(), &[1, 2]).build();
+        let old_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "id",
+            DataType::Int32,
+            false,
+            "1",
+        )]));
+
+        for ids in [vec![], vec![1, 2, 3]] {
+            let num_rows = ids.len();
+            let batch =
+                RecordBatch::try_new(old_schema.clone(), vec![Arc::new(Int32Array::from(ids))])
+                    .unwrap();
+            let result = transformer.process_record_batch(batch).unwrap();
+            assert_eq!(result.num_columns(), 2);
+            assert_eq!(result.num_rows(), num_rows);
+            assert_eq!(result.column(1).null_count(), num_rows);
+        }
+
+        let old_batch =
+            RecordBatch::try_new(old_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
+        let old_result = transformer.process_record_batch(old_batch.clone()).unwrap();
+        let target_schema = old_result.schema();
+        let DataType::List(element) = target_schema.field(1).data_type() else {
+            panic!("expected a list column");
+        };
+        assert_eq!(element.name(), "element");
+        assert_eq!(
+            element.metadata().get(PARQUET_FIELD_ID_META_KEY).unwrap(),
+            "3"
+        );
+
+        let tags = arrow_array::ListArray::new(
+            element.clone(),
+            arrow_buffer::OffsetBuffer::new(vec![0, 2, 2, 2].into()),
+            Arc::new(StringArray::from(vec![Some("alpha"), None])),
+            Some(arrow_buffer::NullBuffer::from(vec![true, true, false])),
+        );
+        let new_batch = RecordBatch::try_new(target_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+            Arc::new(tags.clone()),
+        ])
+        .unwrap();
+        // Each file has its own transformer, which caches that file's source schema.
+        let mut new_transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+        let new_result = new_transformer.process_record_batch(new_batch).unwrap();
+        assert_eq!(new_result.schema(), target_schema);
+        assert_eq!(new_result.num_rows(), 3);
+        assert_eq!(new_result.column(1).to_data(), tags.to_data());
+
+        let old_result = transformer.process_record_batch(old_batch).unwrap();
+        assert_eq!(old_result.schema(), target_schema);
+        assert_eq!(old_result.column(1).null_count(), 3);
+        RecordBatch::try_new(target_schema, old_result.columns().to_vec()).unwrap();
+    }
 }

@@ -650,6 +650,13 @@ pub(crate) fn create_primitive_array_single_element(
     data_type: &DataType,
     prim_lit: &Option<PrimitiveLiteral>,
 ) -> Result<ArrayRef> {
+    if prim_lit.is_none() {
+        if let DataType::FixedSizeBinary(len) = data_type {
+            validated_fixed_len(*len)?;
+        }
+        return Ok(arrow_array::new_null_array(data_type, 1));
+    }
+
     match (data_type, prim_lit) {
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(v))) => {
             Ok(Arc::new(BooleanArray::from(vec![*v])))
@@ -923,6 +930,13 @@ pub(crate) fn create_primitive_array_repeated(
     prim_lit: &Option<PrimitiveLiteral>,
     num_rows: usize,
 ) -> Result<ArrayRef> {
+    if prim_lit.is_none() {
+        if let DataType::FixedSizeBinary(len) = data_type {
+            validated_fixed_len(*len)?;
+        }
+        return Ok(arrow_array::new_null_array(data_type, num_rows));
+    }
+
     Ok(match (data_type, prim_lit) {
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(value))) => {
             Arc::new(BooleanArray::from(vec![*value; num_rows]))
@@ -2350,6 +2364,56 @@ mod test {
             .expect("should downcast to FixedSizeBinaryArray");
         assert!(!typed.is_null(0));
         assert_eq!(typed.value(0), uuid_val.to_be_bytes());
+    }
+
+    #[test]
+    fn test_create_missing_nested_columns_with_nulls() {
+        let element = Arc::new(Field::new("element", DataType::Utf8, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "27".to_string())]),
+        ));
+        let list_type = DataType::List(element.clone());
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", list_type.clone(), true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        for data_type in [
+            list_type.clone(),
+            DataType::LargeList(element),
+            DataType::Struct(Fields::from(vec![Field::new("tags", list_type, true)])),
+            map_type,
+        ] {
+            let single = create_primitive_array_single_element(&data_type, &None).unwrap();
+            assert_eq!(single.data_type(), &data_type);
+            assert_eq!(single.len(), 1);
+            assert_eq!(single.null_count(), 1);
+
+            for num_rows in [0, 3] {
+                let repeated =
+                    create_primitive_array_repeated(&data_type, &None, num_rows).unwrap();
+                assert_eq!(repeated.data_type(), &data_type);
+                assert_eq!(repeated.len(), num_rows);
+                assert_eq!(repeated.null_count(), num_rows);
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_null_columns_rejects_negative_fixed_size_binary() {
+        let data_type = DataType::FixedSizeBinary(-1);
+        let single = create_primitive_array_single_element(&data_type, &None).unwrap_err();
+        assert_eq!(single.kind(), ErrorKind::DataInvalid);
+        for num_rows in [0, 3] {
+            let repeated =
+                create_primitive_array_repeated(&data_type, &None, num_rows).unwrap_err();
+            assert_eq!(repeated.kind(), ErrorKind::DataInvalid);
+        }
     }
 
     #[test]
