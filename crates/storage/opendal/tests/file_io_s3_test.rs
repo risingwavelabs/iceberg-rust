@@ -22,26 +22,25 @@
 #[cfg(feature = "opendal-s3")]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
 
+    use async_trait::async_trait;
     use futures::StreamExt;
     use iceberg::io::{
         FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
-        S3_SECRET_ACCESS_KEY,
+        S3_SECRET_ACCESS_KEY, StorageCredential, StorageCredentialProvider, StorageFactory,
     };
-    use iceberg_storage_opendal::{
-        AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
-    };
-    use iceberg_test_utils::{get_minio_endpoint, normalize_test_name_with_parts, set_up};
-    use reqsign_core::Context;
+    use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
+    use iceberg_test_utils::{get_object_store_endpoint, normalize_test_name_with_parts, set_up};
 
     async fn get_file_io() -> FileIO {
         set_up();
 
-        let minio_endpoint = get_minio_endpoint();
+        let object_store_endpoint = get_object_store_endpoint();
 
         FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
             .with_props(vec![
-                (S3_ENDPOINT, minio_endpoint),
+                (S3_ENDPOINT, object_store_endpoint),
                 (S3_ACCESS_KEY_ID, "admin".to_string()),
                 (S3_SECRET_ACCESS_KEY, "password".to_string()),
                 (S3_REGION, "us-east-1".to_string()),
@@ -96,116 +95,57 @@ mod tests {
         }
     }
 
-    // Mock credential loader for testing
     #[derive(Debug)]
-    struct MockCredentialLoader {
-        credential: Option<AwsCredential>,
-    }
+    struct TestCredentialProvider;
 
-    impl MockCredentialLoader {
-        fn new(credential: Option<AwsCredential>) -> Self {
-            Self { credential }
-        }
-
-        fn new_minio() -> Self {
-            Self::new(Some(AwsCredential {
-                access_key_id: "admin".to_string(),
-                secret_access_key: "password".to_string(),
-                session_token: None,
-                expires_in: None,
-            }))
-        }
-    }
-
-    impl ProvideCredential for MockCredentialLoader {
-        type Credential = AwsCredential;
-
-        async fn provide_credential(
+    #[async_trait]
+    impl StorageCredentialProvider for TestCredentialProvider {
+        async fn load_credential_with_minimum_validity(
             &self,
-            _ctx: &Context,
-        ) -> reqsign_core::Result<Option<AwsCredential>> {
-            Ok(self.credential.clone())
-        }
-    }
-
-    #[test]
-    fn test_custom_aws_credential_loader_instantiation() {
-        // Test creating CustomAwsCredentialLoader with mock loader
-        let mock_loader = MockCredentialLoader::new_minio();
-        let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
-
-        // Test that the loader can be used in FileIOBuilder with OpenDalStorageFactory
-        let _builder = FileIOBuilder::new(Arc::new(
-            OpenDalStorageFactory::s3_with_credential_loader(custom_loader),
-        ))
-        .with_props(vec![
-            (S3_ENDPOINT, "http://localhost:9000".to_string()),
-            ("bucket", "test-bucket".to_string()),
-            (S3_REGION, "us-east-1".to_string()),
-            (S3_PATH_STYLE_ACCESS, "true".to_string()),
-        ]);
-    }
-
-    #[tokio::test]
-    async fn test_s3_with_custom_credential_loader_integration() {
-        let _file_io = get_file_io().await;
-
-        // Create a mock credential loader
-        let mock_loader = MockCredentialLoader::new_minio();
-        let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
-
-        let minio_endpoint = get_minio_endpoint();
-
-        // Build FileIO with custom credential loader via OpenDalStorageFactory
-        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(
-            OpenDalStorageFactory::s3_with_credential_loader(custom_loader),
-        ))
-        .with_props(vec![
-            (S3_ENDPOINT, minio_endpoint),
-            (S3_REGION, "us-east-1".to_string()),
-            (S3_PATH_STYLE_ACCESS, "true".to_string()),
-        ])
-        .build();
-
-        // Test that the FileIO was built successfully with the custom loader
-        match file_io_with_custom_creds.exists("s3://bucket1/any").await {
-            Ok(_) => {}
-            Err(e) => panic!("Failed to check existence of bucket: {e}"),
+            location: &str,
+            _minimum_validity: Duration,
+        ) -> iceberg::Result<StorageCredential> {
+            assert!(location.starts_with("s3://bucket1/"));
+            Ok(
+                StorageCredential::new(iceberg::io::StorageCredentialKind::S3(
+                    iceberg::io::S3Credential::new("admin", "password", None),
+                ))
+                .with_expiration(SystemTime::now() + Duration::from_secs(30)),
+            )
         }
     }
 
     #[tokio::test]
-    async fn test_s3_with_custom_credential_loader_integration_failure() {
-        let _file_io = get_file_io().await;
-
-        // Create a mock credential loader with no credentials
-        let mock_loader = MockCredentialLoader::new(None);
-        let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
-
-        let minio_endpoint = get_minio_endpoint();
-
-        // Build FileIO with custom credential loader via OpenDalStorageFactory
-        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(
-            OpenDalStorageFactory::s3_with_credential_loader(custom_loader),
-        ))
-        .with_props(vec![
-            (S3_ENDPOINT, minio_endpoint),
-            (S3_REGION, "us-east-1".to_string()),
-            (S3_PATH_STYLE_ACCESS, "true".to_string()),
-        ])
-        .build();
-
-        // Test that the FileIO was built successfully with the custom loader
-        match file_io_with_custom_creds.exists("s3://bucket1/any").await {
-            Ok(_) => panic!(
-                "Expected error, but got Ok - the credential loader should fail to provide valid credentials"
-            ),
-            Err(e) => {
-                assert!(
-                    e.to_string().contains("failed to load signing credential"),
-                    "unexpected error: {e}"
-                );
-            }
+    async fn test_s3_with_credential_provider() {
+        set_up();
+        let factories: [Arc<dyn StorageFactory>; 2] = [
+            Arc::new(OpenDalStorageFactory::s3()),
+            Arc::new(OpenDalResolvingStorageFactory::new()),
+        ];
+        for (index, factory) in factories.into_iter().enumerate() {
+            let io = FileIOBuilder::new(factory)
+                .with_props([
+                    (S3_ENDPOINT, get_object_store_endpoint()),
+                    (S3_REGION, "us-east-1".to_string()),
+                    (S3_PATH_STYLE_ACCESS, "true".to_string()),
+                ])
+                .with_credential_provider(Arc::new(TestCredentialProvider))
+                .build();
+            let path = format!(
+                "s3://bucket1/{}/{index}",
+                normalize_test_name_with_parts!("test_s3_with_credential_provider")
+            );
+            io.new_output(&path)
+                .unwrap()
+                .write("custom credentials".into())
+                .await
+                .unwrap();
+            assert_eq!(
+                io.new_input(&path).unwrap().read().await.unwrap().as_ref(),
+                b"custom credentials"
+            );
+            io.delete(&path).await.unwrap();
+            assert!(!io.exists(&path).await.unwrap());
         }
     }
 

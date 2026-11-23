@@ -169,7 +169,7 @@ fn build_cipher(metadata: &StandardKeyMetadata) -> Result<Arc<AesGcmCipher>> {
     Ok(Arc::new(AesGcmCipher::new(key)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
     use crate::io::FileIO;

@@ -157,7 +157,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
+    #[cfg(feature = "encryption")]
     use crate::arrow::test_utils::write_encrypted_parquet;
+    #[cfg(feature = "encryption")]
     use crate::spec::DataFileFormat;
 
     #[tokio::test]
@@ -184,6 +186,7 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_read_encrypted_positional_delete_file() {
         use std::sync::Arc;
@@ -269,6 +272,7 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 4);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_read_encrypted_equality_delete_file() {
         use std::collections::HashMap;

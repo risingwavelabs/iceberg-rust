@@ -81,7 +81,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::ManifestListReader;
+    #[cfg(feature = "encryption")]
     use crate::encryption::kms::MemoryKeyManagementClient;
+    #[cfg(feature = "encryption")]
     use crate::encryption::{EncryptionManager, SensitiveBytes};
     use crate::io::FileIO;
     use crate::spec::{TableMetadata, TableMetadataRef};
@@ -118,6 +120,7 @@ mod tests {
         assert_eq!(err.kind(), crate::ErrorKind::PreconditionFailed);
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn load_manifest_list_decrypts_roundtrip() {
         let mut metadata = encryption_test_metadata();

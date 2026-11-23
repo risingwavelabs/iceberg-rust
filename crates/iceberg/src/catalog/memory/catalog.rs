@@ -447,8 +447,11 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(feature = "encryption")]
     use crate::encryption::kms::MemoryKmsClientFactory;
-    use crate::io::{FileIO, LocalFsStorageFactory};
+    use crate::io::FileIO;
+    #[cfg(feature = "encryption")]
+    use crate::io::LocalFsStorageFactory;
     use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -1954,14 +1957,17 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), ErrorKind::TableNotFound);
     }
 
+    #[cfg(feature = "encryption")]
     /// Master key bytes used to generate the encrypted testdata fixtures.
     /// See `testdata/manifests_lists/README.md`.
     const FIXTURE_MASTER_KEY_ID: &str = "master-1";
+    #[cfg(feature = "encryption")]
     const FIXTURE_MASTER_KEY_BYTES: [u8; 16] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f,
     ];
 
+    #[cfg(feature = "encryption")]
     /// Builds a `MemoryKmsClientFactory` seeded with the fixture master key.
     fn fixture_kms_factory() -> MemoryKmsClientFactory {
         use crate::encryption::SensitiveBytes;
@@ -1976,6 +1982,7 @@ pub(crate) mod tests {
         factory
     }
 
+    #[cfg(feature = "encryption")]
     /// Loads the encrypted V3 metadata fixture and patches its snapshot's
     /// manifest-list to point at the on-disk encrypted testdata file.
     fn load_encrypted_fixture_metadata() -> TableMetadata {
@@ -1996,6 +2003,7 @@ pub(crate) mod tests {
         metadata
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn catalog_kms_factory_client_reaches_table_encryption_manager() {
         let warehouse = temp_path();

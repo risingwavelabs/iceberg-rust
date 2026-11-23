@@ -36,6 +36,8 @@ pub const ADLS_ACCOUNT_NAME: &str = "adls.account-name";
 pub const ADLS_ACCOUNT_KEY: &str = "adls.account-key";
 /// The shared access signature.
 pub const ADLS_SAS_TOKEN: &str = "adls.sas-token";
+/// Overrides the storage endpoint derived from the account URI.
+pub const ADLS_ENDPOINT: &str = "adls.endpoint";
 /// The tenant-id.
 pub const ADLS_TENANT_ID: &str = "adls.tenant-id";
 /// The client-id.
@@ -118,6 +120,7 @@ impl TryFrom<&StorageConfig> for AzdlsConfig {
         if let Some(authority_host) = props.get(ADLS_AUTHORITY_HOST) {
             cfg.authority_host = Some(authority_host.clone());
         }
+        cfg.endpoint = props.get(ADLS_ENDPOINT).cloned();
 
         Ok(cfg)
     }
@@ -142,12 +145,17 @@ mod tests {
     fn test_azdls_config_from_storage_config() {
         let storage_config = StorageConfig::new()
             .with_prop(ADLS_ACCOUNT_NAME, "myaccount")
+            .with_prop(ADLS_ENDPOINT, "https://myaccount.dfs.core.windows.net")
             .with_prop(ADLS_ACCOUNT_KEY, "my-account-key");
 
         let azdls_config = AzdlsConfig::try_from(&storage_config).unwrap();
 
         assert_eq!(azdls_config.account_name.as_deref(), Some("myaccount"));
         assert_eq!(azdls_config.account_key.as_deref(), Some("my-account-key"));
+        assert_eq!(
+            azdls_config.endpoint.as_deref(),
+            Some("https://myaccount.dfs.core.windows.net")
+        );
     }
 
     #[test]

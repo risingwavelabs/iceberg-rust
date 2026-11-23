@@ -242,7 +242,7 @@ impl KeyManagementClient for MemoryKeyManagementClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::*;
 

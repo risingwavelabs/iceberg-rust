@@ -22,6 +22,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
+use super::CredentialProvider;
 use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
 };
@@ -86,6 +87,7 @@ pub struct FileIO {
     factory: Arc<dyn StorageFactory>,
     /// Cached storage instance (lazily initialized)
     storage: Arc<OnceLock<Arc<dyn Storage>>>,
+    credential_provider: Option<CredentialProvider>,
 }
 
 impl FileIO {
@@ -97,6 +99,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(MemoryStorageFactory),
             storage: Arc::new(OnceLock::new()),
+            credential_provider: None,
         }
     }
 
@@ -108,6 +111,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(LocalFsStorageFactory),
             storage: Arc::new(OnceLock::new()),
+            credential_provider: None,
         }
     }
 
@@ -127,7 +131,12 @@ impl FileIO {
         }
 
         // Build the storage
-        let storage = self.factory.build(&self.config)?;
+        let storage = match &self.credential_provider {
+            Some(provider) => self
+                .factory
+                .build_with_credentials(&self.config, provider.0.clone())?,
+            None => self.factory.build(&self.config)?,
+        };
 
         // Try to set it (another thread might have set it first)
         let _ = self.storage.set(storage.clone());
@@ -224,6 +233,7 @@ pub struct FileIOBuilder {
     factory: Arc<dyn StorageFactory>,
     /// Storage configuration
     config: StorageConfig,
+    credential_provider: Option<CredentialProvider>,
 }
 
 impl FileIOBuilder {
@@ -232,6 +242,7 @@ impl FileIOBuilder {
         Self {
             factory,
             config: StorageConfig::new(),
+            credential_provider: None,
         }
     }
 
@@ -257,12 +268,22 @@ impl FileIOBuilder {
         &self.config
     }
 
+    /// Share a runtime credential provider with all derived file handles.
+    pub fn with_credential_provider(
+        mut self,
+        provider: Arc<dyn super::StorageCredentialProvider>,
+    ) -> Self {
+        self.credential_provider = Some(CredentialProvider(provider));
+        self
+    }
+
     /// Builds [`FileIO`].
     pub fn build(self) -> FileIO {
         FileIO {
             config: self.config,
             factory: self.factory,
             storage: Arc::new(OnceLock::new()),
+            credential_provider: self.credential_provider,
         }
     }
 }

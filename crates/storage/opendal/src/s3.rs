@@ -16,10 +16,9 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use iceberg::io::{
-    CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ASSUME_ROLE_ARN,
+    CLIENT_REGION, CredentialProvider, S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ASSUME_ROLE_ARN,
     S3_ASSUME_ROLE_EXTERNAL_ID, S3_ASSUME_ROLE_SESSION_NAME, S3_DISABLE_CONFIG_LOAD,
     S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
     S3_SESSION_TOKEN, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE,
@@ -27,13 +26,10 @@ use iceberg::io::{
 use iceberg::{Error, ErrorKind, Result};
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
-/// AWS credentials: access key ID, secret access key, and optional session token.
-pub use reqsign_aws_v4::Credential as AwsCredential;
-/// Trait for types that can asynchronously supply [`AwsCredential`] to a [`CustomAwsCredentialLoader`].
-pub use reqsign_core::ProvideCredential;
-use reqsign_core::{ProvideCredentialChain, ProvideCredentialDyn};
+use reqsign_core::ProvideCredentialChain;
 use url::Url;
 
+use crate::credentials::{VendedCredentialSource, VendedS3CredentialProvider};
 use crate::utils::{from_opendal_error, is_truthy};
 
 /// Parse iceberg props to s3 config.
@@ -128,8 +124,8 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
 /// Build new opendal operator from give path.
 pub(crate) fn s3_config_build(
     cfg: &S3Config,
-    customized_credential_load: &Option<CustomAwsCredentialLoader>,
     path: &str,
+    credentials: Option<&CredentialProvider>,
 ) -> Result<Operator> {
     let url = Url::parse(path)?;
     let bucket = url.host_str().ok_or_else(|| {
@@ -139,45 +135,30 @@ pub(crate) fn s3_config_build(
         )
     })?;
 
+    let mut cfg = cfg.clone();
+    if credentials.is_some() {
+        // Delegated authentication must never bypass its provider.
+        cfg.skip_signature = false;
+        #[allow(deprecated)]
+        {
+            cfg.allow_anonymous = false;
+        }
+    }
     let mut builder = cfg
-        .clone()
         .into_builder()
         // Set bucket name.
         .bucket(bucket);
 
-    if let Some(loader) = customized_credential_load {
-        let chain = ProvideCredentialChain::new().push(Arc::clone(&loader.0));
-        builder = builder.credential_provider_chain(chain);
+    if let Some(provider) = credentials {
+        builder = builder.credential_provider_chain(ProvideCredentialChain::new().push(
+            VendedS3CredentialProvider(VendedCredentialSource {
+                provider: provider.clone(),
+                location: path.to_string(),
+            }),
+        ));
     }
 
     Operator::new(builder).map_err(from_opendal_error)
-}
-
-/// Custom AWS credential loader.
-///
-/// Wraps any [`ProvideCredential`] implementation for use with the S3 storage backend.
-/// Use [`CustomAwsCredentialLoader::new`] to create one, then pass it to
-/// [`OpenDalStorageFactory::s3`](crate::OpenDalStorageFactory::s3).
-pub struct CustomAwsCredentialLoader(Arc<dyn ProvideCredentialDyn<Credential = AwsCredential>>);
-
-impl Clone for CustomAwsCredentialLoader {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl std::fmt::Debug for CustomAwsCredentialLoader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CustomAwsCredentialLoader")
-            .finish_non_exhaustive()
-    }
-}
-
-impl CustomAwsCredentialLoader {
-    /// Create a new custom AWS credential loader from any [`ProvideCredential`] implementation.
-    pub fn new(provider: impl ProvideCredential<Credential = AwsCredential> + 'static) -> Self {
-        Self(Arc::new(provider) as Arc<dyn ProvideCredentialDyn<Credential = AwsCredential>>)
-    }
 }
 
 #[cfg(test)]

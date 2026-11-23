@@ -154,6 +154,7 @@ impl AsyncFileReader for ArrowFileReader {
         &mut self,
         options: Option<&'_ ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        #[cfg(feature = "encryption")]
         let decryption_properties = options
             .and_then(|opts| opts.file_decryption_properties())
             .cloned();
@@ -173,8 +174,9 @@ impl AsyncFileReader for ArrowFileReader {
                 .with_offset_index_policy(PageIndexPolicy::from(
                     self.parquet_read_options.preload_offset_index(),
                 ))
-                .with_metadata_options(metadata_options)
-                .with_decryption_properties(decryption_properties);
+                .with_metadata_options(metadata_options);
+            #[cfg(feature = "encryption")]
+            let reader = reader.with_decryption_properties(decryption_properties);
             let size = self.meta.size;
             let meta = reader.load_and_finish(self, size).await?;
 

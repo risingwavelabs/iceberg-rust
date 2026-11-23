@@ -17,7 +17,10 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+#[cfg(feature = "gcp-auth")]
+use std::sync::Arc;
 
+#[cfg(feature = "gcp-auth")]
 use gcp_auth::TokenProvider;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
@@ -48,6 +51,9 @@ pub(crate) struct HttpClient {
     disable_header_redaction: bool,
     /// GCP service-account JSON for BigLake REST authentication.
     gcp_credential: Option<String>,
+    /// Explicit Google authentication also enables ADC without inline credentials.
+    google_auth: bool,
+    gcp_auth_scopes: Vec<String>,
 }
 
 impl Debug for HttpClient {
@@ -72,6 +78,10 @@ impl HttpClient {
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential(),
+            google_auth: cfg.google_auth(),
+            gcp_auth_scopes: cfg
+                .gcp_auth_scopes()?
+                .unwrap_or_else(|| vec![GCP_CLOUD_PLATFORM_SCOPE.to_string()]),
         })
     }
 
@@ -80,6 +90,7 @@ impl HttpClient {
     /// If cfg carries new value, we will use cfg instead.
     /// Otherwise, we will keep the old value.
     pub fn update_with(self, cfg: &RestCatalogConfig) -> Result<Self> {
+        let gcp_auth_scopes = cfg.gcp_auth_scopes()?.unwrap_or(self.gcp_auth_scopes);
         let extra_headers = (!cfg.extra_headers()?.is_empty())
             .then(|| cfg.extra_headers())
             .transpose()?
@@ -101,6 +112,9 @@ impl HttpClient {
             },
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
+            // Catalog responses must not enable access to the host's ADC.
+            google_auth: self.google_auth,
+            gcp_auth_scopes,
         })
     }
 
@@ -183,30 +197,41 @@ impl HttpClient {
         Ok(auth_res.access_token)
     }
 
+    #[cfg(feature = "gcp-auth")]
     async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
-        let credential = self.gcp_credential.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "GCP service account must be provided for authentication",
+        let provider: Arc<dyn TokenProvider> = if let Some(credential) = &self.gcp_credential {
+            Arc::new(
+                gcp_auth::CustomServiceAccount::from_json(credential).map_err(|error| {
+                    Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
+                        .with_source(error)
+                })?,
             )
+        } else {
+            gcp_auth::provider().await.map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to load Google Application Default Credentials",
+                )
+                .with_source(error)
+            })?
+        };
+        let scopes: Vec<_> = self.gcp_auth_scopes.iter().map(String::as_str).collect();
+        let token = provider.token(&scopes).await.map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "Failed to get GCP access token").with_source(error)
         })?;
-        let service_account =
-            gcp_auth::CustomServiceAccount::from_json(credential).map_err(|error| {
-                Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
-                    .with_source(error)
-            })?;
-        let token = service_account
-            .token(&[GCP_CLOUD_PLATFORM_SCOPE])
-            .await
-            .map_err(|error| {
-                Error::new(ErrorKind::Unexpected, "Failed to get GCP access token")
-                    .with_source(error)
-            })?;
         Ok(token.as_str().to_string())
     }
 
+    #[cfg(not(feature = "gcp-auth"))]
+    async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Google authentication requires the `gcp-auth` feature of iceberg-catalog-rest",
+        ))
+    }
+
     async fn exchange_token(&self) -> Result<String> {
-        if self.gcp_credential.is_some() {
+        if self.google_auth || self.gcp_credential.is_some() {
             self.exchange_gcp_credential_for_token().await
         } else {
             self.exchange_credential_for_token().await
@@ -214,7 +239,7 @@ impl HttpClient {
     }
 
     fn can_refresh_token(&self) -> bool {
-        self.credential.is_some() || self.gcp_credential.is_some()
+        self.credential.is_some() || self.gcp_credential.is_some() || self.google_auth
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -243,7 +268,7 @@ impl HttpClient {
     /// 1. **No authentication** - Skip authentication when both `credential` and `token` are missing.
     /// 2. **Token authentication** - Use the provided `token` directly for authentication.
     /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
-    /// 4. **GCP service account** - Exchange `gcs.credentials-json` for a Google access token.
+    /// 4. **Google authentication** - Exchange `gcs.credentials-json` or ADC for a Google access token.
     ///
     /// When both `credential` and `token` are present, `token` takes precedence.
     /// GCP service-account exchange takes precedence when a new token is needed.
@@ -301,7 +326,29 @@ impl HttpClient {
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and
     // returns a `Response`.
-    pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
+    pub async fn query_catalog(&self, request: Request) -> Result<Response> {
+        self.query_catalog_inner(request, None).await
+    }
+
+    /// Keep an observed 401 visible to storage credential revocation handling,
+    /// even when the subsequent OAuth exchange itself fails.
+    pub(crate) async fn query_credentials(
+        &self,
+        request: Request,
+        revoked: &mut bool,
+    ) -> Result<Response> {
+        self.query_catalog_inner(request, Some(revoked)).await
+    }
+
+    /// `revoked` is absent for ordinary catalog calls. Credential refresh calls
+    /// pass their persistent revocation flag so an initial 401 remains visible
+    /// if OAuth renewal fails, times out, or is cancelled. Only the credential
+    /// layer clears that flag after successfully fetching new credentials.
+    async fn query_catalog_inner(
+        &self,
+        mut request: Request,
+        revoked: Option<&mut bool>,
+    ) -> Result<Response> {
         let retry_request = request.try_clone();
         let used_token = self.authenticate(&mut request).await?;
         let response = self.execute(request).await?;
@@ -312,8 +359,19 @@ impl HttpClient {
         let (Some(mut retry_request), Some(rejected_token)) = (retry_request, used_token) else {
             return Ok(response);
         };
+        let preserve_unauthorized = revoked.is_some();
+        if let Some(revoked) = revoked {
+            // This survives cancellation or timeout during the OAuth exchange.
+            *revoked = true;
+        }
+        if let Err(error) = self.refresh_after_unauthorized(&rejected_token).await {
+            return if preserve_unauthorized {
+                Ok(response)
+            } else {
+                Err(error)
+            };
+        }
         drop(response);
-        self.refresh_after_unauthorized(&rejected_token).await?;
         self.authenticate(&mut retry_request).await?;
         self.execute(retry_request).await
     }
@@ -415,6 +473,104 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn google_config(scopes: Option<&str>) -> RestCatalogConfig {
+        let mut props = HashMap::from([("rest.auth.type".into(), "google".into())]);
+        if let Some(scopes) = scopes {
+            props.insert("gcp.auth.scopes".into(), scopes.into());
+        }
+        RestCatalogConfig::builder()
+            .uri("https://catalog.example".into())
+            .props(props)
+            .build()
+    }
+
+    #[test]
+    fn google_authentication_enables_adc_and_preserves_scopes_on_update() {
+        let client = HttpClient::new(&google_config(None)).unwrap();
+        assert!(client.google_auth);
+        assert!(client.can_refresh_token());
+        assert_eq!(client.gcp_auth_scopes, vec![GCP_CLOUD_PLATFORM_SCOPE]);
+        let client = client
+            .update_with(&google_config(Some(" scope-a , scope-b ")))
+            .unwrap();
+        assert_eq!(client.gcp_auth_scopes, vec!["scope-a", "scope-b"]);
+        let client = client
+            .update_with(
+                &RestCatalogConfig::builder()
+                    .uri("https://catalog.example".into())
+                    .build(),
+            )
+            .unwrap();
+        assert!(client.google_auth);
+        assert_eq!(client.gcp_auth_scopes, vec!["scope-a", "scope-b"]);
+    }
+
+    #[cfg(not(feature = "gcp-auth"))]
+    #[tokio::test]
+    async fn google_authentication_without_gcp_auth_feature_is_unsupported() {
+        let client = HttpClient::new(&google_config(None)).unwrap();
+        let err = client.exchange_token().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    }
+
+    #[test]
+    fn google_authentication_accepts_user_aliases_and_preserves_user_selection() {
+        for auth_type in [
+            "google",
+            "GOOGLE",
+            "GoOgLe",
+            "org.apache.iceberg.gcp.auth.GoogleAuthManager",
+        ] {
+            let cfg = RestCatalogConfig::builder()
+                .uri("https://catalog.example".into())
+                .props(HashMap::from([("rest.auth.type".into(), auth_type.into())]))
+                .build();
+            let client = HttpClient::new(&cfg).unwrap();
+            assert!(client.google_auth);
+            assert!(client.can_refresh_token());
+
+            let server_cfg = RestCatalogConfig::builder()
+                .uri("https://catalog.example".into())
+                .props(HashMap::from([("rest.auth.type".into(), "none".into())]))
+                .build();
+            let client = client.update_with(&server_cfg).unwrap();
+            assert!(client.google_auth);
+            assert!(client.can_refresh_token());
+        }
+    }
+
+    #[test]
+    fn google_authentication_rejects_empty_scopes() {
+        for scopes in ["", " ", ",scope", "scope,", "scope,,other"] {
+            let error = HttpClient::new(&google_config(Some(scopes))).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        }
+    }
+
+    #[tokio::test]
+    async fn google_authentication_keeps_explicit_token_and_fails_closed_on_bad_credentials() {
+        let cfg = RestCatalogConfig::builder()
+            .uri("https://catalog.example".into())
+            .props(HashMap::from([
+                ("rest.auth.type".into(), "google".into()),
+                ("token".into(), "test-catalog-token".into()),
+                ("gcs.credentials-json".into(), "invalid-json".into()),
+            ]))
+            .build();
+        let client = HttpClient::new(&cfg).unwrap();
+        let mut request = client
+            .request(Method::GET, "https://catalog.example")
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.authenticate(&mut request).await.unwrap().as_deref(),
+            Some("test-catalog-token")
+        );
+        client.invalidate_token().await.unwrap();
+        assert!(client.authenticate(&mut request).await.is_err());
+        assert!(client.token.lock().await.is_none());
+    }
 
     #[test]
     fn test_format_headers_redacted_empty() {

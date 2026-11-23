@@ -19,14 +19,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::encryption::EncryptionManager;
 use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestFile,
-    ManifestStatus, ManifestWriter, ManifestWriterBuilder, PartitionSpec, Schema,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestContentType,
+    ManifestFile, ManifestStatus, ManifestWriter, ManifestWriterBuilder, PartitionSpec, Schema,
 };
 use crate::transaction::snapshot::{
     DataFileIdentity, data_file_identity, format_data_file_identity,
@@ -132,6 +133,7 @@ pub struct ManifestFilterManager {
 
     file_io: FileIO,
     writer_context: ManifestWriterContext,
+    load_concurrency: usize,
 }
 
 impl ManifestFilterManager {
@@ -147,7 +149,13 @@ impl ManifestFilterManager {
             removed_data_file_path: HashSet::new(),
             file_io,
             writer_context,
+            load_concurrency: 16,
         }
+    }
+
+    pub(crate) fn set_load_concurrency(&mut self, load_concurrency: usize) {
+        assert!(load_concurrency > 0);
+        self.load_concurrency = load_concurrency;
     }
 
     /// Set whether to fail if any delete operation is attempted
@@ -200,45 +208,95 @@ impl ManifestFilterManager {
             return Ok(vec![]);
         }
 
-        let mut filtered = Vec::with_capacity(manifests.len());
+        enum FilterTask {
+            Ready(ManifestFile),
+            Load(ManifestFile),
+            PendingCache(String),
+        }
 
+        enum FilterInput {
+            Ready(ManifestFile),
+            Loaded(ManifestFile, Manifest),
+            PendingCache(String),
+        }
+
+        let manifest_count = manifests.len();
+        let criteria_can_expand = self.min_sequence_number > 0;
+        let mut scheduled_paths = HashSet::new();
+        let mut tasks = Vec::with_capacity(manifests.len());
         for manifest in manifests {
-            let filtered_manifest = self.filter_manifest(table_schema, manifest).await?;
+            if let Some(cached) = self.filtered_manifests.get(&manifest.manifest_path) {
+                tasks.push(FilterTask::Ready(cached.clone()));
+            } else if Self::manifest_has_no_live_files(&manifest)
+                || (!criteria_can_expand && !self.can_contain_deleted_files(&manifest))
+            {
+                self.filtered_manifests
+                    .insert(manifest.manifest_path.clone(), manifest.clone());
+                tasks.push(FilterTask::Ready(manifest));
+            } else if scheduled_paths.insert(manifest.manifest_path.clone()) {
+                tasks.push(FilterTask::Load(manifest));
+            } else {
+                tasks.push(FilterTask::PendingCache(manifest.manifest_path));
+            }
+        }
+
+        let file_io = self.file_io.clone();
+        let load_concurrency = if self.fail_any_delete {
+            1
+        } else {
+            self.load_concurrency
+        };
+        let mut inputs = futures::stream::iter(tasks)
+            .map(|task| {
+                let file_io = file_io.clone();
+                async move {
+                    match task {
+                        FilterTask::Ready(manifest) => Ok::<_, Error>(FilterInput::Ready(manifest)),
+                        FilterTask::Load(manifest_file) => {
+                            let manifest = manifest_file.load_manifest(&file_io).await?;
+                            Ok::<_, Error>(FilterInput::Loaded(manifest_file, manifest))
+                        }
+                        FilterTask::PendingCache(path) => {
+                            Ok::<_, Error>(FilterInput::PendingCache(path))
+                        }
+                    }
+                }
+            })
+            .buffered(load_concurrency);
+
+        let mut filtered = Vec::with_capacity(manifest_count);
+        while let Some(input) = inputs.next().await {
+            let filtered_manifest = match input? {
+                FilterInput::Ready(manifest) => manifest,
+                FilterInput::Loaded(manifest_file, manifest) => {
+                    if !self.can_contain_deleted_files(&manifest_file) {
+                        self.filtered_manifests
+                            .insert(manifest_file.manifest_path.clone(), manifest_file.clone());
+                        manifest_file
+                    } else if self.manifest_has_deleted_files(&manifest_file, &manifest)? {
+                        self.filter_loaded_manifest_with_deleted_files(
+                            table_schema,
+                            manifest_file,
+                            manifest,
+                        )
+                        .await?
+                    } else {
+                        self.filtered_manifests
+                            .insert(manifest_file.manifest_path.clone(), manifest_file.clone());
+                        manifest_file
+                    }
+                }
+                FilterInput::PendingCache(path) => self
+                    .filtered_manifests
+                    .get(&path)
+                    .expect("earlier duplicate manifest should be filtered")
+                    .clone(),
+            };
             filtered.push(filtered_manifest);
         }
 
         self.validate_required_deletes(&filtered)?;
         Ok(filtered)
-    }
-
-    /// Filter a single manifest file
-    async fn filter_manifest(
-        &mut self,
-        table_schema: &Schema,
-        manifest: ManifestFile,
-    ) -> Result<ManifestFile> {
-        // Check cache first
-        if let Some(cached) = self.filtered_manifests.get(&manifest.manifest_path) {
-            return Ok(cached.clone());
-        }
-
-        // Check if this manifest can contain files to delete
-        if !self.can_contain_deleted_files(&manifest) {
-            self.filtered_manifests
-                .insert(manifest.manifest_path.clone(), manifest.clone());
-            return Ok(manifest);
-        }
-
-        if self.manifest_has_deleted_files(&manifest).await? {
-            // Load and filter the manifest
-            self.filter_manifest_with_deleted_files(table_schema, manifest)
-                .await
-        } else {
-            // If no deleted files are found, just return the original manifest
-            self.filtered_manifests
-                .insert(manifest.manifest_path.clone(), manifest.clone());
-            Ok(manifest)
-        }
     }
 
     /// Check if a manifest can potentially contain files that need to be deleted
@@ -261,14 +319,12 @@ impl ManifestFilterManager {
     }
 
     /// Filter a manifest that is known to contain files to delete
-    async fn filter_manifest_with_deleted_files(
+    async fn filter_loaded_manifest_with_deleted_files(
         &mut self,
         table_schema: &Schema,
         manifest: ManifestFile,
+        original_manifest: Manifest,
     ) -> Result<ManifestFile> {
-        // Load the original manifest
-        let original_manifest = manifest.load_manifest(&self.file_io).await?;
-
         let (entries, manifest_meta_data) = original_manifest.into_parts();
 
         // Check if this is a delete manifest
@@ -424,9 +480,11 @@ impl ManifestFilterManager {
         !manifest.has_added_files() && !manifest.has_existing_files()
     }
 
-    async fn manifest_has_deleted_files(&self, manifest_file: &ManifestFile) -> Result<bool> {
-        let manifest = manifest_file.load_manifest(&self.file_io).await?;
-
+    fn manifest_has_deleted_files(
+        &self,
+        manifest_file: &ManifestFile,
+        manifest: &Manifest,
+    ) -> Result<bool> {
         let is_delete = manifest_file.content == ManifestContentType::Deletes;
 
         for entry in manifest.entries() {
@@ -531,12 +589,20 @@ impl ManifestFilterManager {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
-    use crate::io::FileIO;
+    use crate::io::{
+        FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, ListEntry,
+        MemoryStorage, OutputFile, Storage, StorageConfig, StorageFactory,
+    };
     use crate::spec::{
         DataContentType, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
         ManifestFile, ManifestStatus, ManifestWriterBuilder, NestedField, PartitionSpec,
@@ -699,6 +765,109 @@ mod tests {
         let manager = ManifestFilterManager::new(file_io, writer_context);
 
         (manager, temp_dir)
+    }
+
+    fn default_read_count() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CountingStorage {
+        inner: MemoryStorage,
+        #[serde(skip, default = "default_read_count")]
+        input_opens: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl Storage for CountingStorage {
+        async fn exists(&self, path: &str) -> Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+            self.inner.metadata(path).await
+        }
+
+        async fn read(&self, path: &str) -> Result<Bytes> {
+            self.inner.read(path).await
+        }
+
+        async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+            self.inner.reader(path).await
+        }
+
+        async fn write(&self, path: &str, bytes: Bytes) -> Result<()> {
+            self.inner.write(path, bytes).await
+        }
+
+        async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+            self.inner.writer(path).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn delete_prefix(&self, path: &str) -> Result<()> {
+            self.inner.delete_prefix(path).await
+        }
+
+        async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
+            self.inner.delete_stream(paths).await
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            recursive: bool,
+        ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+            self.inner.list(path, recursive).await
+        }
+
+        fn new_input(&self, path: &str) -> Result<InputFile> {
+            self.input_opens.fetch_add(1, Ordering::SeqCst);
+            self.inner.new_input(path)
+        }
+
+        fn new_output(&self, path: &str) -> Result<OutputFile> {
+            self.inner.new_output(path)
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CountingStorageFactory {
+        storage: CountingStorage,
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for CountingStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+            Ok(Arc::new(self.storage.clone()))
+        }
+    }
+
+    fn setup_counting_test_manager() -> (ManifestFilterManager, Arc<AtomicUsize>) {
+        let input_opens = default_read_count();
+        let storage = CountingStorage {
+            inner: MemoryStorage::new(),
+            input_opens: Arc::clone(&input_opens),
+        };
+        let file_io = FileIOBuilder::new(Arc::new(CountingStorageFactory { storage })).build();
+        let writer_context = ManifestWriterContext::new(
+            "memory:///metadata".to_string(),
+            Uuid::new_v4(),
+            Arc::new(AtomicU64::new(0)),
+            FormatVersion::V2,
+            1,
+            file_io.clone(),
+            None,
+        );
+
+        (
+            ManifestFilterManager::new(file_io, writer_context),
+            input_opens,
+        )
     }
 
     // Helper function to write manifest entries to file
@@ -962,7 +1131,12 @@ mod tests {
 
         // Verify manifest filtering capabilities
         assert!(manager.can_contain_deleted_files(&manifest));
-        assert!(manager.manifest_has_deleted_files(&manifest).await.unwrap());
+        let loaded_manifest = manifest.load_manifest(&manager.file_io).await.unwrap();
+        assert!(
+            manager
+                .manifest_has_deleted_files(&manifest, &loaded_manifest)
+                .unwrap()
+        );
         assert!(
             manager
                 .files_to_delete
@@ -1217,6 +1391,102 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_filter_manifests_loads_rewritten_source_once() {
+        let (mut manager, input_opens) = setup_counting_test_manager();
+        let schema = create_test_schema();
+        let deleted_file = create_test_data_file("memory:///test/delete.parquet", 0);
+        manager.delete_file(deleted_file.clone()).unwrap();
+        let manifest_path = "memory:///test/source-manifest.avro";
+        write_manifest_with_entries(
+            &manager,
+            manifest_path,
+            &schema,
+            create_entries_from_files(vec![
+                create_test_data_file("memory:///test/keep.parquet", 0),
+                deleted_file,
+            ]),
+            12345,
+        )
+        .await
+        .unwrap();
+        let input_manifest = create_manifest_metadata(
+            manifest_path,
+            ManifestContentType::Data,
+            10,
+            12345,
+            (2, 0, 0),
+        );
+        input_opens.store(0, Ordering::SeqCst);
+
+        let filtered = manager
+            .filter_manifests(&schema, vec![
+                input_manifest.clone(),
+                input_manifest.clone(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(input_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0], filtered[1]);
+        assert_ne!(filtered[0].manifest_path, input_manifest.manifest_path);
+
+        manager
+            .filter_manifests(&schema, vec![input_manifest])
+            .await
+            .unwrap();
+        assert_eq!(input_opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_cleanup_applies_discovered_identity_to_later_manifest() {
+        let (mut manager, temp_dir) = setup_test_manager();
+        let schema = create_test_schema();
+        let delete_file =
+            create_test_deletion_vector("/test/repeated.puffin", "/test/data.parquet");
+        let old_path = temp_dir
+            .path()
+            .join("old-sequence.avro")
+            .to_string_lossy()
+            .to_string();
+        let newer_path = temp_dir
+            .path()
+            .join("newer-sequence.avro")
+            .to_string_lossy()
+            .to_string();
+        for path in [&old_path, &newer_path] {
+            write_delete_manifest_with_entries(
+                &manager,
+                path,
+                &schema,
+                create_entries_from_files(vec![delete_file.clone()]),
+                12345,
+            )
+            .await
+            .unwrap();
+        }
+        let old_manifest =
+            create_manifest_metadata(&old_path, ManifestContentType::Deletes, 1, 12345, (1, 0, 0));
+        let newer_manifest = create_manifest_metadata(
+            &newer_path,
+            ManifestContentType::Deletes,
+            10,
+            12345,
+            (1, 0, 0),
+        );
+        manager.drop_delete_files_older_than(5);
+
+        let filtered = manager
+            .filter_manifests(&schema, vec![old_manifest, newer_manifest.clone()])
+            .await
+            .unwrap();
+
+        assert_ne!(filtered[1].manifest_path, newer_manifest.manifest_path);
+        let manifest = filtered[1].load_manifest(&manager.file_io).await.unwrap();
+        assert_eq!(manifest.entries()[0].status(), ManifestStatus::Deleted);
+    }
+
     #[test]
     fn test_unassigned_sequence_number_handling() {
         let (mut manager, _temp_dir) = setup_test_manager();
@@ -1259,13 +1529,15 @@ mod tests {
 
         // First and second calls should return the same cached result
         let result1 = manager
-            .filter_manifest(&schema, manifest.clone())
+            .filter_manifests(&schema, vec![manifest.clone()])
             .await
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let result2 = manager
-            .filter_manifest(&schema, manifest.clone())
+            .filter_manifests(&schema, vec![manifest.clone()])
             .await
-            .unwrap();
+            .unwrap()
+            .remove(0);
 
         assert_eq!(result1.manifest_path, result2.manifest_path);
         assert!(

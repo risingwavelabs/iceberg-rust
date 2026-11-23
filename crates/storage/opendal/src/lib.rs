@@ -17,27 +17,28 @@
 
 //! OpenDAL-based storage implementation for Apache Iceberg.
 //!
-//! This crate provides [`OpenDalStorage`] and [`OpenDalStorageFactory`],
-//! which implement the [`Storage`](Storage) and
-//! [`StorageFactory`](StorageFactory) traits from the `iceberg` crate
-//! using [OpenDAL](https://opendal.apache.org/) as the backend.
+//! [`OpenDalStorageFactory`] implements Iceberg's [`StorageFactory`] using
+//! [OpenDAL](https://opendal.apache.org/). [`OpenDalStorage`] describes backend
+//! configuration; factories create the configured [`Storage`] instances.
 
 mod utils;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, IO_CHUNK_SIZE, IO_MAX_RETRIES, IO_RETRY_MAX_DELAY_MS,
-    IO_RETRY_MIN_DELAY_MS, IO_TIMEOUT_SECONDS, InputFile, ListEntry, OutputFile, Storage,
-    StorageConfig, StorageFactory,
+    CredentialProvider, FileMetadata, FileRead, FileWrite, IO_CHUNK_SIZE, IO_MAX_RETRIES,
+    IO_RETRY_MAX_DELAY_MS, IO_RETRY_MIN_DELAY_MS, IO_TIMEOUT_SECONDS, InputFile, ListEntry,
+    OutputFile, Storage, StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
 use once_cell::sync::OnceCell;
@@ -45,8 +46,18 @@ use opendal::Operator;
 use opendal::layers::RetryLayer;
 #[cfg(not(madsim))]
 use opendal::layers::TimeoutLayer;
+#[cfg(feature = "prometheus")]
+use opendal_layer_prometheus::PrometheusLayer;
 use serde::{Deserialize, Serialize};
+use utils::ErrorRedaction;
+#[cfg(feature = "prometheus")]
 use utils::from_opendal_error;
+
+/// Storage property: when `true` and a credential provider is attached
+/// (vended credentials), redacted storage errors also carry the service error
+/// code (`service_error_code`) and, except for signing and credential errors,
+/// the service error message (`service_error_message`). Defaults to `false`.
+pub const IO_CREDENTIALED_ERROR_SERVICE_DETAIL: &str = "io.credentialed-errors.service-detail";
 
 cfg_if! {
     if #[cfg(feature = "opendal-azdls")] {
@@ -106,12 +117,37 @@ cfg_if! {
     if #[cfg(feature = "opendal-s3")] {
         mod s3;
         use opendal::services::S3Config;
-        pub use s3::*;
+        use s3::*;
     }
 }
 
+#[cfg(any(
+    feature = "opendal-azdls",
+    feature = "opendal-s3",
+    feature = "opendal-gcs"
+))]
+mod credentials;
 mod resolving;
 pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
+
+#[cfg(feature = "prometheus")]
+static PROMETHEUS_LAYER: OnceCell<PrometheusLayer> = OnceCell::new();
+
+/// Installs OpenDAL metrics into the supplied Prometheus registry.
+///
+/// Call this once, before creating any [`OpenDalStorage`] operators. The first
+/// successful call selects the registry used by all subsequently created
+/// operators in this process.
+#[cfg(feature = "prometheus")]
+pub fn install_prometheus_metrics(registry: &prometheus::Registry) -> Result<()> {
+    PROMETHEUS_LAYER
+        .get_or_try_init(|| {
+            PrometheusLayer::builder()
+                .register(registry)
+                .map_err(from_opendal_error)
+        })
+        .map(|_| ())
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct OpenDalStorageOptions {
@@ -168,6 +204,16 @@ where T: std::str::FromStr {
         .transpose()
 }
 
+/// Bind directory operations to the same resource URI used by the backend.
+/// File operations must retain their exact URI, without an added slash.
+fn directory_path(path: &str) -> Cow<'_, str> {
+    if path.ends_with('/') {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(format!("{path}/"))
+    }
+}
+
 type SharedOperatorCache = Arc<OperatorCache>;
 
 /// The subset of [`OpenDalStorageOptions`] that changes a configured operator.
@@ -199,6 +245,8 @@ enum OperatorBackendConfig {
     S3(Arc<S3Config>),
     #[cfg(feature = "opendal-gcs")]
     Gcs(Arc<GcsConfig>),
+    #[cfg(feature = "opendal-azdls")]
+    Azdls(Arc<AzdlsConfig>),
 }
 
 /// Cache entries are scoped by everything that affects the resulting operator.
@@ -207,21 +255,91 @@ enum OperatorBackendConfig {
 #[derive(Clone, PartialEq, Eq)]
 struct OperatorCacheKey {
     backend_config: OperatorBackendConfig,
+    /// The bucket name for S3 and GCS. For ADLS this is
+    /// `<scheme>://<filesystem>@<account host>`, because the operator's
+    /// endpoint is derived from the path scheme and host unless configured.
     bucket: String,
     layer_options: OperatorLayerOptions,
+    credentials: Option<(CredentialProvider, String)>,
+}
+
+/// The maximum number of operators one factory keeps.
+///
+/// Credentials are part of the cache key, so every refresh of vended credentials
+/// (e.g. a table reloaded before each commit) yields a new entry. Bounding the cache
+/// evicts the operators of expired credentials; the static credentials that make
+/// operators expensive to rebuild stay recently used.
+const OPERATOR_CACHE_CAPACITY: usize = 64;
+
+/// Bound in-flight deletes when credentials must be checked for each file.
+pub(crate) const CREDENTIALED_DELETE_CONCURRENCY: usize = 32;
+
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
+fn credentialed_delete_batch_size(capability: opendal::Capability) -> usize {
+    // Bound queued paths independently of a service's maximum request size.
+    const CREDENTIALED_DELETE_BUFFER_SIZE: usize = 1024;
+    capability
+        .delete_max_size
+        .unwrap_or(1)
+        .clamp(1, CREDENTIALED_DELETE_BUFFER_SIZE)
+}
+
+/// Keep bulk deletion within one backend resource and selected credential scope.
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
+#[derive(PartialEq, Eq, Hash)]
+struct DeleteBatchKey {
+    storage: String,
+    credential_location: String,
+}
+
+#[cfg(any(
+    feature = "opendal-s3",
+    feature = "opendal-azdls",
+    feature = "opendal-gcs"
+))]
+enum DeleteCredentialScope {
+    Static,
+    PerPath,
+    Prefix(String),
 }
 
 struct OperatorCacheEntry {
     key: OperatorCacheKey,
     operator: Arc<OnceCell<Operator>>,
+    /// Value of [`OperatorCache::clock`] at the latest lookup of this entry.
+    last_used: AtomicU64,
 }
 
-#[derive(Default)]
+impl OperatorCacheEntry {
+    fn mark_used(&self, timestamp: u64) {
+        // Concurrent readers can finish out of order; an older lookup must
+        // not overwrite a newer access and make this entry appear stale.
+        self.last_used.fetch_max(timestamp, Ordering::Relaxed);
+    }
+}
+
+/// A least-recently-used cache of operators.
 struct OperatorCache {
     // OpenDAL config types intentionally do not implement `Hash`. The number of
     // distinct bucket/config pairs owned by one catalog factory is expected to
     // be small, so a vector keeps equality exact without hashing credentials.
     entries: RwLock<Vec<OperatorCacheEntry>>,
+    capacity: usize,
+    clock: AtomicU64,
+}
+
+impl Default for OperatorCache {
+    fn default() -> Self {
+        Self::with_capacity(OPERATOR_CACHE_CAPACITY)
+    }
 }
 
 impl std::fmt::Debug for OperatorCache {
@@ -235,6 +353,25 @@ impl std::fmt::Debug for OperatorCache {
 }
 
 impl OperatorCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: RwLock::default(),
+            capacity: capacity.max(1),
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns the operator cell of the entry for `key`, marking it as used.
+    fn lookup(
+        &self,
+        entries: &[OperatorCacheEntry],
+        key: &OperatorCacheKey,
+    ) -> Option<Arc<OnceCell<Operator>>> {
+        let entry = entries.iter().find(|entry| entry.key == *key)?;
+        entry.mark_used(self.clock.fetch_add(1, Ordering::Relaxed));
+        Some(entry.operator.clone())
+    }
+
     fn get_or_create(
         &self,
         key: OperatorCacheKey,
@@ -247,10 +384,7 @@ impl OperatorCache {
                     format!("Operator cache lock poisoned: {error}"),
                 )
             })?;
-            entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .map(|entry| entry.operator.clone())
+            self.lookup(&entries, &key)
         };
 
         let operator = match operator {
@@ -262,13 +396,25 @@ impl OperatorCache {
                         format!("Operator cache lock poisoned: {error}"),
                     )
                 })?;
-                if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
-                    entry.operator.clone()
+                if let Some(operator) = self.lookup(&entries, &key) {
+                    operator
                 } else {
+                    if entries.len() >= self.capacity
+                        && let Some(lru) = entries
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+                            .map(|(index, _)| index)
+                    {
+                        // Operators handed out earlier stay valid; only the cache
+                        // forgets them.
+                        entries.swap_remove(lru);
+                    }
                     let operator = Arc::new(OnceCell::new());
                     entries.push(OperatorCacheEntry {
                         key,
                         operator: operator.clone(),
+                        last_used: AtomicU64::new(self.clock.fetch_add(1, Ordering::Relaxed)),
                     });
                     operator
                 }
@@ -292,9 +438,9 @@ fn default_operator_cache() -> SharedOperatorCache {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConfiguredOpenDalStorage {
-    storage: OpenDalStorage,
+    storage: RuntimeStorage,
     options: OpenDalStorageOptions,
-    /// Shared factory-owned cache for fully configured S3 and GCS operators.
+    /// Shared factory-owned cache for fully configured S3, GCS and ADLS operators.
     #[serde(skip, default = "default_operator_cache")]
     operator_cache: SharedOperatorCache,
 }
@@ -305,6 +451,10 @@ impl ConfiguredOpenDalStorage {
         config: &StorageConfig,
         operator_cache: SharedOperatorCache,
     ) -> Result<Self> {
+        let mut storage = RuntimeStorage::new(storage);
+        storage.keep_service_error_detail = config
+            .get(IO_CREDENTIALED_ERROR_SERVICE_DETAIL)
+            .is_some_and(|value| utils::is_truthy(value));
         Ok(Self {
             storage,
             options: OpenDalStorageOptions::try_from(config)?,
@@ -338,11 +488,7 @@ enum OpenDalStorageBackend {
     Fs,
     /// S3 storage factory.
     #[cfg(feature = "opendal-s3")]
-    S3 {
-        /// Custom AWS credential loader.
-        #[serde(skip)]
-        customized_credential_load: Option<CustomAwsCredentialLoader>,
-    },
+    S3,
     /// GCS storage factory.
     #[cfg(feature = "opendal-gcs")]
     Gcs,
@@ -383,17 +529,7 @@ impl OpenDalStorageFactory {
     /// Create an S3 storage factory using the default credential chain.
     #[cfg(feature = "opendal-s3")]
     pub fn s3() -> Self {
-        Self::new(OpenDalStorageBackend::S3 {
-            customized_credential_load: None,
-        })
-    }
-
-    /// Create an S3 storage factory using a custom credential loader.
-    #[cfg(feature = "opendal-s3")]
-    pub fn s3_with_credential_loader(loader: CustomAwsCredentialLoader) -> Self {
-        Self::new(OpenDalStorageBackend::S3 {
-            customized_credential_load: Some(loader),
-        })
+        Self::new(OpenDalStorageBackend::S3)
     }
 
     /// Create a GCS storage factory.
@@ -434,11 +570,8 @@ impl OpenDalStorageFactory {
             #[cfg(feature = "opendal-fs")]
             OpenDalStorageBackend::Fs => OpenDalStorage::LocalFs,
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorageBackend::S3 {
-                customized_credential_load,
-            } => OpenDalStorage::S3 {
+            OpenDalStorageBackend::S3 => OpenDalStorage::S3 {
                 config: s3_config_parse(config.props().clone())?.into(),
-                customized_credential_load: customized_credential_load.clone(),
             },
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageBackend::Gcs => OpenDalStorage::Gcs {
@@ -486,6 +619,16 @@ impl StorageFactory for OpenDalStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(self.build_configured(config)?))
     }
+
+    fn build_with_credentials(
+        &self,
+        config: &StorageConfig,
+        credential_provider: Arc<dyn iceberg::io::StorageCredentialProvider>,
+    ) -> Result<Arc<dyn Storage>> {
+        let mut storage = self.build_configured(config)?;
+        storage.storage.provider = Some(CredentialProvider(credential_provider));
+        Ok(Arc::new(storage))
+    }
 }
 
 /// Default memory operator for serde deserialization.
@@ -494,7 +637,7 @@ fn default_memory_operator() -> Operator {
     memory_config_build().expect("Failed to create default memory operator")
 }
 
-/// OpenDAL-based storage implementation.
+/// OpenDAL backend configuration. Create storage through a storage factory.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorage {
     /// Memory storage variant.
@@ -511,9 +654,6 @@ pub enum OpenDalStorage {
     S3 {
         /// S3 configuration.
         config: Arc<S3Config>,
-        /// Custom AWS credential loader.
-        #[serde(skip)]
-        customized_credential_load: Option<CustomAwsCredentialLoader>,
     },
     /// GCS storage variant.
     #[cfg(feature = "opendal-gcs")]
@@ -556,32 +696,89 @@ pub enum OpenDalStorage {
     },
 }
 
-impl OpenDalStorage {
+/// Request-time policy keeps backend configuration separate from authentication.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RuntimeStorage {
+    backend: OpenDalStorage,
+    provider: Option<CredentialProvider>,
+    #[serde(default)]
+    keep_service_error_detail: bool,
+}
+
+impl RuntimeStorage {
+    fn new(backend: OpenDalStorage) -> Self {
+        Self {
+            backend,
+            provider: None,
+            keep_service_error_detail: false,
+        }
+    }
+
+    fn provider_for(&self, path: &str) -> Option<&CredentialProvider> {
+        self.provider
+            .as_ref()
+            .filter(|provider| provider.0.supports_path(path))
+    }
+
+    fn redaction(&self) -> ErrorRedaction {
+        ErrorRedaction::new(self.provider.is_some(), self.keep_service_error_detail)
+    }
+
+    fn io_error(&self, error: opendal::Error) -> Error {
+        utils::credential_io_error(error, self.redaction())
+    }
+
+    async fn io<T>(&self, future: impl Future<Output = opendal::Result<T>>) -> Result<T> {
+        utils::credential_io(future, self.redaction()).await
+    }
+
     #[allow(unreachable_patterns)]
     fn operator_cache_key(
         &self,
         path: &str,
         options: &OpenDalStorageOptions,
     ) -> Result<Option<OperatorCacheKey>> {
-        let backend_config = match self {
+        let backend_config = match &self.backend {
             #[cfg(feature = "opendal-s3")]
             OpenDalStorage::S3 { config, .. } => OperatorBackendConfig::S3(config.clone()),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorage::Gcs { config } => OperatorBackendConfig::Gcs(config.clone()),
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorage::Azdls { config } => OperatorBackendConfig::Azdls(config.clone()),
             _ => return Ok(None),
         };
 
         let url = url::Url::parse(path)?;
-        let bucket = url.host_str().ok_or_else(|| {
+        let host = url.host_str().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 format!("Invalid object storage url: {path}, missing bucket"),
             )
         })?;
+        let bucket = match &backend_config {
+            #[cfg(feature = "opendal-azdls")]
+            OperatorBackendConfig::Azdls(_) => {
+                // `azdls_config_build` selects the filesystem from the path and,
+                // unless an endpoint is configured, derives the endpoint from the
+                // path's scheme and account host. All of them scope the operator.
+                let filesystem = url.username();
+                if filesystem.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid object storage url: {path}, missing filesystem"),
+                    ));
+                }
+                format!("{}://{filesystem}@{host}", url.scheme())
+            }
+            _ => host.to_string(),
+        };
         Ok(Some(OperatorCacheKey {
             backend_config,
-            bucket: bucket.to_string(),
+            bucket,
             layer_options: options.into(),
+            credentials: self
+                .provider_for(path)
+                .map(|provider| (provider.clone(), path.to_string())),
         }))
     }
 
@@ -627,7 +824,33 @@ impl OpenDalStorage {
         path: &'a str,
         options: &OpenDalStorageOptions,
     ) -> Result<(Operator, &'a str)> {
-        let (operator, relative_path): (Operator, &str) = match self {
+        let provider = self.provider_for(path);
+        let (operator, relative_path): (Operator, &str) = match &self.backend {
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorage::S3 { config } => {
+                let operator = s3_config_build(config, path, provider)?;
+                (operator, self.relativize_path(path)?)
+            }
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config, provider)?,
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorage::Gcs { config } => {
+                let operator = gcs_config_build(config, path, provider)?;
+                (operator, self.relativize_path(path)?)
+            }
+            #[cfg(any(
+                feature = "opendal-memory",
+                feature = "opendal-fs",
+                feature = "opendal-oss",
+                feature = "opendal-azblob",
+                feature = "opendal-hf",
+            ))]
+            _ if provider.is_some() => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "Runtime credentials are unsupported for this storage backend",
+                ));
+            }
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
@@ -645,45 +868,6 @@ impl OpenDalStorage {
                     (op, &path[1..])
                 }
             }
-            #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 {
-                config,
-                customized_credential_load,
-            } => {
-                let op = s3_config_build(config, customized_credential_load, path)?;
-                let op_info = op.info();
-
-                // Use the URL scheme in the path for prefix matching. This enables
-                // use of S3-compatible storage backends using custom schemes (e.g., `minio://`, `r2://`).
-                let url = url::Url::parse(path).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid s3 url: {path}: {e}"),
-                    )
-                })?;
-                let prefix = format!("{}://{}/", url.scheme(), op_info.name());
-                if path.starts_with(&prefix) {
-                    (op, &path[prefix.len()..])
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid s3 url: {path}, should start with {prefix}"),
-                    ));
-                }
-            }
-            #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { config } => {
-                let operator = gcs_config_build(config, path)?;
-                let prefix = format!("gs://{}/", operator.info().name());
-                if path.starts_with(&prefix) {
-                    (operator, &path[prefix.len()..])
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid gcs url: {path}, should start with {prefix}"),
-                    ));
-                }
-            }
             #[cfg(feature = "opendal-oss")]
             OpenDalStorage::Oss { config } => {
                 let op = oss_config_build(config, path)?;
@@ -697,8 +881,6 @@ impl OpenDalStorage {
                     ));
                 }
             }
-            #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config)?,
             #[cfg(feature = "opendal-azblob")]
             OpenDalStorage::Azblob { config } => {
                 let operator = azblob_config_build(config, path)?;
@@ -714,15 +896,16 @@ impl OpenDalStorage {
             }
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { config } => hf_config_build(config, path)?,
-            #[cfg(all(
-                not(feature = "opendal-s3"),
-                not(feature = "opendal-fs"),
-                not(feature = "opendal-gcs"),
-                not(feature = "opendal-oss"),
-                not(feature = "opendal-azdls"),
-                not(feature = "opendal-azblob"),
-                not(feature = "opendal-hf"),
-            ))]
+            #[cfg(not(any(
+                feature = "opendal-memory",
+                feature = "opendal-fs",
+                feature = "opendal-s3",
+                feature = "opendal-gcs",
+                feature = "opendal-oss",
+                feature = "opendal-azdls",
+                feature = "opendal-azblob",
+                feature = "opendal-hf",
+            )))]
             _ => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
@@ -763,13 +946,20 @@ impl OpenDalStorage {
             retry = retry.with_max_delay(Duration::from_millis(max_delay_ms));
         }
         let operator = operator.layer(retry);
+
+        #[cfg(feature = "prometheus")]
+        let operator = match PROMETHEUS_LAYER.get() {
+            Some(layer) => operator.layer(layer.clone()),
+            None => operator,
+        };
+
         Ok((operator, relative_path))
     }
 
     fn uses_append_mode(&self) -> bool {
         #[cfg(feature = "opendal-azdls")]
         {
-            matches!(self, OpenDalStorage::Azdls { .. })
+            matches!(&self.backend, OpenDalStorage::Azdls { .. })
         }
         #[cfg(not(feature = "opendal-azdls"))]
         {
@@ -782,7 +972,7 @@ impl OpenDalStorage {
     /// For most backends the URL host (bucket name) is sufficient. For HF the host
     /// encodes the repo type, not the repo identity, so a more specific key is used.
     fn batch_key_for_path(&self, path: &str) -> String {
-        match self {
+        match &self.backend {
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { .. } => hf_batch_key(path),
             _ => url::Url::parse(path)
@@ -798,7 +988,7 @@ impl OpenDalStorage {
     /// only the relative path is needed, such as for grouped bulk deletes.
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn relativize_path<'a>(&self, path: &'a str) -> Result<&'a str> {
-        match self {
+        match &self.backend {
             #[cfg(feature = "opendal-memory")]
             OpenDalStorage::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-fs")]
@@ -831,7 +1021,10 @@ impl OpenDalStorage {
                         format!("Invalid gcs url: {path}, missing bucket"),
                     )
                 })?;
-                let prefix = format!("gs://{}/", bucket);
+                if !matches!(url.scheme(), "gs" | "gcs") {
+                    return Err(Error::new(ErrorKind::DataInvalid, "Invalid GCS URL scheme"));
+                }
+                let prefix = format!("{}://{}/", url.scheme(), bucket);
                 if path.starts_with(&prefix) {
                     Ok(&path[prefix.len()..])
                 } else {
@@ -883,8 +1076,7 @@ impl OpenDalStorage {
             OpenDalStorage::Azdls { config } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
                 match_path_with_config(&azure_path, config)?;
-                let relative_path_len = azure_path.path.len();
-                Ok(&path[path.len() - relative_path_len..])
+                Ok(azure_path.relative_path(path))
             }
             #[cfg(feature = "opendal-hf")]
             OpenDalStorage::Hf { .. } => {
@@ -893,19 +1085,22 @@ impl OpenDalStorage {
                 })?;
                 Ok(&path[path.len() - parsed.path.len()..])
             }
-            #[cfg(all(
-                not(feature = "opendal-s3"),
-                not(feature = "opendal-fs"),
-                not(feature = "opendal-gcs"),
-                not(feature = "opendal-oss"),
-                not(feature = "opendal-azdls"),
-                not(feature = "opendal-azblob"),
-                not(feature = "opendal-hf"),
-            ))]
-            _ => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "No storage service has been enabled",
-            )),
+            #[cfg(not(any(
+                feature = "opendal-memory",
+                feature = "opendal-fs",
+                feature = "opendal-s3",
+                feature = "opendal-gcs",
+                feature = "opendal-oss",
+                feature = "opendal-azdls",
+                feature = "opendal-azblob",
+                feature = "opendal-hf",
+            )))]
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    "No storage service has been enabled",
+                ));
+            }
         }
     }
 
@@ -917,10 +1112,7 @@ impl OpenDalStorage {
     ) -> Result<bool> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        operator
-            .exists(relative_path)
-            .await
-            .map_err(from_opendal_error)
+        self.io(operator.exists(relative_path)).await
     }
 
     async fn metadata_with_options(
@@ -931,10 +1123,7 @@ impl OpenDalStorage {
     ) -> Result<FileMetadata> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        let metadata = operator
-            .stat(relative_path)
-            .await
-            .map_err(from_opendal_error)?;
+        let metadata = self.io(operator.stat(relative_path)).await?;
         Ok(FileMetadata {
             size: metadata.content_length(),
         })
@@ -948,11 +1137,7 @@ impl OpenDalStorage {
     ) -> Result<Bytes> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        Ok(operator
-            .read(relative_path)
-            .await
-            .map_err(from_opendal_error)?
-            .to_bytes())
+        Ok(self.io(operator.read(relative_path)).await?.to_bytes())
     }
 
     async fn reader_with_options(
@@ -964,10 +1149,8 @@ impl OpenDalStorage {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
         Ok(Box::new(OpenDalReader(
-            operator
-                .reader(relative_path)
-                .await
-                .map_err(from_opendal_error)?,
+            self.io(operator.reader(relative_path)).await?,
+            self.redaction(),
         )))
     }
 
@@ -1001,7 +1184,8 @@ impl OpenDalStorage {
             writer = writer.chunk(chunk_size);
         }
         Ok(Box::new(OpenDalWriter(
-            writer.await.map_err(from_opendal_error)?,
+            self.io(async { writer.await }).await?,
+            self.redaction(),
         )))
     }
 
@@ -1013,10 +1197,7 @@ impl OpenDalStorage {
     ) -> Result<()> {
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        operator
-            .delete(relative_path)
-            .await
-            .map_err(from_opendal_error)
+        self.io(operator.delete(relative_path)).await
     }
 
     async fn delete_prefix_with_options(
@@ -1025,18 +1206,53 @@ impl OpenDalStorage {
         options: &OpenDalStorageOptions,
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
+        let path = directory_path(path);
+        if self.provider.is_some() {
+            // A parent-directory signer cannot authorize every nested scope.
+            // List with the parent's grant, then re-select each deletion path.
+            let mut entries = self
+                .list_with_options(&path, true, options, operator_cache)
+                .await?;
+            let mut files = Vec::new();
+            let mut directories = Vec::new();
+            while let Some(entry) = entries.try_next().await? {
+                if entry.is_dir {
+                    directories.push(entry.path);
+                } else {
+                    files.push(entry.path);
+                }
+                // Bound queued file paths while retaining S3's bulk deletion.
+                if files.len() == 1000 {
+                    self.delete_stream_with_options(
+                        futures::stream::iter(std::mem::take(&mut files)).boxed(),
+                        options,
+                        operator_cache,
+                    )
+                    .await?;
+                }
+            }
+            if !files.is_empty() {
+                self.delete_stream_with_options(
+                    futures::stream::iter(files).boxed(),
+                    options,
+                    operator_cache,
+                )
+                .await?;
+            }
+            // ADLS lists real directories, including the requested directory.
+            // Delete children before parents, without server-side recursion
+            // that would again bypass per-path credential selection.
+            directories.sort_unstable_by_key(|path| std::cmp::Reverse(path.len()));
+            for directory in directories {
+                self.delete_with_options(&directory, options, operator_cache)
+                    .await?;
+            }
+            return Ok(());
+        }
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
-        let path = if relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-        operator
-            .delete_with(&path)
-            .recursive(true)
+        self.io(async { operator.delete_with(relative_path).recursive(true).await })
             .await
-            .map_err(from_opendal_error)
     }
 
     async fn delete_stream_with_options(
@@ -1045,6 +1261,25 @@ impl OpenDalStorage {
         options: &OpenDalStorageOptions,
         operator_cache: Option<&OperatorCache>,
     ) -> Result<()> {
+        if self.provider.is_some() {
+            #[cfg(any(
+                feature = "opendal-s3",
+                feature = "opendal-azdls",
+                feature = "opendal-gcs"
+            ))]
+            return self
+                .delete_credentialed_stream(paths, options, operator_cache)
+                .await;
+            #[cfg(not(any(
+                feature = "opendal-s3",
+                feature = "opendal-azdls",
+                feature = "opendal-gcs"
+            )))]
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Runtime credentials are unsupported for this storage backend",
+            ));
+        }
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
         while let Some(path) = paths.next().await {
@@ -1057,18 +1292,190 @@ impl OpenDalStorage {
                     let (operator, relative_path) =
                         self.create_operator_with_options(&path, options, operator_cache)?;
                     let relative_path = relative_path.to_string();
-                    let deleter = operator.deleter().await.map_err(from_opendal_error)?;
+                    let deleter = operator.deleter().await.map_err(|e| self.io_error(e))?;
                     (relative_path, entry.insert(deleter))
                 }
             };
             deleter
                 .delete(relative_path)
                 .await
-                .map_err(from_opendal_error)?;
+                .map_err(|e| self.io_error(e))?;
         }
 
         for (_, mut deleter) in deleters {
-            deleter.close().await.map_err(from_opendal_error)?;
+            deleter.close().await.map_err(|e| self.io_error(e))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "opendal-s3",
+        feature = "opendal-azdls",
+        feature = "opendal-gcs"
+    ))]
+    async fn delete_credentialed_stream(
+        &self,
+        mut paths: BoxStream<'static, String>,
+        options: &OpenDalStorageOptions,
+        operator_cache: Option<&OperatorCache>,
+    ) -> Result<()> {
+        let provider = self.provider.as_ref().expect("credentialed deletion");
+        let Some(first) = paths.next().await else {
+            return Ok(());
+        };
+        // Construction binds only the first path and performs no credential
+        // load or HTTP request. Inspect the service capability before attaching
+        // any batch signer; single-file requests must not validate whole batches.
+        let batch_size = {
+            let (operator, _) = self.create_operator_with_options(&first, options, None)?;
+            credentialed_delete_batch_size(operator.info().capability())
+        };
+        let paths = futures::stream::iter([first]).chain(paths).boxed();
+        let storage = Self {
+            backend: self.backend.clone(),
+            provider: None,
+            keep_service_error_detail: self.keep_service_error_detail,
+        };
+        if batch_size <= 1 {
+            let mut chunks = paths.chunks(CREDENTIALED_DELETE_CONCURRENCY);
+            while let Some(paths) = chunks.next().await {
+                let (delegated, static_paths): (Vec<_>, Vec<_>) = paths
+                    .into_iter()
+                    .partition(|path| provider.0.supports_path(path));
+                if !static_paths.is_empty() {
+                    Box::pin(storage.delete_stream_with_options(
+                        futures::stream::iter(static_paths).boxed(),
+                        options,
+                        operator_cache,
+                    ))
+                    .await?;
+                }
+                futures::stream::iter(delegated.into_iter().map(Ok))
+                    .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
+                        // Do not retain one-use, per-file deletion signers.
+                        self.delete_with_options(&path, options, None).await
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
+        let mut chunks = paths.chunks(batch_size);
+        while let Some(paths) = chunks.next().await {
+            let matched: Vec<_> = futures::stream::iter(paths)
+                .map(|path| {
+                    let storage = &storage;
+                    async move {
+                        storage.relativize_path(&path)?;
+                        if !provider.0.supports_path(&path) {
+                            return Ok((
+                                storage.batch_key_for_path(&path),
+                                DeleteCredentialScope::Static,
+                                path,
+                            ));
+                        }
+                        let credential = provider
+                            .0
+                            .load_credential(&path)
+                            .await
+                            .map_err(utils::credential_discovery_error)?;
+                        if !credential.covers(&path) {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                "Storage credential does not cover deletion path",
+                            ));
+                        }
+                        let bucket = storage
+                            .operator_cache_key(&path, options)?
+                            .map(|key| key.bucket)
+                            .unwrap_or_else(|| storage.batch_key_for_path(&path));
+                        let scope = credential
+                            .prefix()
+                            .map_or(DeleteCredentialScope::PerPath, |prefix| {
+                                DeleteCredentialScope::Prefix(prefix.to_string())
+                            });
+                        Ok((bucket, scope, path))
+                    }
+                })
+                .buffer_unordered(CREDENTIALED_DELETE_CONCURRENCY)
+                .try_collect()
+                .await?;
+            let mut groups: HashMap<DeleteBatchKey, Vec<String>> = HashMap::new();
+            let mut unscoped = Vec::new();
+            let mut static_paths = Vec::new();
+            for (bucket, scope, path) in matched {
+                match scope {
+                    DeleteCredentialScope::Prefix(prefix) => groups
+                        .entry(DeleteBatchKey {
+                            storage: bucket,
+                            credential_location: prefix,
+                        })
+                        .or_default()
+                        .push(path),
+                    DeleteCredentialScope::PerPath => unscoped.push(path),
+                    DeleteCredentialScope::Static => static_paths.push(path),
+                }
+            }
+            if !static_paths.is_empty() {
+                // An opt-out must retain ordinary backend batching, not just
+                // ordinary authentication.
+                Box::pin(storage.delete_stream_with_options(
+                    futures::stream::iter(static_paths).boxed(),
+                    options,
+                    operator_cache,
+                ))
+                .await?;
+            }
+            futures::stream::iter(unscoped.into_iter().map(Ok))
+                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |path| async move {
+                    self.delete_with_options(&path, options, operator_cache)
+                        .await
+                })
+                .await?;
+            futures::stream::iter(groups.into_iter().map(Ok))
+                .try_for_each_concurrent(CREDENTIALED_DELETE_CONCURRENCY, |(key, paths)| {
+                    let storage = &storage;
+                    async move {
+                        // Capabilities belong to the actual operator, which can
+                        // differ between storage locations. Recheck each group.
+                        let batch_size = {
+                            let (operator, _) =
+                                self.create_operator_with_options(&paths[0], options, None)?;
+                            credentialed_delete_batch_size(operator.info().capability())
+                        };
+                        if batch_size <= 1 {
+                            return futures::stream::iter(paths.into_iter().map(Ok))
+                                .try_for_each_concurrent(
+                                    CREDENTIALED_DELETE_CONCURRENCY,
+                                    |path| async move {
+                                        self.delete_with_options(&path, options, None).await
+                                    },
+                                )
+                                .await;
+                        }
+                        for paths in paths.chunks(batch_size) {
+                            let batch_storage = Self {
+                                backend: storage.backend.clone(),
+                                provider: Some(credentials::BatchCredential::provider(
+                                    provider.clone(),
+                                    key.credential_location.clone(),
+                                    paths.to_vec(),
+                                )),
+                                keep_service_error_detail: storage.keep_service_error_detail,
+                            };
+                            // Do not cache a signer carrying this request's file list.
+                            let (operator, _) = batch_storage
+                                .create_operator_with_options(&paths[0], options, None)?;
+                            let mut deleter = self.io(operator.deleter()).await?;
+                            for path in paths {
+                                self.io(deleter.delete(storage.relativize_path(path)?.to_string()))
+                                    .await?;
+                            }
+                            self.io(deleter.close()).await?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await?;
         }
         Ok(())
     }
@@ -1080,25 +1487,29 @@ impl OpenDalStorage {
         options: &OpenDalStorageOptions,
         operator_cache: Option<&OperatorCache>,
     ) -> Result<BoxStream<'static, Result<ListEntry>>> {
-        let path: Arc<str> = Arc::from(path);
+        let path = directory_path(path);
         let (operator, relative_path) =
             self.create_operator_with_options(&path, options, operator_cache)?;
         let absolute_prefix: Arc<str> =
             Arc::from(&path[..path.len().saturating_sub(relative_path.len())]);
-        let list_path = if relative_path.is_empty() || relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-        let lister = operator
-            .lister_with(&list_path)
-            .recursive(recursive)
-            .await
-            .map_err(from_opendal_error)?;
+        let lister = self
+            .io(async {
+                operator
+                    .lister_with(relative_path)
+                    .recursive(recursive)
+                    .await
+            })
+            .await?;
+        let redaction = self.redaction();
 
-        Ok(lister
+        Ok(
+            futures::stream::try_unfold(lister, move |mut lister| async move {
+                utils::credential_io(lister.try_next(), redaction)
+                    .await
+                    .map(|entry| entry.map(|entry| (entry, lister)))
+            })
             .map(move |entry| {
-                entry.map_err(from_opendal_error).map(|entry| {
+                entry.map(|entry| {
                     let metadata = entry.metadata();
                     let last_modified_ms = metadata
                         .last_modified()
@@ -1115,75 +1526,8 @@ impl OpenDalStorage {
                     }
                 })
             })
-            .boxed())
-    }
-}
-
-#[typetag::serde(name = "OpenDalStorage")]
-#[async_trait]
-impl Storage for OpenDalStorage {
-    async fn exists(&self, path: &str) -> Result<bool> {
-        self.exists_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.metadata_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        self.read_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.reader_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.write_with_options(path, bs, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.writer_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        self.delete_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn delete_prefix(&self, path: &str) -> Result<()> {
-        self.delete_prefix_with_options(path, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
-        self.delete_stream_with_options(paths, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    async fn list(
-        &self,
-        path: &str,
-        recursive: bool,
-    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
-        self.list_with_options(path, recursive, &OpenDalStorageOptions::default(), None)
-            .await
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_output(&self, path: &str) -> Result<OutputFile> {
-        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+            .boxed(),
+        )
     }
 }
 
@@ -1268,33 +1612,30 @@ impl Storage for ConfiguredOpenDalStorage {
 // Reader/Writer since neither trait nor type is defined in this crate.
 
 /// Wrapper around `opendal::Reader` that implements `FileRead`.
-pub(crate) struct OpenDalReader(pub(crate) opendal::Reader);
+pub(crate) struct OpenDalReader(pub(crate) opendal::Reader, ErrorRedaction);
 
 #[async_trait]
 impl FileRead for OpenDalReader {
     async fn read(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Ok(opendal::Reader::read(&self.0, range)
-            .await
-            .map_err(from_opendal_error)?
-            .to_bytes())
+        Ok(
+            utils::credential_io(opendal::Reader::read(&self.0, range), self.1)
+                .await?
+                .to_bytes(),
+        )
     }
 }
 
 /// Wrapper around `opendal::Writer` that implements `FileWrite`.
-pub(crate) struct OpenDalWriter(pub(crate) opendal::Writer);
+pub(crate) struct OpenDalWriter(pub(crate) opendal::Writer, ErrorRedaction);
 
 #[async_trait]
 impl FileWrite for OpenDalWriter {
     async fn write(&mut self, bs: Bytes) -> Result<()> {
-        Ok(opendal::Writer::write(&mut self.0, bs)
-            .await
-            .map_err(from_opendal_error)?)
+        utils::credential_io(opendal::Writer::write(&mut self.0, bs), self.1).await
     }
 
     async fn close(&mut self) -> Result<()> {
-        let _ = opendal::Writer::close(&mut self.0)
-            .await
-            .map_err(from_opendal_error)?;
+        let _ = utils::credential_io(opendal::Writer::close(&mut self.0), self.1).await?;
         Ok(())
     }
 }
@@ -1309,7 +1650,7 @@ mod tests {
     #[cfg(feature = "opendal-s3")]
     use iceberg::io::{
         CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
-        S3_SECRET_ACCESS_KEY,
+        S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
     };
 
     use super::*;
@@ -1322,15 +1663,297 @@ mod tests {
             backend_config: OperatorBackendConfig::S3(Arc::new(config)),
             bucket: bucket.to_string(),
             layer_options: OperatorLayerOptions::from(&OpenDalStorageOptions::default()),
+            credentials: None,
         }
     }
 
-    #[cfg(feature = "opendal-s3")]
+    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
     fn create_cached_operator(storage: &ConfiguredOpenDalStorage, path: &str) {
         storage
             .storage
             .create_operator_with_options(&path, &storage.options, Some(&storage.operator_cache))
             .unwrap();
+    }
+
+    #[cfg(any(feature = "opendal-s3", feature = "opendal-azdls"))]
+    mod directory_credentials {
+        use futures::TryStreamExt;
+        use iceberg::io::{FileIOBuilder, StorageCredential};
+        use mockito::{Matcher, Server};
+
+        use super::*;
+
+        async fn assert_directory_credential_binding(
+            factory: OpenDalStorageFactory,
+            props: HashMap<String, String>,
+            credential_kind: iceberg::io::StorageCredentialKind,
+            file: &str,
+        ) {
+            let directory = format!("{file}/");
+            let granted_directory = directory.clone();
+            let credential = StorageCredential::new(credential_kind)
+                .with_expiration(SystemTime::now() + Duration::from_secs(30));
+            let provider = Arc::new(credentials::test_provider(move |location, _| {
+                // A directory grant must not cover the file of the same name.
+                if location != granted_directory {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "No matching directory credential",
+                    ));
+                }
+                Ok(credential.clone())
+            }));
+            let io = FileIOBuilder::new(Arc::new(factory))
+                .with_props(props)
+                .with_prop(IO_MAX_RETRIES, "0")
+                .with_credential_provider(provider)
+                .build();
+
+            // Cache the rejected file operator first. A subsequent directory
+            // operation without a slash must not reuse this path-bound signer.
+            assert!(io.new_input(file).unwrap().read().await.is_err());
+
+            for path in [file, directory.as_str()] {
+                let _: Vec<_> = io
+                    .list(path, false)
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                io.delete_prefix(path).await.unwrap();
+            }
+
+            // A successful directory operation must not authorize the file.
+            assert!(io.new_input(file).unwrap().read().await.is_err());
+        }
+
+        #[cfg(feature = "opendal-s3")]
+        #[tokio::test]
+        async fn s3_directory_operations_bind_normalized_uri_before_cache_lookup() {
+            let mut server = Server::new_async().await;
+            let list = server
+                .mock("GET", "/bucket")
+                .match_query(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("list-type".to_string(), "2".to_string()),
+                    Matcher::UrlEncoded("prefix".to_string(), "table/".to_string()),
+                ]))
+                .match_header(
+                    "authorization",
+                    Matcher::Regex("Credential=DIRECTORY/".to_string()),
+                )
+                .with_body("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
+                // S3 implements recursive deletion by listing the prefix.
+                .expect(4)
+                .create_async()
+                .await;
+            let file = server
+                .mock("GET", "/bucket/table")
+                .with_body("must not be read")
+                .expect(0)
+                .create_async()
+                .await;
+
+            assert_directory_credential_binding(
+                OpenDalStorageFactory::s3(),
+                HashMap::from([
+                    (S3_ENDPOINT.to_string(), server.url()),
+                    (S3_REGION.to_string(), "us-east-1".to_string()),
+                    (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
+                ]),
+                iceberg::io::StorageCredentialKind::S3(iceberg::io::S3Credential::new(
+                    "DIRECTORY",
+                    "dummy-secret",
+                    None,
+                )),
+                "s3://bucket/table",
+            )
+            .await;
+
+            list.assert_async().await;
+            file.assert_async().await;
+        }
+
+        #[cfg(feature = "opendal-azdls")]
+        #[tokio::test]
+        async fn adls_directory_operations_bind_normalized_uri_before_cache_lookup() {
+            use iceberg::io::ADLS_ENDPOINT;
+
+            let mut server = Server::new_async().await;
+            // The endpoint path satisfies ADLS's endpoint-suffix validation
+            // while keeping all requests on the local mock server.
+            let endpoint = format!("{}/core.windows.net", server.url());
+            let list = server
+                .mock("GET", "/core.windows.net/myfs")
+                .match_query(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("resource".to_string(), "filesystem".to_string()),
+                    Matcher::UrlEncoded("directory".to_string(), "table".to_string()),
+                    Matcher::UrlEncoded("sig".to_string(), "directory".to_string()),
+                ]))
+                .with_body(r#"{"paths":[]}"#)
+                .expect(4)
+                .create_async()
+                .await;
+            let delete = server
+                .mock("DELETE", "/core.windows.net/myfs/table")
+                .match_query(Matcher::UrlEncoded(
+                    "sig".to_string(),
+                    "directory".to_string(),
+                ))
+                .with_status(200)
+                .expect(2)
+                .create_async()
+                .await;
+            let file = server
+                .mock("GET", "/core.windows.net/myfs/table")
+                .match_query(Matcher::Any)
+                .with_body("must not be read")
+                .expect(0)
+                .create_async()
+                .await;
+
+            assert_directory_credential_binding(
+                OpenDalStorageFactory::azdls(),
+                HashMap::from([(ADLS_ENDPOINT.to_string(), endpoint)]),
+                iceberg::io::StorageCredentialKind::Azdls(iceberg::io::AzdlsCredential::new(
+                    "sig=directory",
+                )),
+                "abfs://myfs@myaccount.dfs.core.windows.net/table",
+            )
+            .await;
+
+            list.assert_async().await;
+            delete.assert_async().await;
+            file.assert_async().await;
+        }
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    fn test_azdls_storage(endpoint: Option<&str>) -> ConfiguredOpenDalStorage {
+        let storage = OpenDalStorage::Azdls {
+            config: Arc::new(AzdlsConfig {
+                account_name: Some("myaccount".to_string()),
+                account_key: Some("bXlhY2NvdW50a2V5".to_string()),
+                endpoint: endpoint.map(str::to_string),
+                ..Default::default()
+            }),
+        };
+        ConfiguredOpenDalStorage::new(storage, &StorageConfig::new(), default_operator_cache())
+            .unwrap()
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_operator_cache_reuses_operator_per_filesystem() {
+        let storage = test_azdls_storage(None);
+
+        create_cached_operator(
+            &storage,
+            "abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet",
+        );
+        create_cached_operator(
+            &storage,
+            "abfss://myfs@myaccount.dfs.core.windows.net/other/two.parquet",
+        );
+        assert_eq!(storage.operator_cache.len(), 1);
+
+        create_cached_operator(
+            &storage,
+            "abfss://otherfs@myaccount.dfs.core.windows.net/path/to/one.parquet",
+        );
+        assert_eq!(storage.operator_cache.len(), 2);
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn credentialed_operators_are_isolated_and_cache_is_bounded() {
+        let provider = || {
+            CredentialProvider(Arc::new(credentials::test_provider(|_, _| {
+                panic!("operator construction must not fetch credentials");
+            })))
+        };
+        let mut first = test_azdls_storage(None);
+        first.storage.provider = Some(provider());
+        let path = "abfss://myfs@myaccount.dfs.core.windows.net/data/0";
+        create_cached_operator(&first, path);
+        create_cached_operator(&first, path);
+        assert_eq!(first.operator_cache.len(), 1);
+        let mut second = test_azdls_storage(None);
+        second.operator_cache = first.operator_cache.clone();
+        second.storage.provider = Some(provider());
+        create_cached_operator(&second, path);
+        assert_eq!(first.operator_cache.len(), 2);
+        for index in 1..80 {
+            create_cached_operator(
+                &first,
+                &format!("abfss://myfs@myaccount.dfs.core.windows.net/data/{index}"),
+            );
+        }
+        assert_eq!(first.operator_cache.len(), 64);
+        // An evicted operator is rebuilt safely; serialization never drops auth.
+        create_cached_operator(&first, path);
+        assert_eq!(first.operator_cache.len(), 64);
+        assert!(serde_json::to_string(&first).is_err());
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_operator_cache_key_scopes_scheme_filesystem_and_host() {
+        let storage = test_azdls_storage(None);
+        let key = |path: &str| {
+            storage
+                .storage
+                .operator_cache_key(path, &storage.options)
+                .unwrap()
+                .expect("azdls operators are cached")
+        };
+
+        let base = key("abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet");
+        assert_eq!(base.bucket, "abfss://myfs@myaccount.dfs.core.windows.net");
+        assert!(base == key("abfss://myfs@myaccount.dfs.core.windows.net/other/two.parquet"));
+        assert!(base != key("abfs://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet"));
+        assert!(base != key("abfss://otherfs@myaccount.dfs.core.windows.net/path/to/one.parquet"));
+        assert!(base != key("abfss://myfs@otheraccount.dfs.core.windows.net/path/to/one.parquet"));
+
+        assert!(
+            storage
+                .storage
+                .operator_cache_key(
+                    "abfss://myaccount.dfs.core.windows.net/path/to/one.parquet",
+                    &storage.options
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_azdls_operator_cache_validates_path_before_lookup() {
+        let storage = test_azdls_storage(Some("https://myaccount.dfs.core.windows.net"));
+        create_cached_operator(
+            &storage,
+            "abfss://myfs@myaccount.dfs.core.windows.net/path/to/one.parquet",
+        );
+        assert_eq!(storage.operator_cache.len(), 1);
+
+        for invalid in [
+            // account name differs from the configured one
+            "abfss://myfs@otheraccount.dfs.core.windows.net/path/to/one.parquet",
+            // endpoint suffix differs from the configured endpoint
+            "abfss://myfs@myaccount.dfs.core.chinacloudapi.cn/path/to/one.parquet",
+        ] {
+            assert!(
+                storage
+                    .storage
+                    .create_operator_with_options(
+                        &invalid,
+                        &storage.options,
+                        Some(&storage.operator_cache)
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(storage.operator_cache.len(), 1);
     }
 
     #[cfg(feature = "opendal-s3")]
@@ -1354,7 +1977,7 @@ mod tests {
                             build_count.fetch_add(1, Ordering::SeqCst);
                             let mut config = S3Config::default();
                             config.region = Some("us-east-1".to_string());
-                            s3_config_build(&config, &None, "s3://test-bucket/path/to/file")
+                            s3_config_build(&config, "s3://test-bucket/path/to/file", None)
                         })
                         .unwrap();
                 });
@@ -1363,6 +1986,90 @@ mod tests {
 
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_evicts_least_recently_used() {
+        let cache = OperatorCache::with_capacity(2);
+        let build_count = AtomicUsize::new(0);
+        let get = |bucket: &str| {
+            cache
+                .get_or_create(test_s3_cache_key(bucket), || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    let mut config = S3Config::default();
+                    config.region = Some("us-east-1".to_string());
+                    s3_config_build(&config, &format!("s3://{bucket}/path/to/file"), None)
+                })
+                .unwrap()
+        };
+
+        get("a");
+        get("b");
+        get("a");
+        assert_eq!(build_count.load(Ordering::SeqCst), 2);
+
+        // `b` is the least recently used entry, so `c` replaces it.
+        get("c");
+        assert_eq!(cache.len(), 2);
+        get("a");
+        assert_eq!(build_count.load(Ordering::SeqCst), 3);
+        get("b");
+        assert_eq!(build_count.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_out_of_order_lookups_preserve_recent_entry() {
+        let cache = OperatorCache::with_capacity(2);
+        let build_count = AtomicUsize::new(0);
+        let get = |bucket: &str| {
+            cache
+                .get_or_create(test_s3_cache_key(bucket), || {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    let mut config = S3Config::default();
+                    config.region = Some("us-east-1".to_string());
+                    s3_config_build(&config, &format!("s3://{bucket}/path/to/file"), None)
+                })
+                .unwrap()
+        };
+
+        get("a");
+        get("b");
+        // Simulate a reader of `a` pausing after reserving its timestamp.
+        let delayed_timestamp = cache.clock.fetch_add(1, Ordering::Relaxed);
+        get("b");
+        get("a");
+        {
+            let entries = cache.entries.read().unwrap();
+            let a = entries
+                .iter()
+                .find(|entry| entry.key == test_s3_cache_key("a"))
+                .unwrap();
+            a.mark_used(delayed_timestamp);
+        }
+
+        // The delayed reader must not make `a` older than `b`.
+        get("c");
+        get("a");
+        assert_eq!(build_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_operator_cache_is_bounded_under_credential_refresh() {
+        let factory = OpenDalStorageFactory::s3();
+        for refresh in 0..OPERATOR_CACHE_CAPACITY + 16 {
+            let config = StorageConfig::new()
+                .with_prop(S3_REGION, "us-east-1")
+                .with_prop(S3_ACCESS_KEY_ID, "vended-access-key")
+                .with_prop(S3_SECRET_ACCESS_KEY, "vended-secret-key")
+                .with_prop(S3_SESSION_TOKEN, format!("vended-session-token-{refresh}"));
+            let storage = factory.build_configured(&config).unwrap();
+            create_cached_operator(&storage, "s3://test-bucket/path/to/file");
+        }
+        assert_eq!(factory.operator_cache.len(), OPERATOR_CACHE_CAPACITY);
     }
 
     #[cfg(feature = "opendal-s3")]
@@ -1383,7 +2090,7 @@ mod tests {
                 build_count.fetch_add(1, Ordering::SeqCst);
                 let mut config = S3Config::default();
                 config.region = Some("us-east-1".to_string());
-                s3_config_build(&config, &None, "s3://test-bucket/path/to/file")
+                s3_config_build(&config, "s3://test-bucket/path/to/file", None)
             })
             .unwrap();
 
@@ -1485,9 +2192,7 @@ mod tests {
         let serialized = serde_json::to_string(&factory).unwrap();
         let deserialized: OpenDalStorageFactory = serde_json::from_str(&serialized).unwrap();
 
-        // Keep the serialized representation compatible with the former
-        // public enum even though the factory now owns runtime state.
-        assert_eq!(serialized, r#"{"S3":{}}"#);
+        assert_eq!(serialized, r#""S3""#);
         assert_eq!(factory.operator_cache.len(), 1);
         assert_eq!(deserialized.operator_cache.len(), 0);
         assert!(!Arc::ptr_eq(
@@ -1531,18 +2236,44 @@ mod tests {
         assert_eq!(op.info().scheme().to_string(), "memory");
     }
 
+    #[cfg(all(feature = "opendal-memory", feature = "prometheus"))]
+    #[tokio::test]
+    async fn test_prometheus_metrics() {
+        let registry = prometheus::Registry::new();
+        install_prometheus_metrics(&registry).unwrap();
+
+        let storage = OpenDalStorageFactory::memory()
+            .build(&StorageConfig::new())
+            .unwrap();
+        storage
+            .write("memory:/metrics.txt", Bytes::from_static(b"metrics"))
+            .await
+            .unwrap();
+
+        assert!(
+            registry
+                .gather()
+                .iter()
+                .any(|family| family.name() == "opendal_operation_duration_seconds")
+        );
+    }
+
     #[cfg(feature = "opendal-memory")]
     #[test]
     fn test_relativize_path_memory() {
         let storage = OpenDalStorage::Memory(default_memory_operator());
 
         assert_eq!(
-            storage.relativize_path("memory:/path/to/file").unwrap(),
+            RuntimeStorage::new(storage.clone())
+                .relativize_path("memory:/path/to/file")
+                .unwrap(),
             "path/to/file"
         );
         // Without the scheme prefix, falls back to stripping the leading slash
         assert_eq!(
-            storage.relativize_path("/path/to/file").unwrap(),
+            RuntimeStorage::new(storage.clone())
+                .relativize_path("/path/to/file")
+                .unwrap(),
             "path/to/file"
         );
     }
@@ -1553,13 +2284,15 @@ mod tests {
         let storage = OpenDalStorage::LocalFs;
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("file:/tmp/data/file.parquet")
                 .unwrap(),
             "tmp/data/file.parquet"
         );
         assert_eq!(
-            storage.relativize_path("/tmp/data/file.parquet").unwrap(),
+            RuntimeStorage::new(storage.clone())
+                .relativize_path("/tmp/data/file.parquet")
+                .unwrap(),
             "tmp/data/file.parquet"
         );
     }
@@ -1569,7 +2302,6 @@ mod tests {
     fn test_relativize_path_s3() {
         let storage = OpenDalStorage::S3 {
             config: Arc::new(S3Config::default()),
-            customized_credential_load: None,
         };
 
         // All S3-family schemes are accepted by the same storage instance.
@@ -1577,7 +2309,7 @@ mod tests {
         // accepted because the path's scheme is used as-is for prefix matching.
         for scheme in ["s3", "s3a", "s3n", "minio"] {
             assert_eq!(
-                storage
+                RuntimeStorage::new(storage.clone())
                     .relativize_path(&format!("{scheme}://my-bucket/path/to/file.parquet"))
                     .unwrap(),
                 "path/to/file.parquet"
@@ -1592,12 +2324,14 @@ mod tests {
             config: Arc::new(GcsConfig::default()),
         };
 
-        assert_eq!(
-            storage
-                .relativize_path("gs://my-bucket/path/to/file.parquet")
-                .unwrap(),
-            "path/to/file.parquet"
-        );
+        for scheme in ["gs", "gcs"] {
+            assert_eq!(
+                RuntimeStorage::new(storage.clone())
+                    .relativize_path(&format!("{scheme}://my-bucket/path/to/file.parquet"))
+                    .unwrap(),
+                "path/to/file.parquet"
+            );
+        }
     }
 
     #[cfg(feature = "opendal-gcs")]
@@ -1608,7 +2342,7 @@ mod tests {
         };
 
         assert!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("s3://my-bucket/path/to/file.parquet")
                 .is_err()
         );
@@ -1622,7 +2356,7 @@ mod tests {
         };
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("oss://my-bucket/path/to/file.parquet")
                 .unwrap(),
             "path/to/file.parquet"
@@ -1637,7 +2371,7 @@ mod tests {
         };
 
         assert!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("s3://my-bucket/path/to/file.parquet")
                 .is_err()
         );
@@ -1655,12 +2389,118 @@ mod tests {
         };
 
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
                 .unwrap(),
-            "/path/to/file.parquet"
+            "path/to/file.parquet"
         );
-        assert!(storage.uses_append_mode());
+        assert!(RuntimeStorage::new(storage.clone()).uses_append_mode());
+    }
+
+    /// Answers every request with `200`, and `GET` (ADLS `ListPaths`) with `list_body`.
+    /// Returns the port and the recorded request lines.
+    #[cfg(feature = "opendal-azdls")]
+    fn start_fake_adls(list_body: &'static str) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let recorded = recorded.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                            continue;
+                        };
+                        let line = String::from_utf8_lossy(&buf[..end])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        buf.drain(..end + 4);
+                        let body = if line.starts_with("GET") {
+                            list_body
+                        } else {
+                            ""
+                        };
+                        recorded.lock().unwrap().push(line);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[tokio::test]
+    async fn test_azdls_delete_stream_and_list_paths() {
+        use futures::TryStreamExt;
+
+        let (port, requests) = start_fake_adls(
+            r#"{"paths":[{"name":"dir/f0.parquet","contentLength":"1","isDirectory":"false","lastModified":"Wed, 30 Sep 2026 00:00:00 GMT","etag":"0x1"}]}"#,
+        );
+        // Only the scheme and the suffix of the endpoint are validated, so a local server can
+        // stand in for ADLS.
+        let storage = OpenDalStorage::Azdls {
+            config: Arc::new(AzdlsConfig {
+                account_name: Some("myaccount".to_string()),
+                account_key: Some("a2V5".to_string()),
+                endpoint: Some(format!("http://127.0.0.1:{port}/core.windows.net")),
+                ..Default::default()
+            }),
+        };
+        let options = OpenDalStorageOptions::default();
+        let dir = "abfs://myfs@myaccount.dfs.core.windows.net/dir";
+
+        let paths = vec![format!("{dir}/f0.parquet"), format!("{dir}/f1.parquet")];
+        RuntimeStorage::new(storage.clone())
+            .delete_stream_with_options(futures::stream::iter(paths).boxed(), &options, None)
+            .await
+            .unwrap();
+        let mut deletes: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("DELETE"))
+            .cloned()
+            .collect();
+        deletes.sort();
+        assert_eq!(deletes, vec![
+            "DELETE /core.windows.net/myfs/dir/f0.parquet HTTP/1.1".to_string(),
+            "DELETE /core.windows.net/myfs/dir/f1.parquet HTTP/1.1".to_string(),
+        ]);
+
+        let listed: Vec<String> = RuntimeStorage::new(storage.clone())
+            .list_with_options(dir, false, &options, None)
+            .await
+            .unwrap()
+            .map_ok(|entry| entry.path)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(listed.contains(&format!("{dir}/f0.parquet")), "{listed:?}");
+        assert!(
+            listed
+                .iter()
+                .all(|path| path.starts_with(&format!("{dir}/"))),
+            "{listed:?}"
+        );
     }
 
     #[cfg(feature = "opendal-azblob")]
@@ -1670,7 +2510,7 @@ mod tests {
             config: Arc::new(AzblobConfig::default()),
         };
         assert_eq!(
-            storage
+            RuntimeStorage::new(storage.clone())
                 .relativize_path("azblob://container/path/to/file.parquet")
                 .unwrap(),
             "path/to/file.parquet"
@@ -1682,7 +2522,9 @@ mod tests {
     async fn test_list_memory_storage() {
         use futures::TryStreamExt;
 
-        let storage = OpenDalStorage::Memory(default_memory_operator());
+        let storage = OpenDalStorageFactory::memory()
+            .build(&StorageConfig::new())
+            .unwrap();
         storage
             .write("memory:/root/direct.txt", Bytes::from_static(b"a"))
             .await

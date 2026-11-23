@@ -315,12 +315,15 @@ fn require_row_counts_in_manifest(manifest: &ManifestFile) -> Result<(u64, u64)>
 mod test {
     use std::fs;
     use std::path::Path;
+    #[cfg(feature = "encryption")]
     use std::sync::Arc;
 
     use tempfile::TempDir;
 
     use super::ManifestListWriter;
+    #[cfg(feature = "encryption")]
     use crate::encryption::kms::{KeyManagementClient, MemoryKeyManagementClient};
+    #[cfg(feature = "encryption")]
     use crate::encryption::{EncryptedInputFile, EncryptionManager};
     use crate::io::{FileIO, FileWrite};
     use crate::spec::{
@@ -610,6 +613,7 @@ mod test {
         temp_dir.close().unwrap();
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_manifest_list_writer_v3_encrypted_round_trip() {
         let (mgr, file_io) = fresh_encryption_manager_and_io();
@@ -671,6 +675,7 @@ mod test {
         assert_eq!(manifest_list, expected);
     }
 
+    #[cfg(feature = "encryption")]
     fn fresh_encryption_manager_and_io() -> (EncryptionManager, FileIO) {
         let kms = MemoryKeyManagementClient::new();
         kms.add_master_key("master-1").unwrap();

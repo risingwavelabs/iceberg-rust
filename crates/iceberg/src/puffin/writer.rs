@@ -401,6 +401,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_encrypted_write_read_roundtrip() {
         use crate::encryption::{EncryptedInputFile, EncryptedOutputFile, StandardKeyMetadata};

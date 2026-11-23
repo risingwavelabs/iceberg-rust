@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 
 use crate::spec::{PartitionKey, Struct};
 use crate::writer::partitioning::PartitioningWriter;
@@ -28,6 +30,12 @@ use crate::writer::{
     DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder, PositionDeleteInput,
 };
 use crate::{Error, ErrorKind, Result};
+
+/// Maximum number of partition writers that `FanoutWriter::close` finalizes
+/// (flush + upload) concurrently. Closes for distinct partitions are
+/// independent, but bounding the concurrency caps the number of simultaneous
+/// object-store uploads for tables with many active partitions.
+const DEFAULT_CLOSE_CONCURRENCY_LIMIT: usize = 16;
 
 /// A writer that can write data to multiple partitions simultaneously.
 ///
@@ -116,26 +124,68 @@ where
     }
 
     async fn close(mut self) -> Result<O> {
-        // Close all partition writers
-        for (_, mut writer) in self.partition_writers {
-            self.output.extend(writer.close().await?);
+        // Finalize partition writers with bounded concurrency. Each close is an
+        // independent object-store upload, and a fan-out writer may hold one
+        // writer per active partition, so bounding the concurrency caps the
+        // number of simultaneous uploads.
+        //
+        // Scheduling is explicit so that the first failing close stops new
+        // closes from being started: the closes already in flight are drained
+        // to completion (never cancelled mid-upload), and the remaining writers
+        // are dropped without being closed, since their output would be
+        // discarded with the error anyway.
+        let mut pending = self.partition_writers.into_values();
+        let mut in_flight = FuturesUnordered::new();
+        in_flight.extend(
+            pending
+                .by_ref()
+                .take(DEFAULT_CLOSE_CONCURRENCY_LIMIT)
+                .map(close_writer),
+        );
+
+        let mut first_error = None;
+        while let Some(result) = in_flight.next().await {
+            match result {
+                Ok(output) => self.output.extend(output),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if first_error.is_none()
+                && let Some(writer) = pending.next()
+            {
+                in_flight.push(close_writer(writer));
+            }
         }
 
-        // Collect all output items into the output collection type
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(O::from_iter(self.output))
     }
+}
+
+/// Closes a single partition writer, taking ownership so the close future is `'static`.
+async fn close_writer<W, I, O>(mut writer: W) -> Result<O>
+where
+    W: IcebergWriter<I, O>,
+    I: Send + 'static,
+{
+    writer.close().await
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
+    use tokio::sync::Barrier;
 
     use super::*;
     use crate::io::FileIO;
@@ -391,6 +441,186 @@ mod tests {
             "Missing ASIA partition"
         );
 
+        Ok(())
+    }
+
+    // A controllable mock writer for asserting the close() concurrency bound
+    // and that no started close is cancelled when one partition fails.
+
+    #[derive(Default)]
+    struct MockCloseState {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        next_id: AtomicUsize,
+    }
+
+    struct MockWriterBuilder {
+        state: Arc<MockCloseState>,
+        barrier: Arc<Barrier>,
+        fail_indices: Vec<usize>,
+    }
+
+    struct MockWriter {
+        id: usize,
+        state: Arc<MockCloseState>,
+        barrier: Arc<Barrier>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl IcebergWriterBuilder<(), Vec<u32>> for MockWriterBuilder {
+        type R = MockWriter;
+        async fn build(&self, _partition_key: Option<PartitionKey>) -> Result<Self::R> {
+            let id = self.state.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(MockWriter {
+                id,
+                state: self.state.clone(),
+                barrier: self.barrier.clone(),
+                fail: self.fail_indices.contains(&id),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl IcebergWriter<(), Vec<u32>> for MockWriter {
+        async fn write(&mut self, _input: ()) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<Vec<u32>> {
+            // Record ourselves as in-flight, then wait at the shared barrier so
+            // the test can force a deterministic number of overlapping closes.
+            let in_flight = self.state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .max_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            self.state.started.fetch_add(1, Ordering::SeqCst);
+
+            self.barrier.wait().await;
+
+            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.state.finished.fetch_add(1, Ordering::SeqCst);
+
+            if self.fail {
+                Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("mock writer {} close failure", self.id),
+                ))
+            } else {
+                Ok(vec![self.id as u32])
+            }
+        }
+    }
+
+    fn build_schema_and_spec() -> (Arc<crate::spec::Schema>, PartitionSpec) {
+        let schema = Arc::new(
+            crate::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(3, "region", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .expect("schema builds"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .build()
+            .expect("partition spec builds");
+        (schema, spec)
+    }
+
+    fn partition_key_for(
+        schema: &Arc<crate::spec::Schema>,
+        spec: &PartitionSpec,
+        region: &str,
+    ) -> PartitionKey {
+        let value = Struct::from_iter([Some(Literal::string(region))]);
+        PartitionKey::new(spec.clone(), schema.clone(), value)
+    }
+
+    #[tokio::test]
+    async fn test_close_bounds_in_flight_closes() -> Result<()> {
+        let (schema, spec) = build_schema_and_spec();
+        let state = Arc::new(MockCloseState::default());
+        let builder = MockWriterBuilder {
+            state: state.clone(),
+            barrier: Arc::new(Barrier::new(DEFAULT_CLOSE_CONCURRENCY_LIMIT)),
+            fail_indices: vec![],
+        };
+        let mut writer = FanoutWriter::<MockWriterBuilder, (), Vec<u32>>::new(builder);
+
+        // Twice as many partitions as the concurrency limit, so the close
+        // stream must flow through two barrier "waves".
+        let num_partitions = DEFAULT_CLOSE_CONCURRENCY_LIMIT * 2;
+        for i in 0..num_partitions {
+            writer
+                .write(partition_key_for(&schema, &spec, &format!("p{i}")), ())
+                .await?;
+        }
+
+        let data = writer.close().await?;
+
+        // The concurrency window fills to the limit and never exceeds it, even
+        // though there are twice as many writers as slots.
+        assert_eq!(
+            state.max_in_flight.load(Ordering::SeqCst),
+            DEFAULT_CLOSE_CONCURRENCY_LIMIT,
+            "close() should run up to the concurrency limit and no more"
+        );
+        assert_eq!(
+            state.finished.load(Ordering::SeqCst),
+            num_partitions,
+            "every partition writer should have been closed"
+        );
+        assert_eq!(data.len(), num_partitions);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_close_stops_scheduling_after_error_and_drains_in_flight() -> Result<()> {
+        let (schema, spec) = build_schema_and_spec();
+        let state = Arc::new(MockCloseState::default());
+        let num_partitions = DEFAULT_CLOSE_CONCURRENCY_LIMIT * 2;
+        // Every writer fails, so whichever writers land in the first
+        // concurrency window (HashMap iteration order is arbitrary) are
+        // guaranteed to fail. The barrier holds them until the whole window
+        // has started, so all of them are in flight when the first error
+        // surfaces.
+        let builder = MockWriterBuilder {
+            state: state.clone(),
+            barrier: Arc::new(Barrier::new(DEFAULT_CLOSE_CONCURRENCY_LIMIT)),
+            fail_indices: (0..num_partitions).collect(),
+        };
+        let mut writer = FanoutWriter::<MockWriterBuilder, (), Vec<u32>>::new(builder);
+
+        for i in 0..num_partitions {
+            writer
+                .write(partition_key_for(&schema, &spec, &format!("p{i}")), ())
+                .await?;
+        }
+
+        let result = writer.close().await;
+        assert!(
+            result.is_err(),
+            "close() should surface the failing writer's error"
+        );
+
+        // No close beyond the first window is started once an error is seen.
+        assert_eq!(
+            state.started.load(Ordering::SeqCst),
+            DEFAULT_CLOSE_CONCURRENCY_LIMIT,
+            "no new closes should be scheduled after the first error"
+        );
+        // Closes already in flight are drained, not cancelled.
+        assert_eq!(
+            state.finished.load(Ordering::SeqCst),
+            DEFAULT_CLOSE_CONCURRENCY_LIMIT,
+            "in-flight closes should drain to completion (no cancellation)"
+        );
         Ok(())
     }
 }

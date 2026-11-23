@@ -81,3 +81,30 @@ async fn main() -> iceberg::Result<()> {
     Ok(())
 }
 ```
+
+## Runtime credentials
+
+S3, ADLS and GCS use the same `iceberg::io::StorageCredentialProvider` interface.
+Attach the provider to `FileIOBuilder`, not the storage factory:
+
+```rust
+use std::sync::Arc;
+use iceberg::io::{FileIO, FileIOBuilder, StorageCredentialProvider};
+use iceberg_storage_opendal::OpenDalStorageFactory;
+
+fn file_io(provider: impl StorageCredentialProvider + 'static) -> FileIO {
+    FileIOBuilder::new(Arc::new(OpenDalStorageFactory::s3()))
+        .with_prop("s3.region", "us-east-1")
+        .with_credential_provider(Arc::new(provider))
+        .build()
+}
+```
+
+With a credential provider attached, storage errors are redacted: they keep the
+OpenDAL error kind, HTTP status, operation and an allowlisted service error
+code, but not URIs, headers, bodies or service messages. Set
+`io.credentialed-errors.service-detail=true`
+(`IO_CREDENTIALED_ERROR_SERVICE_DETAIL`) to also keep any service error code
+and, except for signing and credential errors, a truncated service error
+message, so callers can tell apart failures such as a suspended account from
+other `AccessDenied` responses.
