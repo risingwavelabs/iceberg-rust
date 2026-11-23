@@ -3552,6 +3552,7 @@ pub fn iceberg::transaction::Transaction::update_table_properties(&self) -> iceb
 pub fn iceberg::transaction::Transaction::upgrade_table_version(&self) -> iceberg::transaction::upgrade_format_version::UpgradeFormatVersionAction
 impl core::clone::Clone for iceberg::transaction::Transaction
 pub fn iceberg::transaction::Transaction::clone(&self) -> iceberg::transaction::Transaction
+pub const iceberg::transaction::CONFLICTING_DATA_FILE_CONTEXT_KEY: &str
 pub const iceberg::transaction::MANIFEST_MERGE_ENABLED: &str
 pub const iceberg::transaction::MANIFEST_MERGE_ENABLED_DEFAULT: bool
 pub const iceberg::transaction::MANIFEST_MIN_MERGE_COUNT: &str

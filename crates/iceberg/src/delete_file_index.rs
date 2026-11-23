@@ -102,7 +102,10 @@ fn may_contain_null(file: &DataFile, field_id: i32) -> bool {
 ///
 /// File metrics are used only to prove that a match is impossible. Missing or incompatible
 /// metrics fail open so that scan planning never drops a delete that may apply.
-fn can_contain_eq_deletes_for_file(data_file: &DataFile, delete_file: &DataFile) -> bool {
+pub(crate) fn can_contain_eq_deletes_for_file(
+    data_file: &DataFile,
+    delete_file: &DataFile,
+) -> bool {
     let Some(equality_ids) = delete_file.equality_ids.as_deref() else {
         return true;
     };
