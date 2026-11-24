@@ -5120,6 +5120,106 @@ mod tests {
         assert_eq!(conflicting_paths(&err), vec![CONFLICT_INPUT.to_string()]);
     }
 
+    async fn append_to_branch(
+        catalog: &impl crate::Catalog,
+        table: &Table,
+        branch: &str,
+        files: Vec<DataFile>,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        tx.fast_append()
+            .set_target_branch(branch.to_string())
+            .add_data_files(files)
+            .apply(tx)
+            .unwrap()
+            .commit(catalog)
+            .await
+            .unwrap()
+    }
+
+    /// A rewrite on a branch other than `main` reads the history of that branch only: a delete
+    /// committed to `main` for the same path is not a conflict, a starting snapshot from `main`
+    /// is not an ancestor, and a delete committed to the branch is a conflict.
+    #[tokio::test]
+    async fn test_rewrite_on_a_branch_validates_against_that_branch_only() {
+        const BRANCH: &str = "ingestion";
+        let rewrite_on_branch = |table: &Table, input: &DataFile, starting_snapshot_id: i64| {
+            let tx = Transaction::new(table);
+            tx.rewrite_files()
+                .set_target_branch(BRANCH.to_string())
+                .delete_files([input.clone()])
+                .add_data_files([conflict_test_file(
+                    table,
+                    "test/conflict-replacement.parquet",
+                    DataContentType::Data,
+                    300,
+                )
+                .build()
+                .unwrap()])
+                .validate_from_snapshot_id(starting_snapshot_id)
+                .apply(tx)
+                .unwrap()
+        };
+        let delete_input = |table: &Table| {
+            vec![conflict_test_position_delete(
+                table,
+                Some(CONFLICT_INPUT),
+                None,
+                300,
+            )]
+        };
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let input = conflict_test_file(&table, CONFLICT_INPUT, DataContentType::Data, 300)
+            .build()
+            .unwrap();
+        let table_s0 = append_to_branch(&catalog, &table, BRANCH, vec![input.clone()]).await;
+        let s0 = table_s0
+            .metadata()
+            .snapshot_for_ref(BRANCH)
+            .unwrap()
+            .snapshot_id();
+        let table =
+            append_to_branch(&catalog, &table_s0, MAIN_BRANCH, delete_input(&table_s0)).await;
+        let main_snapshot_id = table.metadata().current_snapshot_id().unwrap();
+
+        let err = rewrite_on_branch(&table, &input, main_snapshot_id)
+            .commit(&catalog)
+            .await
+            .expect_err("a snapshot on main is not an ancestor of the branch");
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert!(conflicting_paths(&err).is_empty(), "{err}");
+
+        let committed = rewrite_on_branch(&table, &input, s0)
+            .commit(&catalog)
+            .await
+            .expect("a delete on main does not conflict with a rewrite on the branch");
+        assert_ne!(
+            committed
+                .metadata()
+                .snapshot_for_ref(BRANCH)
+                .unwrap()
+                .snapshot_id(),
+            s0
+        );
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let table_s0 = append_to_branch(&catalog, &table, BRANCH, vec![input.clone()]).await;
+        let s0 = table_s0
+            .metadata()
+            .snapshot_for_ref(BRANCH)
+            .unwrap()
+            .snapshot_id();
+        let table = append_to_branch(&catalog, &table_s0, BRANCH, delete_input(&table_s0)).await;
+        let err = rewrite_on_branch(&table, &input, s0)
+            .commit(&catalog)
+            .await
+            .expect_err("a delete on the branch conflicts");
+        assert_eq!(conflicting_paths(&err), vec![CONFLICT_INPUT.to_string()]);
+    }
+
     #[tokio::test]
     async fn test_rewrite_rejects_starting_snapshot_outside_branch_history() {
         let catalog = new_memory_catalog().await;
