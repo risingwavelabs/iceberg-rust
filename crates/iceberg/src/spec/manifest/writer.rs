@@ -322,8 +322,18 @@ impl ManifestWriter {
         }
     }
 
-    /// Approximate serialized size of entries accumulated by this writer.
-    pub(crate) fn estimated_manifest_size(&self) -> u64 {
+    /// Cheap heuristic estimate, in bytes, of the uncompressed serialized size of the
+    /// entries added to this writer so far.
+    ///
+    /// The estimate covers each entry's file path, column statistics and bounds, key
+    /// metadata and split offsets plus fixed per-entry framing. It excludes the Avro
+    /// header and manifest metadata, and does not count partition values, so it is not
+    /// the final [`ManifestFile::manifest_length`].
+    ///
+    /// The value never decreases as entries are added. It is meant for deciding when to
+    /// start a new manifest once the current one reaches a target size, not for exact
+    /// sizing. The estimation may change between releases.
+    pub fn estimated_manifest_size(&self) -> u64 {
         self.estimated_size
     }
 
