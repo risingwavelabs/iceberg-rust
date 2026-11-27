@@ -165,13 +165,13 @@ impl AsyncFileReader for ArrowFileReader {
             let reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(self.parquet_read_options.metadata_size_hint())
                 // Set the page policy first because it updates both column and offset policies.
-                .with_page_index_policy(PageIndexPolicy::from(
+                .with_page_index_policy(page_index_policy(
                     self.parquet_read_options.preload_page_index(),
                 ))
-                .with_column_index_policy(PageIndexPolicy::from(
+                .with_column_index_policy(page_index_policy(
                     self.parquet_read_options.preload_column_index(),
                 ))
-                .with_offset_index_policy(PageIndexPolicy::from(
+                .with_offset_index_policy(page_index_policy(
                     self.parquet_read_options.preload_offset_index(),
                 ))
                 .with_metadata_options(metadata_options);
@@ -183,6 +183,14 @@ impl AsyncFileReader for ArrowFileReader {
             Ok(Arc::new(meta))
         }
         .boxed()
+    }
+}
+
+fn page_index_policy(preload: bool) -> PageIndexPolicy {
+    if preload {
+        PageIndexPolicy::Optional
+    } else {
+        PageIndexPolicy::Skip
     }
 }
 
@@ -225,8 +233,14 @@ fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::sync::Arc;
 
-    use parquet::arrow::async_reader::AsyncFileReader;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, ParquetMetaDataWriter};
 
     use super::{ArrowFileReader, ParquetReadOptions, merge_ranges};
     use crate::io::{FileMetadata, FileRead};
@@ -278,6 +292,12 @@ mod tests {
             Self {
                 data: bytes::Bytes::from(data),
             }
+        }
+    }
+
+    impl MockFileRead {
+        fn from_bytes(data: bytes::Bytes) -> Self {
+            Self { data }
         }
     }
 
@@ -440,5 +460,130 @@ mod tests {
         assert_eq!(result[0], expected_0);
         assert_eq!(result[1], expected_1);
         assert_eq!(result[2], expected_2);
+    }
+
+    const ROWS: i64 = 100;
+
+    fn write_two_column_parquet() -> bytes::Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            Arc::new(Int64Array::from_iter_values(ROWS..2 * ROWS)),
+        ])
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        bytes::Bytes::from(buf)
+    }
+
+    fn drop_offset_index_location_after_first_column(file: bytes::Bytes) -> bytes::Bytes {
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Skip)
+            .parse_and_finish(&file)
+            .unwrap();
+        let row_groups = metadata
+            .row_groups()
+            .iter()
+            .map(|row_group| {
+                let columns = row_group
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, column)| {
+                        if idx == 0 {
+                            column.clone()
+                        } else {
+                            column
+                                .clone()
+                                .into_builder()
+                                .set_offset_index_offset(None)
+                                .set_offset_index_length(None)
+                                .build()
+                                .unwrap()
+                        }
+                    })
+                    .collect();
+                row_group
+                    .clone()
+                    .into_builder()
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let metadata = metadata.into_builder().set_row_groups(row_groups).build();
+
+        let footer_len =
+            u32::from_le_bytes(file[file.len() - 8..file.len() - 4].try_into().unwrap());
+        let footer_start = file.len() - 8 - footer_len as usize;
+        let mut out = file[..footer_start].to_vec();
+        ParquetMetaDataWriter::new(&mut out, &metadata)
+            .finish()
+            .unwrap();
+        bytes::Bytes::from(out)
+    }
+
+    fn reader_for(file: bytes::Bytes) -> ArrowFileReader {
+        ArrowFileReader::new(
+            FileMetadata {
+                size: file.len() as u64,
+            },
+            Box::new(MockFileRead::from_bytes(file)),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_loads_offset_index_present_on_every_column() {
+        let mut reader = reader_for(write_two_column_parquet());
+
+        let metadata = reader.get_metadata(None).await.unwrap();
+
+        assert!(metadata.offset_index().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_accepts_offset_index_missing_on_some_columns() {
+        let file = drop_offset_index_location_after_first_column(write_two_column_parquet());
+        let mut reader = reader_for(file);
+
+        let metadata = reader.get_metadata(None).await.unwrap();
+
+        assert!(metadata.offset_index().is_none());
+        assert!(
+            metadata
+                .row_group(0)
+                .column(0)
+                .offset_index_offset()
+                .is_some()
+        );
+        assert!(
+            metadata
+                .row_group(0)
+                .column(1)
+                .offset_index_offset()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reads_rows_with_offset_index_missing_on_some_columns() {
+        let file = drop_offset_index_location_after_first_column(write_two_column_parquet());
+
+        let batches: Vec<RecordBatch> = ParquetRecordBatchStreamBuilder::new(reader_for(file))
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, ROWS as usize);
     }
 }
